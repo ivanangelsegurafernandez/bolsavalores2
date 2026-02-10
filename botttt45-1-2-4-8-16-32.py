@@ -52,6 +52,22 @@ except Exception as _e:
 script_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(script_dir)
 
+def validar_sin_conflictos_merge_en_fuente(path: str):
+    """
+    Falla rápido si quedaron marcadores de merge sin resolver en el script.
+    Evita ejecutar el bot con conflictos ocultos (<<<<<<<, =======, >>>>>>>).
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, raw in enumerate(f, start=1):
+                s = raw.rstrip("\r\n")
+                if s.startswith("<<<<<<< ") or s.startswith(">>>>>>> ") or s == "=======":
+                    raise RuntimeError(f"Conflicto de merge no resuelto en {os.path.basename(path)}:{i}")
+    except FileNotFoundError:
+        return
+
+validar_sin_conflictos_merge_en_fuente(__file__)
+
 # === PATCH SFX: audio seguro, canales y rate-limit ===
 AUDIO_ENABLED = False
 try:
