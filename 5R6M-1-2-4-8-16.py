@@ -5768,6 +5768,13 @@ def mostrar_panel():
     # Línea de estado general
     print(padding + Fore.GREEN + "🟢 MODO OPERACIÓN ACTIVO – Escaneando…")
 
+    # Etapa activa para depuración de flujo
+    try:
+        edad_etapa = max(0, int(time.time() - float(ETAPA_TS)))
+        print(padding + Fore.YELLOW + f"🧭 ETAPA {ETAPA_ACTUAL}: {ETAPA_DETALLE} ({edad_etapa}s)")
+    except Exception:
+        pass
+
     # Saldo actual (archivo Deriv o saldo_real en memoria)
     try:
         valor = obtener_valor_saldo()
@@ -6740,6 +6747,43 @@ def backfill_incremental(ultimas=500):
 # === FIN BLOQUE 12 ===
 
 # === BLOQUE 13 — LOOP PRINCIPAL, WEBSOCKET Y TECLADO ===
+# Orden operativo por etapas (solo trazabilidad/depuración; no altera trading)
+ETAPAS_PROGRAMA = {
+    "BOOT_01": "Arranque y validación de entorno",
+    "BOOT_02": "Carga de audio/tokens y reset opcional",
+    "BOOT_03": "Backfill + primer entrenamiento IA",
+    "BOOT_04": "Sincronización inicial HUD/CSV",
+    "TICK_01": "Lectura de token y carga incremental por bot",
+    "TICK_02": "Watchdog REAL + detección de cierre",
+    "TICK_03": "Selección IA / ventana manual / asignación REAL",
+    "TICK_04": "Refresh saldo + render HUD",
+    "STOP": "Salida controlada",
+}
+ETAPA_ACTUAL = "BOOT_01"
+ETAPA_DETALLE = ETAPAS_PROGRAMA[ETAPA_ACTUAL]
+ETAPA_TS = time.time()
+
+def set_etapa(codigo, detalle_extra=None, anunciar=False):
+    """
+    Marca etapa actual del programa para facilitar diagnóstico en vivo.
+    No modifica ninguna decisión de trading.
+    """
+    global ETAPA_ACTUAL, ETAPA_DETALLE, ETAPA_TS
+
+    codigo = str(codigo or "").strip().upper()
+    if codigo not in ETAPAS_PROGRAMA:
+        return
+
+    base = ETAPAS_PROGRAMA[codigo]
+    detalle = f"{base} | {detalle_extra}" if detalle_extra else base
+
+    ETAPA_ACTUAL = codigo
+    ETAPA_DETALLE = detalle
+    ETAPA_TS = time.time()
+
+    if anunciar:
+        agregar_evento(f"🧭 ETAPA {codigo}: {detalle}")
+
 # Nueva constante para watchdog de REAL - Bajado para más reactividad
 REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para forzar salida de REAL
 
@@ -7057,10 +7101,12 @@ async def main():
     global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA
 
     try:
+        set_etapa("BOOT_01", "Inicializando main()", anunciar=True)
         try:
             os.remove("real.lock")
         except:
             pass
+        set_etapa("BOOT_02", "Leyendo tokens de usuario")
         tokens = leer_tokens_usuario()
         if tokens == (None, None):
             print("⚠️ Tokens ausentes. Modo sin-saldo activo (HUD/IA continúan).")
@@ -7079,6 +7125,7 @@ async def main():
         if valor is not None:
             inicializar_saldo_real(valor)
 
+        set_etapa("BOOT_03", "Backfill y primer entrenamiento")
         # Backfill IA desde los logs enriquecidos
         try:
             backfill_incremental(ultimas=1500)
@@ -7091,6 +7138,7 @@ async def main():
         except Exception as e:
             agregar_evento(f"⚠️ IA: error al intentar entrenar tras el backfill: {e}")
 
+        set_etapa("BOOT_04", "Sincronizando HUD con CSV")
         # Pasada inicial para sincronizar HUD con CSV existentes
         token_actual_loop = "--"  # Dummy para carga inicial
         for bot in BOT_NAMES:
@@ -7098,6 +7146,7 @@ async def main():
 
         while True:
             if salir:
+                set_etapa("STOP", "Señal de salida detectada", anunciar=True)
                 break
             if pausado:
                 await asyncio.sleep(1)
@@ -7108,6 +7157,7 @@ async def main():
                 await refresh_saldo_real(forzado=True)
 
             try:  
+                set_etapa("TICK_01")
                 token_actual_loop = leer_token_actual()
                 activo_real = next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
                 for bot in BOT_NAMES:
@@ -7123,6 +7173,7 @@ async def main():
                     except Exception as e_bot:
                         agregar_evento(f"⚠️ Error en {bot}: {e_bot}")
                 else:
+                    set_etapa("TICK_02")
                     # Watchdog para REAL pegado
                     ahora = time.time()
                     for bot in BOT_NAMES:
@@ -7168,6 +7219,7 @@ async def main():
 
 
                     if not activo_real:
+                        set_etapa("TICK_03")
                         # Usamos el MISMO umbral operativo que HUD + audio
                         meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta()
                         umbral_ia = get_umbral_operativo(meta_local or {})
@@ -7253,6 +7305,7 @@ async def main():
                             if max_prob < umbral_ia:
                                 pass
 
+                    set_etapa("TICK_04")
                     await refresh_saldo_real()
                     if meta_mostrada and not pausado and not MODAL_ACTIVO:
                         mostrar_advertencia_meta()
@@ -7260,10 +7313,12 @@ async def main():
                         with RENDER_LOCK:
                             mostrar_panel()
             except Exception as e:
+                set_etapa("TICK_04", f"Error: {str(e)}")
                 agregar_evento(f"⚠️ Error en loop principal: {str(e)}")
                 await asyncio.sleep(1)  
             await asyncio.sleep(2)
     except Exception as e:
+        set_etapa("STOP", f"Error en main: {str(e)}", anunciar=True)
         agregar_evento(f"⛔ Error en main: {str(e)}")
 
 if __name__ == "__main__":
