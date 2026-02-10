@@ -278,6 +278,9 @@ async def _silencio_temporal(seg=90, fuente=None):
 
 # >>> PATCH (globals) BLOQUE 3
 _contratos_procesados = set()
+# Métricas de cierre en memoria (evita releer CSV completo en cada trade)
+stats_cerrados_total = 0
+stats_cerrados_ganados = 0
 # <<< PATCH
 
 # >>> PATCH (globals) BLOQUE 3 y BLOQUE 4
@@ -393,6 +396,96 @@ def _write_row_dict_atomic(archivo_csv: str, row_dict: dict):
     """
     row = [row_dict.get(col, "") for col in CSV_HEADER]
     write_csv_atomic(archivo_csv, row)
+
+def _parse_result_bin_01(value):
+    """Normaliza result_bin y devuelve 0/1 o None si no es válido."""
+    try:
+        if value is None:
+            return None
+        s = str(value).strip().replace(",", ".")
+        if s == "":
+            return None
+        f = float(s)
+        if f == 1.0:
+            return 1
+        if f == 0.0:
+            return 0
+    except Exception:
+        return None
+    return None
+
+def bootstrap_estadisticas_exito(archivo_csv: str):
+    """
+    Carga 1 sola vez las métricas de éxito desde CSV para no releer todo en cada contrato.
+    Cuenta únicamente filas CERRADO con result_bin válido (0/1).
+    """
+    global stats_cerrados_total, stats_cerrados_ganados
+    stats_cerrados_total = 0
+    stats_cerrados_ganados = 0
+
+    if not os.path.exists(archivo_csv):
+        return
+
+    try:
+        with open(archivo_csv, "r", newline="", encoding="utf-8", errors="replace") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                trade_status = str((row or {}).get("trade_status", "")).strip().upper()
+                if trade_status and trade_status != "CERRADO":
+                    continue
+                rb = _parse_result_bin_01((row or {}).get("result_bin"))
+                if rb is None:
+                    continue
+                stats_cerrados_total += 1
+                if rb == 1:
+                    stats_cerrados_ganados += 1
+    except Exception as e:
+        if _print_once("stats-bootstrap-err", ttl=30):
+            print(Fore.YELLOW + f"No se pudo inicializar éxito acumulado desde CSV: {e}")
+
+def registrar_cierre_en_estadisticas(resultado: str):
+    """Actualiza contadores en memoria para mostrar éxito acumulado sin costo alto de I/O."""
+    global stats_cerrados_total, stats_cerrados_ganados
+    if resultado not in ("GANANCIA", "PÉRDIDA"):
+        return
+    stats_cerrados_total += 1
+    if resultado == "GANANCIA":
+        stats_cerrados_ganados += 1
+
+def imprimir_estadisticas_exito():
+    total = int(stats_cerrados_total)
+    ganancias = int(stats_cerrados_ganados)
+    porcentaje_exito = (ganancias / total) * 100 if total else 0.0
+    print(f"Éxito acumulado en {ARCHIVO_CSV}: {ganancias}/{total} = {porcentaje_exito:.2f}%")
+
+def validar_features_operacion(rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, condiciones):
+    """
+    Garantiza que las features críticas del trade estén presentes y sean parseables.
+    Evita escribir snapshots PRE_TRADE incompletos que luego distorsionan la IA.
+    """
+    checks = {
+        "rsi_9": rsi9,
+        "rsi_14": rsi14,
+        "sma_5": sma5,
+        "sma_20": sma20,
+        "cruce_sma": cruce,
+        "breakout": breakout,
+        "rsi_reversion": rsi_reversion,
+        "puntaje_estrategia": condiciones,
+    }
+    faltantes = []
+    for k, v in checks.items():
+        try:
+            if v is None:
+                faltantes.append(k)
+                continue
+            _ = float(v)
+        except Exception:
+            faltantes.append(k)
+
+    if faltantes:
+        return False, faltantes
+    return True, []
 
 # === FIN HEADER FINAL ===
 def write_pretrade_snapshot(
@@ -910,6 +1003,7 @@ def cargar_tokens():
             time.sleep(3)
 
 TOKEN_DEMO, TOKEN_REAL = cargar_tokens()
+_token_archivo_ultimo_valido = None  # evita rebotes falsos a DEMO por lecturas parciales
 
 def reset_csv_and_total():
     """
@@ -933,16 +1027,28 @@ if not os.path.exists(ARCHIVO_CSV):
 
 def leer_token_desde_archivo():
     """
-    Lee ARCHIVO_TOKEN. Si contiene 'REAL:fulll46' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
+    Lee ARCHIVO_TOKEN. Si contiene 'REAL:<NOMBRE_BOT>' -> TOKEN_REAL, si no -> TOKEN_DEMO.
+    Si el archivo está vacío/inválido en una lectura puntual (race con el maestro),
+    conserva el último token válido para evitar rebotes falsos de coordinación.
     """
+    global _token_archivo_ultimo_valido
+    expected = f"REAL:{NOMBRE_BOT}".upper()
     try:
         with open(ARCHIVO_TOKEN, "r", encoding="utf-8", errors="replace") as f:
-            linea = f.read().strip()
-            if linea == f"REAL:{NOMBRE_BOT}":
-                return TOKEN_REAL
-    except:
-        pass
-    return TOKEN_DEMO
+            linea = (f.read() or "").strip()
+            if not linea:
+                raise ValueError("token vacío")
+
+            token = TOKEN_REAL if linea.upper() == expected else TOKEN_DEMO
+            _token_archivo_ultimo_valido = token
+            return token
+    except Exception as e:
+        # Si hubo lectura parcial (escritura atómica en progreso), reutiliza el último válido.
+        if _token_archivo_ultimo_valido is not None:
+            if _print_once("token-read-fallback", ttl=20):
+                print(Fore.YELLOW + f"Lectura inestable de token ({e}). Manteniendo último modo válido.")
+            return _token_archivo_ultimo_valido
+        return TOKEN_DEMO
 
 def calcular_rsi(cierres, periodo=14):
     if len(cierres) < periodo + 1:
@@ -1501,21 +1607,12 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
 
             except Exception as csv_e:
                 print(Fore.RED + f"[ERROR] al escribir CSV: {csv_e}")
-            # Calcular y mostrar % de éxito acumulado (robusto: solo cuenta 0/1)
+            # Calcular y mostrar % de éxito acumulado sin releer todo el CSV en cada trade
             try:
-                import pandas as pd
-                # on_bad_lines="skip" evita que una línea rota tumbe todo el panel
-                df = pd.read_csv(ARCHIVO_CSV, encoding="utf-8", on_bad_lines="skip")
-                if "result_bin" in df.columns:
-                    # Normaliza y filtra solo valores válidos "0" y "1"
-                    rb = df["result_bin"].astype(str).str.strip()
-                    mask = rb.isin(["0", "1"])                   
-                    total = int(mask.sum())
-                    ganancias = int((rb[mask] == "1").sum())
-                    porcentaje_exito = (ganancias / total) * 100 if total else 0.0
-                    print(f"Éxito acumulado en {ARCHIVO_CSV}: {ganancias}/{total} = {porcentaje_exito:.2f}%")
+                registrar_cierre_en_estadisticas(resultado)
+                imprimir_estadisticas_exito()
             except Exception as e:
-                print(f"No se pudo calcular % de éxito: {type(e).__name__}: {e!r}")
+                print(f"No se pudo calcular % de éxito (memoria): {type(e).__name__}: {e!r}")
 
             # Acumular profit separado
             if token_antes == TOKEN_REAL:
@@ -1712,6 +1809,14 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
                 "ts": ts_val,
             }
             _write_row_dict_atomic(ARCHIVO_CSV, row_dict)
+
+        # Refleja cierres en background en las métricas de éxito de interfaz
+        try:
+            registrar_cierre_en_estadisticas(resultado)
+            imprimir_estadisticas_exito()
+        except Exception:
+            pass
+
         # === Logs ===
         msg = Fore.CYAN + f"Contrato #{contract_id} finalizado en background: {resultado} {profit:.2f} USD"
         if estado_bot.get("barra_activa", False):
@@ -1826,6 +1931,9 @@ async def ejecutar_panel():
         reparar_csv_esrebote_ciclo(ARCHIVO_CSV)
         _CSV_REPARADO_1VEZ = True
     # ================= FIN PATCH CSV (SOLO) =================
+
+    # Inicializa métricas de éxito una sola vez (evita lectura completa por cada cierre)
+    bootstrap_estadisticas_exito(ARCHIVO_CSV)
    
     
     async def _cerrar_ws(_ws):
@@ -1940,8 +2048,11 @@ async def ejecutar_panel():
                 if symbol == "REINTENTAR" or symbol is None:
                     continue
 
-                if not all([direccion, rsi9 is not None, rsi14 is not None]):
-                    print(Fore.YELLOW + "Datos de estrategia incompletos. Reintentando ciclo.")
+                ok_features, faltantes = validar_features_operacion(
+                    rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, condiciones
+                )
+                if not direccion or (not ok_features):
+                    print(Fore.YELLOW + f"Datos de estrategia incompletos ({', '.join(faltantes) if faltantes else 'direction'}). Reintentando ciclo.")
                     continue
 
                 # Rechequeo token justo antes de avanzar
