@@ -3224,6 +3224,10 @@ def _add_derived_for_model(d: dict):
 
     return d
 
+# Cache liviano para evitar parsear CSV del bot cuando no hubo filas nuevas.
+# key=bot -> {"sig": (mtime_ns, size), "row": dict|None}
+_PRED_FEATURE_ROW_CACHE: dict[str, dict] = {}
+
 def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
     """
     Lee features para PREDICCIÓN (sin label):
@@ -3234,6 +3238,18 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
     ruta = f"registro_enriquecido_{bot}.csv"
     if not os.path.exists(ruta):
         return None
+
+    try:
+        st = os.stat(ruta)
+        mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+        sig = (mtime_ns, int(st.st_size))
+    except Exception:
+        sig = None
+
+    cached = _PRED_FEATURE_ROW_CACHE.get(bot)
+    if sig is not None and cached and cached.get("sig") == sig:
+        row_cached = cached.get("row")
+        return dict(row_cached) if isinstance(row_cached, dict) else None
 
     df = None
     for enc in ("utf-8", "latin-1", "windows-1252"):
@@ -3360,6 +3376,9 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
     except Exception:
         pass
 
+    if sig is not None:
+        _PRED_FEATURE_ROW_CACHE[bot] = {"sig": sig, "row": dict(row)}
+
     return row
 
 def _coerce_float_default(v, default=0.0) -> float:
@@ -3464,7 +3483,9 @@ def predecir_prob_ia_bot(bot: str) -> tuple[float | None, str | None]:
 # --- Updater: NO fuerces prob_ia=0 cuando falla ---
 IA_PRED_TTL_S = 180.0          # si falla por mucho tiempo, recién se limpia a None
 IA_PRED_MIN_INTERVAL_S = 2.0   # anti-spam de predicción
+IA_AUDIT_SCAN_MIN_INTERVAL_S = 2.0  # evita escaneo pesado en cada render del HUD
 _last_pred_ts = {b: 0.0 for b in BOT_NAMES}
+_last_audit_scan_ts = {b: 0.0 for b in BOT_NAMES}
 
 def actualizar_prob_ia_bot(bot: str):
     """
@@ -3512,13 +3533,17 @@ def actualizar_prob_ia_todos():
       2) Actualiza Prob IA por bot (sin tocar la lógica de trading).
     Nota: esto arregla el caso clásico "Aún no hay cierres suficientes" cuando el cierre nunca se ejecuta.
     """
+    now = time.time()
     for b in BOT_NAMES:
         # 1) Backfill / cierre de señales (más profundo solo en el primer tick tras arrancar)
         try:
-            last = IA_AUDIT_LAST_CLOSE_EPOCH.get(b, None)
-            tail_lines = 25000 if last is None else 6000
-            max_events = 60 if last is None else 15
-            ia_audit_scan_close(b, tail_lines=tail_lines, max_events=max_events)
+            last_scan = float(_last_audit_scan_ts.get(b, 0.0) or 0.0)
+            if (now - last_scan) >= IA_AUDIT_SCAN_MIN_INTERVAL_S:
+                last = IA_AUDIT_LAST_CLOSE_EPOCH.get(b, None)
+                tail_lines = 25000 if last is None else 6000
+                max_events = 60 if last is None else 15
+                ia_audit_scan_close(b, tail_lines=tail_lines, max_events=max_events)
+                _last_audit_scan_ts[b] = now
         except Exception:
             pass
 
