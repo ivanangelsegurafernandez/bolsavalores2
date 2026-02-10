@@ -5,9 +5,18 @@ import json
 import csv
 import os
 import sys
+import warnings
 from datetime import datetime, timezone
 from statistics import mean
 from colorama import Fore, Back, Style, init
+
+# Silencia warning conocido de pygame/pkg_resources en Python modernos.
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API",
+    category=UserWarning,
+)
+
 import pygame
 import pandas as pd
 import time  # Added for timestamps in orden_real and BLOQUE 5
@@ -2174,6 +2183,9 @@ async def ejecutar_panel():
                 if VENTANA_DECISION_IA_S > 0:
                     t0 = time.time()
                     ack_visto = False
+                    ack_prob_ultima = None
+                    ack_auc_ultima = None
+                    ack_modo_ultimo = None
 
                     while (time.time() - t0) < VENTANA_DECISION_IA_S:
                         if reinicio_forzado.is_set():
@@ -2186,19 +2198,38 @@ async def ejecutar_panel():
                                 break
                         except Exception:
                             pass
-                        # ✅ Leer ACK del maestro (si llega, lo mostramos una sola vez)
-                        if (not ack_visto) and epoch_pre:
+                        # ✅ Leer ACK del maestro (si llega, tomamos SIEMPRE el más reciente de este PRE_TRADE)
+                        if epoch_pre:
                             ack = leer_ia_ack(NOMBRE_BOT)
                             try:
-                                if ack and int(ack.get("epoch", 0)) >= int(epoch_pre):
+                                if ack and int(ack.get("epoch", 0)) == int(epoch_pre):
                                     p = ack.get("prob", None)
+                                    p_raw = ack.get("prob_raw", None)
                                     auc = float(ack.get("auc", 0.0) or 0.0)
                                     modo = ack.get("modo", "OFF")
 
-                                    if isinstance(p, (int, float)):
-                                        print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p*100:.1f}% | AUC={auc:.3f} | modo={modo}")
-                                    else:
-                                        print(f"🤖 IA ACK ({NOMBRE_BOT}) → (sin prob) | AUC={auc:.3f} | modo={modo}")
+                                    # Preferimos prob calibrada; fallback a prob_raw si calibrada viene nula.
+                                    p_show = p if isinstance(p, (int, float)) else (p_raw if isinstance(p_raw, (int, float)) else None)
+
+                                    if isinstance(p_show, (int, float)):
+                                        p_show = max(0.0, min(1.0, float(p_show)))
+
+                                    hubo_cambio = (
+                                        (not ack_visto)
+                                        or (ack_prob_ultima != p_show)
+                                        or (ack_auc_ultima != auc)
+                                        or (ack_modo_ultimo != modo)
+                                    )
+
+                                    ack_prob_ultima = p_show
+                                    ack_auc_ultima = auc
+                                    ack_modo_ultimo = modo
+
+                                    if hubo_cambio:
+                                        if isinstance(p_show, (int, float)):
+                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | AUC={auc:.3f} | modo={modo}")
+                                        else:
+                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → (sin prob) | AUC={auc:.3f} | modo={modo}")
 
                                     ack_visto = True
                             except Exception:
@@ -2216,6 +2247,13 @@ async def ejecutar_panel():
                         reinicio_forzado.clear()
                         await asyncio.sleep(0.8)
                         continue
+
+                    # Mensaje final: la prob mostrada coincide con la última que reportó el maestro para este PRE.
+                    if ack_visto and isinstance(ack_prob_ultima, (int, float)):
+                        print(
+                            Fore.CYAN +
+                            f"🤖 IA FINAL ({NOMBRE_BOT}) → {float(ack_prob_ultima)*100:.1f}% | AUC={float(ack_auc_ultima or 0.0):.3f} | modo={ack_modo_ultimo or 'OFF'}"
+                        )
 
 # ==================== /VENTANA DE DECISIÓN IA ====================
 
