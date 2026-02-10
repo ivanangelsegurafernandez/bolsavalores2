@@ -6122,13 +6122,13 @@ def mostrar_panel():
             _IA_CALIB_CACHE = {"ts": 0.0, "rep": None}
 
         if (time.time() - float(_IA_CALIB_CACHE.get("ts", 0.0) or 0.0)) >= 15.0:
-            _IA_CALIB_CACHE["rep"] = auditar_calibracion_seniales_reales(min_prob=float(IA_METRIC_THRESHOLD))
+            _IA_CALIB_CACHE["rep"] = auditar_calibracion_seniales_reales(min_prob=float(IA_CALIB_THRESHOLD))
             _IA_CALIB_CACHE["ts"] = float(time.time())
 
         rep = _IA_CALIB_CACHE.get("rep", None) or {}
         n = int(rep.get("n", 0) or 0)
 
-        print(Fore.MAGENTA + "\n✅ Prob IA REAL vs Prob IA FICTICIA (señales cerradas):")
+        print(Fore.MAGENTA + f"\n✅ Prob IA REAL vs Prob IA FICTICIA (señales cerradas, ≥{IA_CALIB_THRESHOLD*100:.0f}%):")
         if n <= 0:
             print(Fore.MAGENTA + "   (Aún no hay cierres suficientes para medir calibración.)")
         else:
@@ -6142,11 +6142,17 @@ def mostrar_panel():
                 + f"   n={n} | PredMedia={pred_mean*100:.1f}% | Real={win_rate*100:.1f}% | Inflación={infl_pp:+.1f}pp | Factor≈{factor:.3f}"
             )
 
+            if n < int(MIN_IA_SENIALES_CONF):
+                print(
+                    Fore.MAGENTA
+                    + f"   ⚠ muestra baja (n<{MIN_IA_SENIALES_CONF}). Úsalo como referencia, no como decisión final."
+                )
+
             por_bot = rep.get("por_bot", {}) if isinstance(rep.get("por_bot", {}), dict) else {}
             # Mostrar por bot (solo si hay datos)
             for bn in BOT_NAMES:
                 sb = por_bot.get(bn, None)
-                if isinstance(sb, dict) and int(sb.get("n", 0) or 0) > 0:
+                if isinstance(sb, dict) and int(sb.get("n", 0) or 0) >= int(MIN_IA_SENIALES_CONF):
                     pm = float(sb.get("avg_pred", 0.0) or 0.0)
                     wr = float(sb.get("win_rate", 0.0) or 0.0)
                     ip = float(sb.get("inflacion_pp", 0.0) or 0.0)
