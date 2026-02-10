@@ -1407,6 +1407,9 @@ def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: st
             "bot": str(bot),
             "epoch": int(epoch) if epoch is not None else 0,
             "prob": float(prob) if isinstance(prob, (int, float)) else None,
+            # prob_hud/modo_hud = valor vigente que pinta el HUD del maestro (fuente visual principal)
+            "prob_hud": float(st.get("prob_ia")) if isinstance(st.get("prob_ia"), (int, float)) else None,
+            "modo_hud": str(st.get("modo_ia", "off") or "off").upper(),
             "prob_raw": float(st.get("prob_ia_raw")) if isinstance(st.get("prob_ia_raw"), (int, float)) else None,
             "calib_factor": float(st.get("cal_factor")) if isinstance(st.get("cal_factor"), (int, float)) else None,
             "auc": float((meta or {}).get("auc", 0.0) or 0.0),
