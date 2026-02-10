@@ -910,6 +910,7 @@ def cargar_tokens():
             time.sleep(3)
 
 TOKEN_DEMO, TOKEN_REAL = cargar_tokens()
+_token_archivo_ultimo_valido = None  # evita rebotes falsos a DEMO por lecturas parciales
 
 def reset_csv_and_total():
     """
@@ -933,16 +934,28 @@ if not os.path.exists(ARCHIVO_CSV):
 
 def leer_token_desde_archivo():
     """
-    Lee ARCHIVO_TOKEN. Si contiene 'REAL:fulll46' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
+    Lee ARCHIVO_TOKEN. Si contiene 'REAL:<NOMBRE_BOT>' -> TOKEN_REAL, si no -> TOKEN_DEMO.
+    Si el archivo está vacío/inválido en una lectura puntual (race con el maestro),
+    conserva el último token válido para evitar rebotes falsos de coordinación.
     """
+    global _token_archivo_ultimo_valido
+    expected = f"REAL:{NOMBRE_BOT}".upper()
     try:
         with open(ARCHIVO_TOKEN, "r", encoding="utf-8", errors="replace") as f:
-            linea = f.read().strip()
-            if linea == f"REAL:{NOMBRE_BOT}":
-                return TOKEN_REAL
-    except:
-        pass
-    return TOKEN_DEMO
+            linea = (f.read() or "").strip()
+            if not linea:
+                raise ValueError("token vacío")
+
+            token = TOKEN_REAL if linea.upper() == expected else TOKEN_DEMO
+            _token_archivo_ultimo_valido = token
+            return token
+    except Exception as e:
+        # Si hubo lectura parcial (escritura atómica en progreso), reutiliza el último válido.
+        if _token_archivo_ultimo_valido is not None:
+            if _print_once("token-read-fallback", ttl=20):
+                print(Fore.YELLOW + f"Lectura inestable de token ({e}). Manteniendo último modo válido.")
+            return _token_archivo_ultimo_valido
+        return TOKEN_DEMO
 
 def calcular_rsi(cierres, periodo=14):
     if len(cierres) < periodo + 1:
