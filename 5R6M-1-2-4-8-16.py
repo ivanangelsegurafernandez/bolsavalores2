@@ -1404,7 +1404,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
     except Exception:
         pass
 
-def escribir_orden_real(bot: str, ciclo: int):
+def escribir_orden_real(bot: str, ciclo: int) -> bool:
     global REAL_OWNER_LOCK
     """
     Wrapper oficial:
@@ -1424,7 +1424,7 @@ def escribir_orden_real(bot: str, ciclo: int):
             agregar_evento(f"🔒 Orden REAL bloqueada para {bot.upper()}: {owner_lock.upper()} está activo.")
         except Exception:
             pass
-        return
+        return False
 
     # ✅ Auditoría Real vs Ficticia: abrir señal SOLO si esta orden está respaldada por IA (prob >= umbral)
     try:
@@ -1441,6 +1441,9 @@ def escribir_orden_real(bot: str, ciclo: int):
 
     _escribir_orden_real_raw(bot, ciclo)
     activar_real_inmediato(bot, ciclo, origen="orden_real")
+
+    owner_after = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+    return owner_after == bot
 # === FIN PATCH REAL INMEDIATO ===
 # === IA ACK (handshake maestro→bot: confirma que el PRE-TRADE ya fue evaluado) ===
 IA_ACK_DIR = "ia_ack"
@@ -6758,7 +6761,9 @@ def forzar_real_manual(bot: str, ciclo: int):
                 pass
 
 
-        escribir_orden_real(bot, ciclo)  
+        if not escribir_orden_real(bot, ciclo):
+            agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
+            return
 
         estado_bots[bot]["reintentar_ciclo"] = True
         estado_bots[bot]["ciclo_actual"] = ciclo
@@ -6770,17 +6775,6 @@ def forzar_real_manual(bot: str, ciclo: int):
         val = obtener_valor_saldo()
         if val is None or val < requerido:
             agregar_evento(f"⚠️ Saldo < requerido para ciclo #{ciclo} en {bot} (pide {requerido}). Intentando igual.")
-
-        owner = leer_token_actual()
-        if owner and owner not in (bot, "none"):
-            agregar_evento(f"🔓 Liberando token (estaba en {owner})…")
-            with file_lock():
-                write_token_atomic(TOKEN_FILE, "REAL:none")
-            try:
-                reinicio_forzado.set()
-            except Exception:
-                pass
-            time.sleep(0.2)
 
         # escribir_orden_real(...) ya dejó token+HUD sincronizados; evitamos doble token_sync.
         agregar_evento(f"⚡ Forzar REAL: {bot} → ciclo #{ciclo} (fuente=MANUAL)")
@@ -7622,12 +7616,15 @@ async def main():
                                 estado_bots[mejor_bot]["ia_senal_pendiente"] = True
                                 estado_bots[mejor_bot]["ia_prob_senal"] = prob
                                 ciclo_auto = int(marti_paso) + 1
-                                escribir_orden_real(mejor_bot, ciclo_auto)
-                                estado_bots[mejor_bot]["fuente"] = "IA_AUTO"
-                                estado_bots[mejor_bot]["token"] = "REAL"
-                                estado_bots[mejor_bot]["ciclo_actual"] = ciclo_auto
-                                activo_real = mejor_bot
-                                marti_activa = True
+                                ok_real = escribir_orden_real(mejor_bot, ciclo_auto)
+                                if ok_real:
+                                    estado_bots[mejor_bot]["fuente"] = "IA_AUTO"
+                                    estado_bots[mejor_bot]["ciclo_actual"] = ciclo_auto
+                                    activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else mejor_bot
+                                    marti_activa = True
+                                else:
+                                    estado_bots[mejor_bot]["ia_senal_pendiente"] = False
+                                    estado_bots[mejor_bot]["ia_prob_senal"] = None
                         else:
                             max_prob = max((estado_bots[bot]["prob_ia"] for bot in BOT_NAMES if estado_bots[bot]["ia_ready"]), default=0)
                             if max_prob < umbral_ia:
