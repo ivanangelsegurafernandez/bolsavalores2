@@ -127,13 +127,13 @@ HUD_LAYOUT = "bottom_center"  # Fijado en centro inferior
 HUD_VISIBLE = True       # Para ocultarlo con tecla
 
 # --- Oráculo visual ---
-ORACULO_THR_MIN   = 0.80
+ORACULO_THR_MIN   = 0.75
 ORACULO_N_MIN     = 40
 ORACULO_DELTA_PRE = 0.05
 
 # Umbral único (verde + aviso IA)  -> esto NO lo tocamos
-IA_VERDE_THR = 0.80
-AUTO_REAL_THR = 0.80  # umbral fijo para auto-promoción a REAL
+IA_VERDE_THR = 0.75
+AUTO_REAL_THR = 0.75  # umbral fijo para auto-promoción a REAL
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
 # OJO: también se usa como piso en get_umbral_operativo(), así que NO lo bajamos para no cambiar conducta del bot.
@@ -146,7 +146,7 @@ IA_CALIB_GOAL_THRESHOLD = 0.70  # objetivo: medir cierres fuertes (≥70%)
 IA_CALIB_MIN_CLOSED = 200  # mínimo recomendado para considerar estable la auditoría
 
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
-AUDIO_IA53_THR = 0.80
+AUDIO_IA53_THR = 0.75
 
 # Anti-spam + rearme
 AUDIO_IA53_COOLDOWN_S = 20     # no repetir más de 1 vez cada X segundos por bot
@@ -5255,7 +5255,7 @@ def _umbral_alerta_ia(meta: dict | None = None) -> float:
     try:
         thr = float(AUDIO_IA53_THR)
     except Exception:
-        thr = 0.80
+        thr = 0.75
     if thr < 0.0:
         thr = 0.0
     if thr > 1.0:
@@ -5300,7 +5300,7 @@ def _thr_visual_verde() -> float:
     try:
         return float(IA_VERDE_THR)
     except Exception:
-        return 0.80
+        return 0.75
 
 def _thr_visual_amarillo() -> float:
     # Amarillo: zona previa (por defecto 65% si verde es 70%)
@@ -6008,20 +6008,20 @@ def mostrar_panel():
     # Resumen rápido para que el HUD no se vea "vacío"
     try:
         bots_con_prob = 0
-        bots_80 = 0
+        bots_75 = 0
         mejor = None
         for b in BOT_NAMES:
             pb = estado_bots.get(b, {}).get("prob_ia")
             if isinstance(pb, (int, float)):
                 bots_con_prob += 1
                 if float(pb) >= float(AUTO_REAL_THR):
-                    bots_80 += 1
+                    bots_75 += 1
                 if (mejor is None) or (float(pb) > mejor[1]):
                     mejor = (b, float(pb))
         owner = leer_token_actual()
         owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
         mejor_txt = "--" if mejor is None else f"{mejor[0]} {mejor[1]*100:.1f}%"
-        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥80%: {bots_80} | Mejor: {mejor_txt} | Token: {owner_txt}")
+        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥75%: {bots_75} | Mejor: {mejor_txt} | Token: {owner_txt}")
 
         if owner not in (None, "none") and mejor is not None and owner != mejor[0]:
             print(padding + Fore.YELLOW + f"⛓️ Token bloqueado en {owner}; mejor IA actual es {mejor[0]} ({mejor[1]*100:.1f}%).")
@@ -7489,6 +7489,17 @@ async def main():
 
                     if not activo_real:
                         set_etapa("TICK_03")
+
+                        # 🔒 Lock estricto: si token_actual.txt ya tiene dueño REAL,
+                        # no evaluamos ni promovemos otro bot aunque cumpla umbral.
+                        owner_lock = leer_token_actual()
+                        if owner_lock in BOT_NAMES:
+                            activo_real = owner_lock
+                            for b in BOT_NAMES:
+                                if b != owner_lock:
+                                    estado_bots[b]["ia_senal_pendiente"] = False
+                                    estado_bots[b]["ia_prob_senal"] = None
+                            continue
                         # Usamos el MISMO umbral operativo que HUD + audio
                         meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta()
                         umbral_ia = max(get_umbral_operativo(meta_local or {}), float(AUTO_REAL_THR))
