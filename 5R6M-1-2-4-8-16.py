@@ -1383,6 +1383,7 @@ def escribir_orden_real(bot: str, ciclo: int):
 # === FIN PATCH REAL INMEDIATO ===
 # === IA ACK (handshake maestro→bot: confirma que el PRE-TRADE ya fue evaluado) ===
 IA_ACK_DIR = "ia_ack"
+_LAST_IA_ACK_HEARTBEAT_TS = 0.0
 
 def path_ia_ack(bot: str) -> str:
     _ensure_dir(IA_ACK_DIR)
@@ -1423,6 +1424,36 @@ def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: st
             json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+def refrescar_ia_ack_desde_hud(intervalo_s: float = 1.0):
+    """
+    Heartbeat de ACK: mantiene `ia_ack/<bot>.json` sincronizado con el HUD.
+    Objetivo: que los bots vean la prob IA vigente del maestro durante GateWin,
+    incluso si no entraron filas nuevas de CSV en ese instante.
+    """
+    global _LAST_IA_ACK_HEARTBEAT_TS
+    now = time.time()
+    if (now - float(_LAST_IA_ACK_HEARTBEAT_TS or 0.0)) < float(intervalo_s):
+        return
+
+    meta = leer_model_meta() or {}
+    for bot in BOT_NAMES:
+        try:
+            st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
+            ep = st.get("ultimo_epoch_pretrade", 0)
+            if ep is None:
+                ep = 0
+            ep = int(float(ep)) if str(ep).strip() != "" else 0
+            if ep <= 0:
+                continue
+
+            p = st.get("prob_ia", None)
+            modo = str(st.get("modo_ia", "off") or "off").upper()
+            escribir_ia_ack(bot, ep, p if isinstance(p, (int, float)) else None, modo, meta)
+        except Exception:
+            continue
+
+    _LAST_IA_ACK_HEARTBEAT_TS = now
 # Leer token actual
 def leer_token_actual():
     """
@@ -6838,6 +6869,15 @@ async def cargar_datos_bot(bot, token_actual):
             #    - NO tocamos historial, n, ni %éxito (evita los “·” intercalados)
             # =========================
             if resultado not in ("GANANCIA", "PÉRDIDA"):
+                # Guarda epoch PRE más reciente para heartbeat ACK (sin depender de filas nuevas constantes)
+                try:
+                    ep_pre = fila_dict.get("epoch", 0)
+                    ep_pre = int(float(ep_pre)) if str(ep_pre).strip() != "" else 0
+                    if ep_pre > 0:
+                        estado_bots[bot]["ultimo_epoch_pretrade"] = ep_pre
+                except Exception:
+                    pass
+
                 # Si el bot marcó CERRADO pero no trajo resultado válido,
                 # cerramos señal pendiente (si existía) sin contaminar historial.
                 if trade_status == "CERRADO":
@@ -7162,6 +7202,8 @@ async def main():
             try:  
                 set_etapa("TICK_01")
                 token_actual_loop = leer_token_actual()
+                # Heartbeat: mantiene ACK alineado al HUD aunque no entren filas nuevas ese tick.
+                refrescar_ia_ack_desde_hud(intervalo_s=1.0)
                 activo_real = next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
                 for bot in BOT_NAMES:
                     try:  # Aislamiento per-bot para evitar skips globales
