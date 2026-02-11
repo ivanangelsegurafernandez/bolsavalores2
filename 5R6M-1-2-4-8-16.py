@@ -7095,6 +7095,9 @@ async def cargar_datos_bot(bot, token_actual):
     try:
         snapshot = SNAPSHOT_FILAS.get(bot, 0)
 
+        # Fuente de verdad de owner REAL para no pintar DEMO transitorio en HUD/tabla.
+        effective_owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else token_actual
+
         # Gate rápido (opcional): si el archivo no creció, salimos sin leer todo el CSV
         actual = contar_filas_csv(bot)
         if actual <= snapshot:
@@ -7149,7 +7152,7 @@ async def cargar_datos_bot(bot, token_actual):
                         estado_bots[bot]["ia_senal_pendiente"] = False
                         estado_bots[bot]["ia_prob_senal"] = None
 
-                    estado_bots[bot]["token"] = "REAL" if token_actual == bot else "DEMO"
+                    estado_bots[bot]["token"] = "REAL" if effective_owner == bot else "DEMO"
                     last_update_time[bot] = time.time()
                     continue
 
@@ -7203,7 +7206,7 @@ async def cargar_datos_bot(bot, token_actual):
 
 
 
-                estado_bots[bot]["token"] = "REAL" if token_actual == bot else "DEMO"
+                estado_bots[bot]["token"] = "REAL" if effective_owner == bot else "DEMO"
                 last_update_time[bot] = time.time()
                 continue
 
@@ -7263,7 +7266,7 @@ async def cargar_datos_bot(bot, token_actual):
                 estado_bots[bot]["ia_senal_pendiente"] = False
                 estado_bots[bot]["ia_prob_senal"] = None
 
-            estado_bots[bot]["token"] = "REAL" if token_actual == bot else "DEMO"
+            estado_bots[bot]["token"] = "REAL" if effective_owner == bot else "DEMO"
             last_update_time[bot] = time.time()
 
         # Mantén tu pipeline incremental como estaba
@@ -7465,7 +7468,7 @@ async def main():
 
             try:  
                 set_etapa("TICK_01")
-                token_actual_loop = leer_token_actual()
+                token_actual_loop = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
                 # Heartbeat: mantiene ACK alineado al HUD aunque no entren filas nuevas ese tick.
                 refrescar_ia_ack_desde_hud(intervalo_s=1.0)
                 owner_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
