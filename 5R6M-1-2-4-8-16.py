@@ -141,6 +141,7 @@ IA_METRIC_THRESHOLD = IA_VERDE_THR
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
 IA_CALIB_THRESHOLD = 0.60
+IA_CALIB_MIN_CLOSED = 200  # mínimo recomendado para considerar estable la auditoría
 
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
 AUDIO_IA53_THR = 0.80
@@ -1652,6 +1653,31 @@ def normalizar_trade_status(ts):
     except Exception:
         return ""
 
+def canonicalizar_campos_bot_maestro(row_dict: dict | None):
+    """
+    Mapeo central BOT -> Maestro para mantener un único esquema canónico.
+
+    Este normalizador NO inventa datos: solo renombra/duplica aliases conocidos
+    hacia los nombres oficiales que consume la IA del maestro.
+    """
+    out = dict(row_dict or {})
+
+    alias_map = {
+        "direction": ("direccion",),
+        "ciclo_martingala": ("ciclo",),
+        "cruce_sma": ("cruce",),
+        "payout_multiplier": ("payout_decimal_rounded",),
+    }
+
+    for canon, aliases in alias_map.items():
+        if out.get(canon) in (None, ""):
+            for a in aliases:
+                if out.get(a) not in (None, ""):
+                    out[canon] = out.get(a)
+                    break
+
+    return out
+
 # ==========================================================
 # Payout/ROI — Normalización consistente (SIN confundir %)
 # Convención:
@@ -2283,7 +2309,7 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
         if pre_row is None:
             return None, None
 
-        row_dict_full = dict(pre_row)
+        row_dict_full = canonicalizar_campos_bot_maestro(pre_row)
 
         # 3) Asegurar monto (stake) desde PRE; si falta, tomar del cierre (monto NO filtra label)
         if ("monto" not in row_dict_full) or (row_dict_full.get("monto") in (None, "", 0, 0.0)):
@@ -3099,6 +3125,8 @@ def auditar_calibracion_seniales_reales(min_prob: float = 0.70, max_rows: int = 
         except Exception:
             por_bot = {}
 
+        stable_sample = bool(len(d) >= int(IA_CALIB_MIN_CLOSED))
+
         return {
             "n": int(len(d)),
             "win_rate": win_rate,
@@ -3107,6 +3135,8 @@ def auditar_calibracion_seniales_reales(min_prob: float = 0.70, max_rows: int = 
             "factor": factor,
             "brier": brier,
             "ece": ece,
+            "stable_sample": stable_sample,
+            "min_recommended_n": int(IA_CALIB_MIN_CLOSED),
             "por_bot": por_bot,
         }
     except Exception:

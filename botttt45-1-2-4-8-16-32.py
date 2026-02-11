@@ -411,6 +411,13 @@ CSV_HEADER = [
     "epoch",
     "ts"
 ]
+
+# Contrato único de payout para BOT -> Maestro.
+# - payout_total: retorno total en USD (stake + profit)
+# - payout_multiplier: ratio total/stake (>= 1.0 en condiciones normales)
+# Nota: el campo IA `payout` del maestro se deriva de estos dos (ROI),
+# no se escribe aquí para evitar ambigüedad semántica.
+PAYOUT_MULTIPLIER_SPLIT = 3.5
 # =============================================================================
 # CSV — helpers robustos (evita columnas corridas + asegura puntaje 0..1)
 # =============================================================================
@@ -456,6 +463,46 @@ def _norm_puntaje_01(condiciones, total_cond=3):
         return float(v)
     except Exception:
         return 0.0
+
+def _normalizar_payout_contractual(payout_value, monto_value):
+    """
+    Normalización contractual única de payout.
+
+    Reglas:
+    - Si payout <= PAYOUT_MULTIPLIER_SPLIT, se interpreta como payout_multiplier.
+    - Si payout > PAYOUT_MULTIPLIER_SPLIT, se interpreta como payout_total.
+    - Siempre devuelve tupla (payout_total, payout_multiplier) con floats finitos >= 0.
+    """
+    payout_total = 0.0
+    payout_multiplier = 0.0
+
+    try:
+        monto_f = float(monto_value) if monto_value not in (None, "", "nan", "NaN") else 0.0
+    except Exception:
+        monto_f = 0.0
+
+    try:
+        payout_f = float(payout_value) if payout_value not in (None, "", "nan", "NaN") else 0.0
+    except Exception:
+        payout_f = 0.0
+
+    try:
+        import math
+        if not math.isfinite(monto_f):
+            monto_f = 0.0
+        if not math.isfinite(payout_f):
+            payout_f = 0.0
+    except Exception:
+        pass
+
+    if payout_f > 0 and payout_f <= PAYOUT_MULTIPLIER_SPLIT:
+        payout_multiplier = payout_f
+        payout_total = (monto_f * payout_multiplier) if monto_f > 0 else 0.0
+    elif payout_f > PAYOUT_MULTIPLIER_SPLIT:
+        payout_total = payout_f
+        payout_multiplier = (payout_total / monto_f) if monto_f > 0 else 0.0
+
+    return float(max(0.0, payout_total)), float(max(0.0, payout_multiplier))
 
 def _write_row_dict_atomic(archivo_csv: str, row_dict: dict):
     """
@@ -639,32 +686,7 @@ def write_pretrade_snapshot(
     except Exception:
         monto_f = 0.0
 
-    # -------------------------
-    # payout robusto
-    # -------------------------
-    payout_total_f = 0.0
-    payout_mult_f = 0.0
-    try:
-        p = float(payout) if payout not in (None, "", "nan", "NaN") else 0.0
-        # si NaN/inf, lo anulamos
-        try:
-            import math
-            if not math.isfinite(p):
-                p = 0.0
-            if not math.isfinite(monto_f):
-                monto_f = 0.0
-        except Exception:
-            pass
-
-        if p > 0 and p <= 3.5:
-            payout_mult_f = p
-            payout_total_f = (monto_f * payout_mult_f) if monto_f > 0 else 0.0
-        elif p > 3.5:
-            payout_total_f = p
-            payout_mult_f = (payout_total_f / monto_f) if monto_f > 0 else 0.0
-    except Exception:
-        payout_total_f = 0.0
-        payout_mult_f = 0.0
+    payout_total_f, payout_mult_f = _normalizar_payout_contractual(payout, monto_f)
 
     # -------------------------
     # puntaje 0..1
@@ -1591,50 +1613,11 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                 es_rebote_flag = 1 if (racha_anterior <= -4) else 0
 
                 # 3) Escribir fila en CSV
-                # ==========================================================
-                # payout robusto (CIERRE NORMAL):
-                # - si payout <= 3.5 => es payout_multiplier (ratio_total)
-                # - si payout > 3.5  => es payout_total (USD)
-                # Resultado SIEMPRE coherente:
-                #   payout_total_f y ratio_total
-                # ==========================================================
-                payout_total_f = 0.0
-                ratio_total = 0.0
-                # monto
                 try:
                     monto_f = float(monto) if monto not in (None, "", "nan", "NaN") else 0.0
                 except Exception:
                     monto_f = 0.0
-
-                # payout (puede venir como multiplier o como total)
-                try:
-                    p = float(payout) if payout not in (None, "", "nan", "NaN") else 0.0
-                except Exception:
-                    p = 0.0
-                # si p es NaN/inf, lo anulamos
-                try:
-                    import math
-                    if not math.isfinite(p):
-                        p = 0.0
-                    if not math.isfinite(monto_f):
-                        monto_f = 0.0
-                except Exception:
-                    pass                   
-                try:
-                    if p > 0 and p <= 3.5:
-                        # payout viene como multiplier (1.95 etc.)
-                        ratio_total = p
-                        payout_total_f = (monto_f * ratio_total) if monto_f > 0 else 0.0
-                    elif p > 3.5:
-                        # payout viene como total (USD)
-                        payout_total_f = p
-                        ratio_total = (payout_total_f / monto_f) if monto_f > 0 else 0.0
-                    else:
-                        payout_total_f = 0.0
-                        ratio_total = 0.0
-                except Exception:
-                    payout_total_f = 0.0
-                    ratio_total = 0.0
+                payout_total_f, ratio_total = _normalizar_payout_contractual(payout, monto_f)
 
                 now = datetime.now(timezone.utc)
                 epoch_val = int(epoch_pretrade) if epoch_pretrade is not None else int(now.timestamp())
@@ -1784,54 +1767,11 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
         epoch_val = int(epoch_pretrade) if epoch_pretrade is not None else int(now.timestamp())
         ts_val = now.isoformat()
 
-        # ==========================================================
-        # payout robusto:
-        # - si payout <= 3.5 => es payout_multiplier (ratio_total)
-        # - si payout > 3.5  => es payout_total (USD)
-        # Guardamos SIEMPRE:
-        #   payout_total = monto * payout_multiplier
-        #   payout_multiplier = payout_total / monto
-        # ==========================================================
-        payout_total = 0.0
-        payout_ratio_total = 0.0
-
-        # monto
         try:
             monto_f = float(monto) if monto not in (None, "", "nan", "NaN") else 0.0
         except Exception:
             monto_f = 0.0
-
-        # payout (puede venir como multiplier o como total)
-        try:
-            p = float(payout) if payout not in (None, "", "nan", "NaN") else 0.0
-        except Exception:
-            p = 0.0
-
-        # si p es NaN/inf, lo anulamos
-        try:
-            import math
-            if not math.isfinite(p):
-                p = 0.0
-            if not math.isfinite(monto_f):
-                monto_f = 0.0
-        except Exception:
-            pass
-
-        try:
-            if p > 0 and p <= 3.5:
-                # payout viene como multiplier (1.95 etc.)
-                payout_ratio_total = p
-                payout_total = (monto_f * payout_ratio_total) if monto_f > 0 else 0.0
-            elif p > 3.5:
-                # payout viene como total (15.62 etc.)
-                payout_total = p
-                payout_ratio_total = (payout_total / monto_f) if monto_f > 0 else 0.0
-            else:
-                payout_total = 0.0
-                payout_ratio_total = 0.0
-        except Exception:
-            payout_total = 0.0
-            payout_ratio_total = 0.0
+        payout_total, payout_ratio_total = _normalizar_payout_contractual(payout, monto_f)
 
         async with csv_lock:
             # ==========================
