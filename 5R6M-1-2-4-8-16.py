@@ -6110,9 +6110,13 @@ def mostrar_panel():
     meta = leer_model_meta()
     umbral_ia = get_umbral_dinamico(meta, ORACULO_THR_MIN)
 
+    # Sincronía visual dura: si hay owner REAL en memoria, la tabla SIEMPRE lo refleja.
+    owner_visual = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+
     for bot in BOT_NAMES:
         r = estado_bots[bot]["resultados"]
-        token = estado_bots[bot]["token"].upper()
+        token = "REAL" if owner_visual == bot else "DEMO"
+        estado_bots[bot]["token"] = token
         src = estado_bots[bot].get("fuente")
 
         # Token + origen
