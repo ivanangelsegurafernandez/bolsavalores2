@@ -127,13 +127,13 @@ HUD_LAYOUT = "bottom_center"  # Fijado en centro inferior
 HUD_VISIBLE = True       # Para ocultarlo con tecla
 
 # --- Oráculo visual ---
-ORACULO_THR_MIN   = 0.80
+ORACULO_THR_MIN   = 0.75
 ORACULO_N_MIN     = 40
 ORACULO_DELTA_PRE = 0.05
 
 # Umbral único (verde + aviso IA)  -> esto NO lo tocamos
-IA_VERDE_THR = 0.80
-AUTO_REAL_THR = 0.80  # umbral fijo para auto-promoción a REAL
+IA_VERDE_THR = 0.75
+AUTO_REAL_THR = 0.75  # umbral fijo para auto-promoción a REAL
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
 # OJO: también se usa como piso en get_umbral_operativo(), así que NO lo bajamos para no cambiar conducta del bot.
@@ -146,7 +146,7 @@ IA_CALIB_GOAL_THRESHOLD = 0.70  # objetivo: medir cierres fuertes (≥70%)
 IA_CALIB_MIN_CLOSED = 200  # mínimo recomendado para considerar estable la auditoría
 
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
-AUDIO_IA53_THR = 0.80
+AUDIO_IA53_THR = 0.75
 
 # Anti-spam + rearme
 AUDIO_IA53_COOLDOWN_S = 20     # no repetir más de 1 vez cada X segundos por bot
@@ -421,6 +421,7 @@ OCULTAR_HASTA_NUEVO = {bot: False for bot in BOT_NAMES}
 t_inicio_indef = {bot: None for bot in BOT_NAMES}
 last_update_time = {bot: time.time() for bot in BOT_NAMES}
 LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mismo cierre REAL varias veces
+REAL_OWNER_LOCK = None  # owner REAL en memoria (evita carreras de lectura de archivo)
 
 try:
     last_sig_por_bot
@@ -1262,13 +1263,32 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
     - Si la orden viene por escribir_orden_real(...), ese wrapper YA escribe el JSON.
     - Flujos de sync/UI/token jamás deben escribir orden_real.json.
     """
-    global LIMPIEZA_PANEL_HASTA, sonido_disparado, marti_paso
+    global LIMPIEZA_PANEL_HASTA, sonido_disparado, marti_paso, REAL_OWNER_LOCK
 
     try:
         if bot not in BOT_NAMES:
             return
 
         now = time.time()
+
+        # 🔒 No permitir reemplazar owner REAL activo por otro bot.
+        # Solo se puede activar si no hay owner o si es el mismo bot.
+        try:
+            owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+        except Exception:
+            owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        if owner_lock in BOT_NAMES and owner_lock != bot:
+            try:
+                agregar_evento(f"🔒 REAL bloqueado: {owner_lock.upper()} sigue activo. Ignorando intento de {bot.upper()}.")
+            except Exception:
+                pass
+            try:
+                if origen == "orden_real":
+                    limpiar_orden_real(bot)
+            except Exception:
+                pass
+            return
+
 
         # Anti doble-disparo (tecla rebotona)
         if (now - _last_real_push_ts.get(bot, 0.0)) < 0.25:
@@ -1299,6 +1319,9 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
             prev_holder = leer_token_actual()  # sincroniza UI
         except Exception:
             prev_holder = None
+
+        # Reservar lock owner en memoria + token REAL en archivo
+        REAL_OWNER_LOCK = bot
 
         # Reservar token REAL en archivo SOLO cuando corresponde:
         # - orden_real: orden explícita ya escrita por wrapper
@@ -1382,12 +1405,27 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
         pass
 
 def escribir_orden_real(bot: str, ciclo: int):
+    global REAL_OWNER_LOCK
     """
     Wrapper oficial:
     - Escribe orden_real.json (RAW)
     - Activa REAL inmediato en HUD + token file
     """
     ciclo = max(1, min(int(ciclo), MAX_CICLOS))
+
+    # 🔒 No crear orden si ya hay otro owner REAL activo.
+    try:
+        owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+    except Exception:
+        owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+
+    if owner_lock in BOT_NAMES and owner_lock != bot:
+        try:
+            agregar_evento(f"🔒 Orden REAL bloqueada para {bot.upper()}: {owner_lock.upper()} está activo.")
+        except Exception:
+            pass
+        return
+
     # ✅ Auditoría Real vs Ficticia: abrir señal SOLO si esta orden está respaldada por IA (prob >= umbral)
     try:
         st = estado_bots.get(str(bot), {}) if isinstance(estado_bots, dict) else {}
@@ -1401,10 +1439,8 @@ def escribir_orden_real(bot: str, ciclo: int):
     except Exception:
         pass
 
-    
     _escribir_orden_real_raw(bot, ciclo)
     activar_real_inmediato(bot, ciclo, origen="orden_real")
-
 # === FIN PATCH REAL INMEDIATO ===
 # === IA ACK (handshake maestro→bot: confirma que el PRE-TRADE ya fue evaluado) ===
 IA_ACK_DIR = "ia_ack"
@@ -1550,6 +1586,7 @@ def activar_remate(bot: str, reason: str):
 
 # Cerrar por WIN
 def cerrar_por_win(bot: str, reason: str):
+    global REAL_OWNER_LOCK
     # Limpieza total de “estado REAL” para evitar REAL fantasma
     try:
         estado_bots[bot]["token"] = "DEMO"
@@ -1574,6 +1611,7 @@ def cerrar_por_win(bot: str, reason: str):
         pass
 
     # Liberar token global REAL
+    REAL_OWNER_LOCK = None
     try:
         with file_lock():
             write_token_atomic(TOKEN_FILE, "REAL:none")
@@ -4124,6 +4162,7 @@ def reiniciar_bot(bot, borrar_csv=False):
         huellas_usadas[bot] = set()
 
 def cerrar_por_fin_de_ciclo(bot: str, reason: str):
+    global REAL_OWNER_LOCK
     # Limpieza total de “estado REAL” para evitar HUD/estado fantasma
     try:
         estado_bots[bot]["token"] = "DEMO"
@@ -4149,6 +4188,7 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
         pass
 
     # Liberar token global REAL
+    REAL_OWNER_LOCK = None
     try:
         with file_lock():
             write_token_atomic(TOKEN_FILE, "REAL:none")
@@ -5255,7 +5295,7 @@ def _umbral_alerta_ia(meta: dict | None = None) -> float:
     try:
         thr = float(AUDIO_IA53_THR)
     except Exception:
-        thr = 0.80
+        thr = 0.75
     if thr < 0.0:
         thr = 0.0
     if thr > 1.0:
@@ -5300,7 +5340,7 @@ def _thr_visual_verde() -> float:
     try:
         return float(IA_VERDE_THR)
     except Exception:
-        return 0.80
+        return 0.75
 
 def _thr_visual_amarillo() -> float:
     # Amarillo: zona previa (por defecto 65% si verde es 70%)
@@ -6008,20 +6048,20 @@ def mostrar_panel():
     # Resumen rápido para que el HUD no se vea "vacío"
     try:
         bots_con_prob = 0
-        bots_80 = 0
+        bots_75 = 0
         mejor = None
         for b in BOT_NAMES:
             pb = estado_bots.get(b, {}).get("prob_ia")
             if isinstance(pb, (int, float)):
                 bots_con_prob += 1
                 if float(pb) >= float(AUTO_REAL_THR):
-                    bots_80 += 1
+                    bots_75 += 1
                 if (mejor is None) or (float(pb) > mejor[1]):
                     mejor = (b, float(pb))
         owner = leer_token_actual()
         owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
         mejor_txt = "--" if mejor is None else f"{mejor[0]} {mejor[1]*100:.1f}%"
-        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥80%: {bots_80} | Mejor: {mejor_txt} | Token: {owner_txt}")
+        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥75%: {bots_75} | Mejor: {mejor_txt} | Token: {owner_txt}")
 
         if owner not in (None, "none") and mejor is not None and owner != mejor[0]:
             print(padding + Fore.YELLOW + f"⛓️ Token bloqueado en {owner}; mejor IA actual es {mejor[0]} ({mejor[1]*100:.1f}%).")
@@ -7362,7 +7402,7 @@ if sys.stdout.isatty():
 # Main - Añadida pasada inicial para sincronizar HUD con CSV existentes
 async def main():
     global salir, pausado, reinicio_manual, SALDO_INICIAL
-    global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA
+    global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA, REAL_OWNER_LOCK
 
     try:
         set_etapa("BOOT_01", "Inicializando main()", anunciar=True)
@@ -7425,7 +7465,11 @@ async def main():
                 token_actual_loop = leer_token_actual()
                 # Heartbeat: mantiene ACK alineado al HUD aunque no entren filas nuevas ese tick.
                 refrescar_ia_ack_desde_hud(intervalo_s=1.0)
-                activo_real = next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
+                owner_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+                owner_file = token_actual_loop if token_actual_loop in BOT_NAMES else None
+                activo_real = owner_mem or owner_file or next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
+                if activo_real in BOT_NAMES:
+                    _set_ui_token_holder(activo_real)
                 for bot in BOT_NAMES:
                     try:  # Aislamiento per-bot para evitar skips globales
                         if reinicio_forzado.is_set():
@@ -7454,6 +7498,7 @@ async def main():
                                 estado_bots[bot]["fuente"] = None
                                 with file_lock():
                                     write_token_atomic(TOKEN_FILE, "REAL:none")
+                                REAL_OWNER_LOCK = None
                                 reinicio_forzado.set()
 
                     for bot in BOT_NAMES:
@@ -7486,9 +7531,20 @@ async def main():
                                     activo_real = None
                                     break
 
-
                     if not activo_real:
                         set_etapa("TICK_03")
+
+                        # 🔒 Lock estricto: si token_actual.txt ya tiene dueño REAL,
+                        # no evaluamos ni promovemos otro bot aunque cumpla umbral.
+                        owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+                        lock_activo = owner_lock in BOT_NAMES
+                        if lock_activo:
+                            activo_real = owner_lock
+                            for b in BOT_NAMES:
+                                if b != owner_lock:
+                                    estado_bots[b]["ia_senal_pendiente"] = False
+                                    estado_bots[b]["ia_prob_senal"] = None
+
                         # Usamos el MISMO umbral operativo que HUD + audio
                         meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta()
                         umbral_ia = max(get_umbral_operativo(meta_local or {}), float(AUTO_REAL_THR))
@@ -7502,20 +7558,21 @@ async def main():
 
                         # Candidatos: prob válida, reciente, IA activa (no OFF)
                         candidatos = []
-                        for b in BOT_NAMES:
-                            try:
-                                modo_b = str(estado_bots.get(b, {}).get("modo_ia", "off")).lower()
-                                if modo_b == "off":
+                        if not lock_activo:
+                            for b in BOT_NAMES:
+                                try:
+                                    modo_b = str(estado_bots.get(b, {}).get("modo_ia", "off")).lower()
+                                    if modo_b == "off":
+                                        continue
+                                    if not ia_prob_valida(b, max_age_s=12.0):
+                                        continue
+                                    p = estado_bots[b].get("prob_ia", None)
+                                    if isinstance(p, (int, float)) and float(p) >= float(umbral_ia):
+                                        candidatos.append((float(p), b))
+                                except Exception:
                                     continue
-                                if not ia_prob_valida(b, max_age_s=12.0):
-                                    continue
-                                p = estado_bots[b].get("prob_ia", None)
-                                if isinstance(p, (int, float)) and float(p) >= float(umbral_ia):
-                                    candidatos.append((float(p), b))
-                            except Exception:
-                                continue
 
-                        candidatos.sort(key=lambda x: x[0], reverse=True)
+                            candidatos.sort(key=lambda x: x[0], reverse=True)
 
                         # Si hay señal pero saldo insuficiente -> avisar y NO abrir ventana
                         if candidatos and saldo_val < costo_ciclo1:
