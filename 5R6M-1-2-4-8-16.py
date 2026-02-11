@@ -1530,8 +1530,15 @@ def leer_token_actual():
     """
     Lee token_actual.txt y además sincroniza el HUD (estado_bots[*]["token"])
     para que REAL/DEMO se refleje sin esperar compra del bot.
+    Prioriza lock en memoria para evitar parpadeos DEMO durante REAL en curso.
     """
-    holder = None
+    holder = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+
+    # Si ya hay owner REAL en memoria, mantenemos sincronía visual inmediata.
+    if holder in BOT_NAMES:
+        _set_ui_token_holder(holder)
+        return holder
+
     if not os.path.exists(TOKEN_FILE):
         _set_ui_token_holder(None)
         return None
@@ -1551,8 +1558,9 @@ def leer_token_actual():
             print(f"⚠️ Error leyendo token: {e}")
         except Exception:
             pass
-        _set_ui_token_holder(None)
-        return None
+        fallback = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        _set_ui_token_holder(fallback)
+        return fallback
 
 # Escribir token actual
 async def escribir_token_actual(bot):
@@ -7096,7 +7104,10 @@ async def cargar_datos_bot(bot, token_actual):
         snapshot = SNAPSHOT_FILAS.get(bot, 0)
 
         # Fuente de verdad de owner REAL para no pintar DEMO transitorio en HUD/tabla.
-        effective_owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else token_actual
+        effective_owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else (token_actual if token_actual in BOT_NAMES else next((b for b in BOT_NAMES if estado_bots.get(b, {}).get("token") == "REAL"), None))
+
+        # Sincroniza token visual SIEMPRE, incluso si no entran filas nuevas este tick.
+        estado_bots[bot]["token"] = "REAL" if effective_owner == bot else "DEMO"
 
         # Gate rápido (opcional): si el archivo no creció, salimos sin leer todo el CSV
         actual = contar_filas_csv(bot)
@@ -7468,7 +7479,7 @@ async def main():
 
             try:  
                 set_etapa("TICK_01")
-                token_actual_loop = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+                token_actual_loop = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else (leer_token_actual() or next((b for b in BOT_NAMES if estado_bots.get(b, {}).get("token") == "REAL"), None))
                 # Heartbeat: mantiene ACK alineado al HUD aunque no entren filas nuevas ese tick.
                 refrescar_ia_ack_desde_hud(intervalo_s=1.0)
                 owner_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
