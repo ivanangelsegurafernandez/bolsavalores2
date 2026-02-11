@@ -34,7 +34,7 @@
 # === BLOQUE 1 — IMPORTS Y ENTORNO BÁSICO ===
 import os, csv, time, random, asyncio, websockets, json, re
 from collections import deque
-from colorama import Fore, init
+from colorama import Fore, Style, init
 import pygame
 try:
     import winsound
@@ -133,6 +133,7 @@ ORACULO_DELTA_PRE = 0.05
 
 # Umbral único (verde + aviso IA)  -> esto NO lo tocamos
 IA_VERDE_THR = 0.80
+AUTO_REAL_THR = 0.80  # umbral fijo para auto-promoción a REAL
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
 # OJO: también se usa como piso en get_umbral_operativo(), así que NO lo bajamos para no cambiar conducta del bot.
@@ -188,12 +189,17 @@ MIN_FIT_ROWS_LOW  = 4          # umbral mínimo para permitir fit “experimenta
 RELIABLE_POS_MIN  = 20         # mínimos para considerar fiable (calibración/umbral estable)
 RELIABLE_NEG_MIN  = 20
 
-# Modo 100% manual: jamás promover a REAL automáticamente
-MODO_REAL_MANUAL = True
+# Modo manual desactivado: priorizamos automatización completa por Prob IA.
+# Si luego quieres volver al modo manual, ponlo en True.
+MODO_REAL_MANUAL = False
 
 # Martingala global
 marti_paso = 0
 marti_activa = False
+
+# Contador global de ciclos de martingala (HUD + orquestación automática)
+# 0 = sin pérdidas consecutivas en REAL; 1..MAX_CICLOS = racha de pérdidas vigente.
+marti_ciclos_perdidos = 0
 
 # Nueva: Umbrales mínimos para historial IA
 MIN_IA_SENIALES_CONF = 10  # Mínimo señales cerradas para confiar en prob_hist
@@ -3603,8 +3609,8 @@ _last_pred_ts = {b: 0.0 for b in BOT_NAMES}
 def actualizar_prob_ia_bot(bot: str):
     """
     Actualiza estado_bots[bot]['prob_ia'] de forma segura:
-    - Si hay prob válida: la escribe y marca ia_ready=True
-    - Si falla: NO pisa prob_ia a 0. Solo registra ia_ready=False y ia_last_err
+    - Si hay prob válida: la escribe, define modo_ia y marca ia_ready=True.
+    - Si falla: NO pisa prob_ia a 0. Conserva último valor por TTL para no vaciar el HUD.
     """
     try:
         now = time.time()
@@ -3620,16 +3626,39 @@ def actualizar_prob_ia_bot(bot: str):
             estado_bots[bot]["ia_ready"] = True
             estado_bots[bot]["ia_last_err"] = None
             estado_bots[bot]["ia_last_prob_ts"] = now
+
+            # FIX UI/AUTO: garantizar modo_ia distinto de OFF cuando hay predicción.
+            try:
+                meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+                reliable = bool(meta_local.get("reliable", False))
+                n_samples = int(meta_local.get("n_samples", meta_local.get("n", 0)) or 0)
+                if reliable:
+                    modo = "confiable"
+                elif n_samples >= int(MIN_FIT_ROWS_LOW):
+                    modo = "modelo"
+                else:
+                    modo = "low_data"
+                estado_bots[bot]["modo_ia"] = modo
+            except Exception:
+                estado_bots[bot]["modo_ia"] = "modelo"
             return
 
         # fallo: no mates la última prob, solo marca error
-        estado_bots[bot]["ia_ready"] = False
         estado_bots[bot]["ia_last_err"] = err or "ERR"
 
-        # si hace demasiado que no hay prob válida, limpia a None (pero NO a 0)
+        # si hace demasiado que no hay prob válida, limpia a None
         last_ok = float(estado_bots[bot].get("ia_last_prob_ts", 0.0) or 0.0)
-        if last_ok <= 0.0 or (now - last_ok) > IA_PRED_TTL_S:
+        age = (now - last_ok) if last_ok > 0 else 10**9
+
+        if age <= IA_PRED_TTL_S and estado_bots[bot].get("prob_ia") is not None:
+            # Mantener último dato útil para que la UI no quede en '--'.
+            estado_bots[bot]["ia_ready"] = True
+            if str(estado_bots[bot].get("modo_ia", "")).strip().lower() in ("", "off"):
+                estado_bots[bot]["modo_ia"] = "stale"
+        else:
+            estado_bots[bot]["ia_ready"] = False
             estado_bots[bot]["prob_ia"] = None
+            estado_bots[bot]["modo_ia"] = "off"
 
     except Exception:
         # ultra defensivo: no romper loop
@@ -3982,7 +4011,7 @@ def detectar_martingala_perdida_completa(bot):
 
 # Reinicio completo - Corregido para no resetear métricas en modo suave
 def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True):
-    global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa
+    global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos
     with file_lock():
         write_token_atomic(TOKEN_FILE, "REAL:none")
     
@@ -4037,6 +4066,7 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
     eventos_recentes.clear()
     marti_paso = 0
     marti_activa = False
+    marti_ciclos_perdidos = 0
     LIMPIEZA_PANEL_HASTA = time.time() + limpiar_visual_segundos
 
 # Reinicio de bot individual - Corregido similar
@@ -4146,6 +4176,33 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
         agregar_evento(f"🔓 Cuenta REAL liberada para {bot.upper()} ({reason})")
     except Exception:
         pass
+
+def registrar_resultado_real(resultado: str, bot: str | None = None):
+    """
+    Actualiza el contador global de ciclos martingala para el HUD y la próxima
+    autoasignación REAL.
+
+    Reglas:
+    - GANANCIA: resetea a ciclo #1 (contador de pérdidas = 0).
+    - PÉRDIDA: incrementa ciclo hasta MAX_CICLOS (tope de blindaje).
+    """
+    global marti_ciclos_perdidos, marti_paso
+
+    res = normalizar_resultado(resultado)
+    if res == "GANANCIA":
+        marti_ciclos_perdidos = 0
+        marti_paso = 0
+    elif res == "PÉRDIDA":
+        marti_ciclos_perdidos = min(MAX_CICLOS, int(marti_ciclos_perdidos) + 1)
+        marti_paso = min(MAX_CICLOS - 1, int(marti_ciclos_perdidos))
+    else:
+        return
+
+    ciclo_sig = int(marti_paso) + 1
+    bot_msg = f" [{bot}]" if bot else ""
+    agregar_evento(
+        f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo={ciclo_sig}"
+    )
 
 # === FIN BLOQUE 9 ===
 
@@ -5934,6 +5991,26 @@ def mostrar_panel():
 
     print(padding + Fore.GREEN + f"💰 SALDO INICIAL {inicial_str} 🎯 META {meta_str}")
 
+    # Resumen rápido para que el HUD no se vea "vacío"
+    try:
+        bots_con_prob = 0
+        bots_80 = 0
+        mejor = None
+        for b in BOT_NAMES:
+            pb = estado_bots.get(b, {}).get("prob_ia")
+            if isinstance(pb, (int, float)):
+                bots_con_prob += 1
+                if float(pb) >= float(AUTO_REAL_THR):
+                    bots_80 += 1
+                if (mejor is None) or (float(pb) > mejor[1]):
+                    mejor = (b, float(pb))
+        owner = leer_token_actual()
+        owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
+        mejor_txt = "--" if mejor is None else f"{mejor[0]} {mejor[1]*100:.1f}%"
+        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥80%: {bots_80} | Mejor: {mejor_txt} | Token: {owner_txt}")
+    except Exception:
+        pass
+
     # Marcar meta_mostrada si ya se alcanzó la META y todavía no fue aceptada
     try:
         if valor is not None and META is not None and valor >= META and not META_ACEPTADA:
@@ -5947,7 +6024,7 @@ def mostrar_panel():
     # ==========================
 
     print(padding + Fore.CYAN + "┌────────┬────────────────────────────────────────────────────────────────────────────────┬─────────┬──────────┬──────────┬──────────┬──────────┬──────────┐")
-    print(padding + Fore.CYAN + "│ ESTADO ACTUAL DE LOS BOTS - ÚLTIMOS 40 RESULTADOS + TOKEN + GANANCIAS/PÉRDIDAS 🌟 │")
+    print(padding + Fore.CYAN + Style.BRIGHT + "│ ✨ ESTADO INTELIGENTE DE BOTS · ÚLTIMOS 40 · TOKEN · IA · RENDIMIENTO      │" + Style.RESET_ALL)
     print(padding + Fore.CYAN + "├────────┼────────────────────────────────────────────────────────────────────────────────┼─────────┬──────────┬──────────┬──────────┬──────────┬──────────┤")
     print(padding + Fore.CYAN + "│ BOT    │ Últimos 40 Resultados                                                  │ Token   │ GANANCIAS│ PÉRDIDAS │ % ÉXITO  │ Prob IA  │ Modo IA  │")
     print(padding + Fore.CYAN + "├────────┼────────────────────────────────────────────────────────────────────────────────┼─────────┬──────────┬──────────┬──────────┬──────────┬──────────┤")
@@ -6038,7 +6115,7 @@ def mostrar_panel():
         # 2) IA ON pero prob no fresca/valida => "--"
         # 3) IA ON + prob fresca => mostrar %
         try:
-            if modo != "off" and ia_prob_valida(bot, max_age_s=30.0):
+            if modo != "off" and ia_prob_valida(bot, max_age_s=120.0):
                 p_now = estado_bots[bot].get("prob_ia", None)
                 try:
                     import math
@@ -6059,6 +6136,22 @@ def mostrar_panel():
             prob_ok = False
             prob = 0.0
             prob_str = "--"
+
+        # Fallback visual: si hay última prob reciente pero no cumplió gate, mostrarla con *
+        if not prob_ok:
+            try:
+                p_last = estado_bots[bot].get("prob_ia", None)
+                ts_last = float(estado_bots[bot].get("ia_last_prob_ts", 0.0) or 0.0)
+                if isinstance(p_last, (int, float)) and ts_last > 0 and (time.time() - ts_last) <= IA_PRED_TTL_S:
+                    p_aux = float(p_last)
+                    if p_aux > 1.0 and p_aux <= 100.0:
+                        p_aux = p_aux / 100.0
+                    if 0.0 <= p_aux <= 1.0:
+                        prob_ok = True
+                        prob = p_aux
+                        prob_str = f"{p_aux*100.0:.1f}%*"
+            except Exception:
+                pass
 
         # Confianza IA (NECESARIA: se usa para colorear modo_str)
         confianza = calcular_confianza_ia(bot, meta)
@@ -6511,6 +6604,7 @@ def dibujar_hud_gatewin(panel_height=8, layout=None):
     if activo_real:
         cyc = estado_bots[activo_real].get("ciclo_actual", 1)
         hud_lines.insert(-1, f"│ Bot REAL: {activo_real} · Ciclo {cyc}/{MAX_CICLOS}".ljust(HUD_INNER_WIDTH) + " │")
+    hud_lines.insert(-1, f"│ Martingala: {marti_ciclos_perdidos}/{MAX_CICLOS} pérdidas seguidas · Próx C{marti_paso+1}".ljust(HUD_INNER_WIDTH) + " │")
     hud_lines.append("└" + "─" * HUD_INNER_WIDTH + "┘")
     layout = (layout or HUD_LAYOUT).lower()
     hud_height = len(hud_lines)
@@ -7380,6 +7474,7 @@ async def main():
                             if cierre_info and isinstance(cierre_info, dict):
                                 res = cierre_info.get("resultado")
                                 if res in ("GANANCIA", "PÉRDIDA"):
+                                    registrar_resultado_real(res, bot=bot)
                                     if res == "GANANCIA":
                                         cerrar_por_fin_de_ciclo(bot, "Ganancia en REAL (fin de turno)")
                                     else:
@@ -7392,7 +7487,7 @@ async def main():
                         set_etapa("TICK_03")
                         # Usamos el MISMO umbral operativo que HUD + audio
                         meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta()
-                        umbral_ia = get_umbral_operativo(meta_local or {})
+                        umbral_ia = max(get_umbral_operativo(meta_local or {}), float(AUTO_REAL_THR))
 
                         # Bloqueo por saldo (no abras ventanas si no puedes ejecutar ciclo1)
                         try:
