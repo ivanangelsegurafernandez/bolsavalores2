@@ -133,6 +133,7 @@ ORACULO_DELTA_PRE = 0.05
 
 # Umbral único (verde + aviso IA)  -> esto NO lo tocamos
 IA_VERDE_THR = 0.80
+AUTO_REAL_THR = 0.80  # umbral fijo para auto-promoción a REAL
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
 # OJO: también se usa como piso en get_umbral_operativo(), así que NO lo bajamos para no cambiar conducta del bot.
@@ -188,12 +189,17 @@ MIN_FIT_ROWS_LOW  = 4          # umbral mínimo para permitir fit “experimenta
 RELIABLE_POS_MIN  = 20         # mínimos para considerar fiable (calibración/umbral estable)
 RELIABLE_NEG_MIN  = 20
 
-# Modo 100% manual: jamás promover a REAL automáticamente
-MODO_REAL_MANUAL = True
+# Modo manual desactivado: priorizamos automatización completa por Prob IA.
+# Si luego quieres volver al modo manual, ponlo en True.
+MODO_REAL_MANUAL = False
 
 # Martingala global
 marti_paso = 0
 marti_activa = False
+
+# Contador global de ciclos de martingala (HUD + orquestación automática)
+# 0 = sin pérdidas consecutivas en REAL; 1..MAX_CICLOS = racha de pérdidas vigente.
+marti_ciclos_perdidos = 0
 
 # Nueva: Umbrales mínimos para historial IA
 MIN_IA_SENIALES_CONF = 10  # Mínimo señales cerradas para confiar en prob_hist
@@ -3982,7 +3988,7 @@ def detectar_martingala_perdida_completa(bot):
 
 # Reinicio completo - Corregido para no resetear métricas en modo suave
 def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True):
-    global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa
+    global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos
     with file_lock():
         write_token_atomic(TOKEN_FILE, "REAL:none")
     
@@ -4037,6 +4043,7 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
     eventos_recentes.clear()
     marti_paso = 0
     marti_activa = False
+    marti_ciclos_perdidos = 0
     LIMPIEZA_PANEL_HASTA = time.time() + limpiar_visual_segundos
 
 # Reinicio de bot individual - Corregido similar
@@ -4146,6 +4153,33 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
         agregar_evento(f"🔓 Cuenta REAL liberada para {bot.upper()} ({reason})")
     except Exception:
         pass
+
+def registrar_resultado_real(resultado: str, bot: str | None = None):
+    """
+    Actualiza el contador global de ciclos martingala para el HUD y la próxima
+    autoasignación REAL.
+
+    Reglas:
+    - GANANCIA: resetea a ciclo #1 (contador de pérdidas = 0).
+    - PÉRDIDA: incrementa ciclo hasta MAX_CICLOS (tope de blindaje).
+    """
+    global marti_ciclos_perdidos, marti_paso
+
+    res = normalizar_resultado(resultado)
+    if res == "GANANCIA":
+        marti_ciclos_perdidos = 0
+        marti_paso = 0
+    elif res == "PÉRDIDA":
+        marti_ciclos_perdidos = min(MAX_CICLOS, int(marti_ciclos_perdidos) + 1)
+        marti_paso = min(MAX_CICLOS - 1, int(marti_ciclos_perdidos))
+    else:
+        return
+
+    ciclo_sig = int(marti_paso) + 1
+    bot_msg = f" [{bot}]" if bot else ""
+    agregar_evento(
+        f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo={ciclo_sig}"
+    )
 
 # === FIN BLOQUE 9 ===
 
@@ -6511,6 +6545,7 @@ def dibujar_hud_gatewin(panel_height=8, layout=None):
     if activo_real:
         cyc = estado_bots[activo_real].get("ciclo_actual", 1)
         hud_lines.insert(-1, f"│ Bot REAL: {activo_real} · Ciclo {cyc}/{MAX_CICLOS}".ljust(HUD_INNER_WIDTH) + " │")
+    hud_lines.insert(-1, f"│ Martingala: {marti_ciclos_perdidos}/{MAX_CICLOS} pérdidas seguidas · Próx C{marti_paso+1}".ljust(HUD_INNER_WIDTH) + " │")
     hud_lines.append("└" + "─" * HUD_INNER_WIDTH + "┘")
     layout = (layout or HUD_LAYOUT).lower()
     hud_height = len(hud_lines)
@@ -7380,6 +7415,7 @@ async def main():
                             if cierre_info and isinstance(cierre_info, dict):
                                 res = cierre_info.get("resultado")
                                 if res in ("GANANCIA", "PÉRDIDA"):
+                                    registrar_resultado_real(res, bot=bot)
                                     if res == "GANANCIA":
                                         cerrar_por_fin_de_ciclo(bot, "Ganancia en REAL (fin de turno)")
                                     else:
@@ -7392,7 +7428,7 @@ async def main():
                         set_etapa("TICK_03")
                         # Usamos el MISMO umbral operativo que HUD + audio
                         meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta()
-                        umbral_ia = get_umbral_operativo(meta_local or {})
+                        umbral_ia = max(get_umbral_operativo(meta_local or {}), float(AUTO_REAL_THR))
 
                         # Bloqueo por saldo (no abras ventanas si no puedes ejecutar ciclo1)
                         try:
