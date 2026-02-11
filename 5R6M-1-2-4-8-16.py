@@ -417,6 +417,7 @@ REFRESCO_SALDO = 12
 MAX_CICLOS = len(MARTI_ESCALADO)
 huellas_usadas = {bot: set() for bot in BOT_NAMES}
 SNAPSHOT_FILAS = {bot: 0 for bot in BOT_NAMES}
+REAL_ENTRY_BASELINE = {bot: 0 for bot in BOT_NAMES}  # filas al entrar/reafirmar REAL
 OCULTAR_HASTA_NUEVO = {bot: False for bot in BOT_NAMES}
 t_inicio_indef = {bot: None for bot in BOT_NAMES}
 last_update_time = {bot: time.time() for bot in BOT_NAMES}
@@ -1263,7 +1264,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
     - Si la orden viene por escribir_orden_real(...), ese wrapper YA escribe el JSON.
     - Flujos de sync/UI/token jamás deben escribir orden_real.json.
     """
-    global LIMPIEZA_PANEL_HASTA, sonido_disparado, marti_paso, REAL_OWNER_LOCK
+    global LIMPIEZA_PANEL_HASTA, sonido_disparado, marti_paso, REAL_OWNER_LOCK, REAL_ENTRY_BASELINE
 
     try:
         if bot not in BOT_NAMES:
@@ -1296,6 +1297,12 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
         _last_real_push_ts[bot] = now
 
         ciclo_obj = max(1, min(int(ciclo), MAX_CICLOS))
+
+        # Baseline REAL: a partir de aquí recién aceptamos cierres para este turno.
+        try:
+            REAL_ENTRY_BASELINE[bot] = int(contar_filas_csv(bot) or 0)
+        except Exception:
+            REAL_ENTRY_BASELINE[bot] = 0
 
         # Idempotencia token_sync: evita re-enganche/spam si ya está el mismo holder/ciclo.
         if origen == "token_sync":
@@ -1345,7 +1352,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
             estado_bots[bot]["real_activado_en"] = now
             estado_bots[bot]["ignore_cierres_hasta"] = now + 15.0
 
-            # Baseline de filas (evita que el cierre REAL cuente con filas viejas)
+            # Snapshot visual/diagnóstico (independiente del baseline REAL)
             try:
                 SNAPSHOT_FILAS[bot] = contar_filas_csv(bot)
             except Exception:
@@ -1634,6 +1641,7 @@ def cerrar_por_win(bot: str, reason: str):
     
     # Resync de snapshots y panel
     try:
+        REAL_ENTRY_BASELINE[bot] = 0
         SNAPSHOT_FILAS[bot] = contar_filas_csv(bot)
     except Exception:
         pass
@@ -4213,6 +4221,7 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
    
     # Actualizar snapshots para que no relea la misma fila
     try:
+        REAL_ENTRY_BASELINE[bot] = 0
         SNAPSHOT_FILAS[bot] = contar_filas_csv(bot)
     except Exception:
         pass
@@ -7499,7 +7508,7 @@ async def main():
                         if estado_bots[bot]["token"] == "REAL":
                             # Detecta el último cierre REAL de forma robusta (sin depender de SNAPSHOT_FILAS,
                             # porque TICK_01 ya puede haber avanzado el snapshot antes de este bloque).
-                            cierre_info = detectar_cierre_martingala(bot, min_fila=None, require_closed=True)
+                            cierre_info = detectar_cierre_martingala(bot, min_fila=REAL_ENTRY_BASELINE.get(bot, 0), require_closed=True)
 
                             # Ventana anti-stale tras activar REAL (protección vigente)
                             if time.time() < (estado_bots[bot].get("ignore_cierres_hasta") or 0):
