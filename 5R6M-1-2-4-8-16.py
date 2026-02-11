@@ -4141,6 +4141,16 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
 
 # Reinicio de bot individual - Corregido similar
 def reiniciar_bot(bot, borrar_csv=False):
+    # Nunca reiniciar duro al owner REAL activo: durante una operación puede no
+    # escribir filas por varios segundos y eso NO significa que deba volver a DEMO.
+    owner_activo = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+    if owner_activo == bot or estado_bots.get(bot, {}).get("token") == "REAL":
+        try:
+            agregar_evento(f"🛡️ Reinicio omitido para {bot.upper()}: operación REAL en curso.")
+        except Exception:
+            pass
+        return
+
     if borrar_csv:
         archivo = f"registro_enriquecido_{bot}.csv"
         if os.path.exists(archivo):
@@ -7499,8 +7509,11 @@ async def main():
                             # No mostrar_panel inmediato; dejar al tick
                             break
                         await cargar_datos_bot(bot, token_actual_loop)
+                        # Evita desincronizar REAL por inactividad normal durante contrato.
+                        # El owner REAL se vigila en TICK_02 (watchdog sin salida a DEMO).
                         if time.time() - last_update_time[bot] > 60:
-                            reiniciar_bot(bot)
+                            if estado_bots.get(bot, {}).get("token") != "REAL":
+                                reiniciar_bot(bot)
                     except Exception as e_bot:
                         agregar_evento(f"⚠️ Error en {bot}: {e_bot}")
                 else:
