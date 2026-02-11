@@ -141,6 +141,7 @@ IA_METRIC_THRESHOLD = IA_VERDE_THR
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
 IA_CALIB_THRESHOLD = 0.60
+IA_CALIB_GOAL_THRESHOLD = 0.70  # objetivo: medir cierres fuertes (≥70%)
 IA_CALIB_MIN_CLOSED = 200  # mínimo recomendado para considerar estable la auditoría
 
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
@@ -3100,12 +3101,16 @@ def auditar_calibracion_seniales_reales(min_prob: float = 0.70, max_rows: int = 
         d["prob"] = pd.to_numeric(d["prob"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
         d["y"] = d["y"].astype(int)
 
+        n_total_closed = int(len(d))
 
         # filtro por umbral
         d = d[d["prob"] >= float(min_prob)].copy()
         if d.empty:
             return {
                 "n": 0,
+                "n_total_closed": n_total_closed,
+                "n_after_threshold": 0,
+                "min_prob": float(min_prob),
                 "win_rate": None,
                 "avg_pred": None,
                 "inflacion_pp": None,
@@ -3191,6 +3196,9 @@ def auditar_calibracion_seniales_reales(min_prob: float = 0.70, max_rows: int = 
 
         return {
             "n": int(len(d)),
+            "n_total_closed": n_total_closed,
+            "n_after_threshold": int(len(d)),
+            "min_prob": float(min_prob),
             "win_rate": win_rate,
             "avg_pred": avg_pred,
             "inflacion_pp": infl_pp,
@@ -6252,16 +6260,27 @@ def mostrar_panel():
     try:
         global _IA_CALIB_CACHE
         if "_IA_CALIB_CACHE" not in globals():
-            _IA_CALIB_CACHE = {"ts": 0.0, "rep": None}
+            _IA_CALIB_CACHE = {"ts": 0.0, "rep": None, "rep_goal": None}
 
         if (time.time() - float(_IA_CALIB_CACHE.get("ts", 0.0) or 0.0)) >= 15.0:
             _IA_CALIB_CACHE["rep"] = auditar_calibracion_seniales_reales(min_prob=float(IA_CALIB_THRESHOLD))
+            _IA_CALIB_CACHE["rep_goal"] = auditar_calibracion_seniales_reales(min_prob=float(IA_CALIB_GOAL_THRESHOLD))
             _IA_CALIB_CACHE["ts"] = float(time.time())
 
         rep = _IA_CALIB_CACHE.get("rep", None) or {}
+        rep_goal = _IA_CALIB_CACHE.get("rep_goal", None) or {}
         n = int(rep.get("n", 0) or 0)
+        n_total_closed = int(rep.get("n_total_closed", 0) or 0)
+        min_prob_cal = float(rep.get("min_prob", IA_CALIB_THRESHOLD) or IA_CALIB_THRESHOLD)
 
         print(Fore.MAGENTA + f"\n✅ Prob IA REAL vs Prob IA FICTICIA (señales cerradas, ≥{IA_CALIB_THRESHOLD*100:.0f}%):")
+        print(Fore.MAGENTA + f"   Alcance: {n} de {n_total_closed} cierres (solo señales con Prob IA ≥{min_prob_cal*100:.0f}% de todos los bots).")
+        n_goal = int(rep_goal.get("n", 0) or 0)
+        wr_goal = rep_goal.get("win_rate", None)
+        if n_goal > 0 and isinstance(wr_goal, (int, float)):
+            print(Fore.MAGENTA + f"   Meta 70%: n={n_goal} cierres con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}% | Real={float(wr_goal)*100:.1f}%")
+        else:
+            print(Fore.MAGENTA + f"   Meta 70%: aún sin cierres suficientes con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}%.")
         if n <= 0:
             print(Fore.MAGENTA + "   (Aún no hay cierres suficientes para medir calibración.)")
         else:
