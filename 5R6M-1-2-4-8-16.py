@@ -6070,7 +6070,7 @@ def mostrar_panel():
                     bots_75 += 1
                 if (mejor is None) or (float(pb) > mejor[1]):
                     mejor = (b, float(pb))
-        owner = leer_token_actual()
+        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
         owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
         mejor_txt = "--" if mejor is None else f"{mejor[0]} {mejor[1]*100:.1f}%"
         print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥75%: {bots_75} | Mejor: {mejor_txt} | Token: {owner_txt}")
@@ -6508,7 +6508,7 @@ def mostrar_panel():
 
     token_file = leer_token_actual()
     token_hud  = "DEMO" if (token_file in (None, "none")) else f"REAL:{token_file}"
-    activo_real = next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
+    activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
     fuente = estado_bots.get(activo_real, {}).get("fuente") or "AUTO" if activo_real else "--"
     panel_lines.append(f"│ Fuente={fuente} → Token={token_hud:<12}          │")
 
@@ -6806,7 +6806,7 @@ def evaluar_semaforo():
             mejor = (prob, b, n)
     prob, bbest, n = mejor
 
-    owner = leer_token_actual()
+    owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
     try: saldo_val = float(obtener_valor_saldo() or 0.0)
     except: saldo_val = 0.0
     costo = float(MARTI_ESCALADO[0])
@@ -7596,7 +7596,7 @@ async def main():
                                 PENDIENTE_FORZAR_INICIO = 0.0
                                 PENDIENTE_FORZAR_EXPIRA = 0.0
 
-                            owner = leer_token_actual()
+                            owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
                             if candidatos and (PENDIENTE_FORZAR_BOT is None) and (owner in (None, "none")):
                                 candidatos.sort(reverse=True)
                                 prob, mejor_bot = candidatos[0]
