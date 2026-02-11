@@ -200,6 +200,12 @@ MIN_AUC_CONF = 0.65        # AUC mínimo para audios/colores verdes
 MAX_CLASS_IMBALANCE = 0.8  # Máx proporción pos/neg para entrenar (evita 99% wins)
 AUC_DROP_TOL = 0.05        # Tolerancia para no machacar modelo si AUC baja
 
+# Semáforo de calibración (lectura rápida PredMedia/Real/Inflación/n)
+SEM_CAL_N_ROJO = 30
+SEM_CAL_N_AMARILLO = 100
+SEM_CAL_INFL_OK_PP = 5.0
+SEM_CAL_INFL_WARN_PP = 15.0
+
 # ============================================================
 # Defaults IA (centralizados, sin duplicados)
 # ============================================================
@@ -2985,6 +2991,34 @@ def ia_audit_scan_close(bot: str, tail_lines: int = 2000, max_events: int = 6):
             pass
         # Avanzamos el puntero siempre: si no había señal abierta (trade sin señal IA), no queremos trabarnos.
         IA_AUDIT_LAST_CLOSE_EPOCH[bot] = int(ep)
+
+def semaforo_calibracion(n: int, infl_pp: float | None):
+    """Devuelve (emoji, etiqueta, detalle) para lectura rápida de calibración."""
+    try:
+        n = int(n or 0)
+    except Exception:
+        n = 0
+
+    try:
+        infl = abs(float(infl_pp)) if infl_pp is not None else None
+    except Exception:
+        infl = None
+
+    if n < SEM_CAL_N_ROJO:
+        return "🔴", "CRÍTICO", f"n={n}<{SEM_CAL_N_ROJO}"
+
+    if infl is None:
+        if n < SEM_CAL_N_AMARILLO:
+            return "🟡", "PRECAUCIÓN", f"n={n}<{SEM_CAL_N_AMARILLO}"
+        return "🟢", "CONFIABLE", f"n={n} (sin inflación calculable)"
+
+    if infl > SEM_CAL_INFL_WARN_PP:
+        return "🔴", "CRÍTICO", f"|infl|={infl:.1f}pp>{SEM_CAL_INFL_WARN_PP:.0f}pp"
+
+    if (n < SEM_CAL_N_AMARILLO) or (infl > SEM_CAL_INFL_OK_PP):
+        return "🟡", "PRECAUCIÓN", f"n={n}, |infl|={infl:.1f}pp"
+
+    return "🟢", "CONFIABLE", f"n={n}, |infl|={infl:.1f}pp"
 
 def auditar_calibracion_seniales_reales(min_prob: float = 0.70, max_rows: int = 20000, n_bins: int = 10):
     """
@@ -6207,16 +6241,25 @@ def mostrar_panel():
             win_rate = float(rep.get("win_rate", 0.0) or 0.0)
             infl_pp = float(rep.get("inflacion_pp", 0.0) or 0.0)
             factor = float(rep.get("factor", 1.0) or 1.0)
+            min_reco = int(rep.get("min_recommended_n", IA_CALIB_MIN_CLOSED) or IA_CALIB_MIN_CLOSED)
 
             print(
                 Fore.MAGENTA
                 + f"   n={n} | PredMedia={pred_mean*100:.1f}% | Real={win_rate*100:.1f}% | Inflación={infl_pp:+.1f}pp | Factor≈{factor:.3f}"
             )
 
+            sem_emoji, sem_label, sem_det = semaforo_calibracion(n, infl_pp)
+            print(Fore.MAGENTA + f"   Semáforo calibración: {sem_emoji} {sem_label} ({sem_det})")
+
             if n < int(MIN_IA_SENIALES_CONF):
                 print(
                     Fore.MAGENTA
                     + f"   ⚠ muestra baja (n<{MIN_IA_SENIALES_CONF}). Úsalo como referencia, no como decisión final."
+                )
+            elif n < min_reco:
+                print(
+                    Fore.MAGENTA
+                    + f"   ⚠ muestra aún en formación (recomendado n≥{min_reco} para estabilidad)."
                 )
 
             por_bot = rep.get("por_bot", {}) if isinstance(rep.get("por_bot", {}), dict) else {}
