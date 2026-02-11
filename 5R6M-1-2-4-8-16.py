@@ -1281,6 +1281,11 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
                 agregar_evento(f"🔒 REAL bloqueado: {owner_lock.upper()} sigue activo. Ignorando intento de {bot.upper()}.")
             except Exception:
                 pass
+            try:
+                if origen == "orden_real":
+                    limpiar_orden_real(bot)
+            except Exception:
+                pass
             return
 
 
@@ -1402,6 +1407,20 @@ def escribir_orden_real(bot: str, ciclo: int):
     - Activa REAL inmediato en HUD + token file
     """
     ciclo = max(1, min(int(ciclo), MAX_CICLOS))
+
+    # 🔒 No crear orden si ya hay otro owner REAL activo.
+    try:
+        owner_lock = leer_token_actual()
+    except Exception:
+        owner_lock = None
+
+    if owner_lock in BOT_NAMES and owner_lock != bot:
+        try:
+            agregar_evento(f"🔒 Orden REAL bloqueada para {bot.upper()}: {owner_lock.upper()} está activo.")
+        except Exception:
+            pass
+        return
+
     # ✅ Auditoría Real vs Ficticia: abrir señal SOLO si esta orden está respaldada por IA (prob >= umbral)
     try:
         st = estado_bots.get(str(bot), {}) if isinstance(estado_bots, dict) else {}
@@ -1415,10 +1434,8 @@ def escribir_orden_real(bot: str, ciclo: int):
     except Exception:
         pass
 
-    
     _escribir_orden_real_raw(bot, ciclo)
     activar_real_inmediato(bot, ciclo, origen="orden_real")
-
 # === FIN PATCH REAL INMEDIATO ===
 # === IA ACK (handshake maestro→bot: confirma que el PRE-TRADE ya fue evaluado) ===
 IA_ACK_DIR = "ia_ack"
