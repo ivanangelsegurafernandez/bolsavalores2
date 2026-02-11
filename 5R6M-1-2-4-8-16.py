@@ -7083,7 +7083,7 @@ def set_etapa(codigo, detalle_extra=None, anunciar=False):
         agregar_evento(f"🧭 ETAPA {codigo}: {detalle}")
 
 # Nueva constante para watchdog de REAL - Bajado para más reactividad
-REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para forzar salida de REAL
+REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme (sin salir de REAL)
 
 # Cargar datos bot
 # Cargar datos bot
@@ -7494,15 +7494,11 @@ async def main():
                             t_last = last_update_time.get(bot, 0)
                             t_real = estado_bots[bot].get("real_activado_en", 0.0)
                             # Si lleva demasiado sin actualizarse desde que entró a REAL:
+                            # NO salir a DEMO aquí: la salida solo ocurre con cierre GANANCIA/PÉRDIDA.
                             if t_real > 0 and (ahora - max(t_last, t_real) > REAL_TIMEOUT_S):
-                                agregar_evento(f"⏱️ Seguridad: {bot} llevaba demasiado tiempo en REAL sin actividad. Volviendo a DEMO.")
-                                estado_bots[bot]["token"] = "DEMO"
-                                estado_bots[bot]["modo_real_anunciado"] = False
-                                estado_bots[bot]["fuente"] = None
-                                with file_lock():
-                                    write_token_atomic(TOKEN_FILE, "REAL:none")
-                                REAL_OWNER_LOCK = None
-                                reinicio_forzado.set()
+                                agregar_evento(f"⏱️ Seguridad: {bot} sin actividad reciente en REAL. Se mantiene REAL hasta cierre (G/P).")
+                                # Rearme anti-spam del watchdog (sin liberar token ni cambiar owner).
+                                estado_bots[bot]["real_activado_en"] = ahora
 
                     for bot in BOT_NAMES:
                         if estado_bots[bot]["token"] == "REAL":
