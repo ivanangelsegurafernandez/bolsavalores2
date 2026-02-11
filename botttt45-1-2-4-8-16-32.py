@@ -78,6 +78,38 @@ def validar_sin_conflictos_merge_en_fuente(path: str):
 
 validar_sin_conflictos_merge_en_fuente(__file__)
 
+def validar_sin_conflictos_merge_en_fuente(path: str):
+    """
+    Falla rápido si quedaron marcadores de merge sin resolver en el script.
+    Evita ejecutar el bot con conflictos ocultos (<<<<<<<, =======, >>>>>>>).
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, raw in enumerate(f, start=1):
+                s = raw.rstrip("\r\n")
+                if s.startswith("<<<<<<< ") or s.startswith(">>>>>>> ") or s == "=======":
+                    raise RuntimeError(f"Conflicto de merge no resuelto en {os.path.basename(path)}:{i}")
+    except FileNotFoundError:
+        return
+
+validar_sin_conflictos_merge_en_fuente(__file__)
+
+def validar_sin_conflictos_merge_en_fuente(path: str):
+    """
+    Falla rápido si quedaron marcadores de merge sin resolver en el script.
+    Evita ejecutar el bot con conflictos ocultos (<<<<<<<, =======, >>>>>>>).
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, raw in enumerate(f, start=1):
+                s = raw.rstrip("\r\n")
+                if s.startswith("<<<<<<< ") or s.startswith(">>>>>>> ") or s == "=======":
+                    raise RuntimeError(f"Conflicto de merge no resuelto en {os.path.basename(path)}:{i}")
+    except FileNotFoundError:
+        return
+
+validar_sin_conflictos_merge_en_fuente(__file__)
+
 # === PATCH SFX: audio seguro, canales y rate-limit ===
 AUDIO_ENABLED = False
 try:
@@ -2282,6 +2314,20 @@ async def ejecutar_panel():
                         reinicio_forzado.clear()
                         await asyncio.sleep(0.8)
                         continue
+
+                    # Mensaje final: la prob mostrada coincide con la última que reportó el maestro para este PRE.
+                    if ack_visto and isinstance(ack_prob_ultima, (int, float)):
+                        print(
+                            Fore.CYAN +
+                            f"🤖 IA FINAL ({NOMBRE_BOT}) → {float(ack_prob_ultima)*100:.1f}% | AUC={float(ack_auc_ultima or 0.0):.3f} | modo={ack_modo_ultimo or 'OFF'}"
+                        )
+
+                    # Mensaje final: la prob mostrada coincide con la última que reportó el maestro para este PRE.
+                    if ack_visto and isinstance(ack_prob_ultima, (int, float)):
+                        print(
+                            Fore.CYAN +
+                            f"🤖 IA FINAL ({NOMBRE_BOT}) → {float(ack_prob_ultima)*100:.1f}% | AUC={float(ack_auc_ultima or 0.0):.3f} | modo={ack_modo_ultimo or 'OFF'}"
+                        )
 
                     # Mensaje final: la prob mostrada coincide con la última que reportó el maestro para este PRE.
                     if ack_visto and isinstance(ack_prob_ultima, (int, float)):
