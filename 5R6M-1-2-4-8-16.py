@@ -421,6 +421,7 @@ OCULTAR_HASTA_NUEVO = {bot: False for bot in BOT_NAMES}
 t_inicio_indef = {bot: None for bot in BOT_NAMES}
 last_update_time = {bot: time.time() for bot in BOT_NAMES}
 LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mismo cierre REAL varias veces
+REAL_OWNER_LOCK = None  # owner REAL en memoria (evita carreras de lectura de archivo)
 
 try:
     last_sig_por_bot
@@ -1262,7 +1263,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
     - Si la orden viene por escribir_orden_real(...), ese wrapper YA escribe el JSON.
     - Flujos de sync/UI/token jamás deben escribir orden_real.json.
     """
-    global LIMPIEZA_PANEL_HASTA, sonido_disparado, marti_paso
+    global LIMPIEZA_PANEL_HASTA, sonido_disparado, marti_paso, REAL_OWNER_LOCK
 
     try:
         if bot not in BOT_NAMES:
@@ -1273,9 +1274,9 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
         # 🔒 No permitir reemplazar owner REAL activo por otro bot.
         # Solo se puede activar si no hay owner o si es el mismo bot.
         try:
-            owner_lock = leer_token_actual()
+            owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
         except Exception:
-            owner_lock = None
+            owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
         if owner_lock in BOT_NAMES and owner_lock != bot:
             try:
                 agregar_evento(f"🔒 REAL bloqueado: {owner_lock.upper()} sigue activo. Ignorando intento de {bot.upper()}.")
@@ -1318,6 +1319,9 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
             prev_holder = leer_token_actual()  # sincroniza UI
         except Exception:
             prev_holder = None
+
+        # Reservar lock owner en memoria + token REAL en archivo
+        REAL_OWNER_LOCK = bot
 
         # Reservar token REAL en archivo SOLO cuando corresponde:
         # - orden_real: orden explícita ya escrita por wrapper
@@ -1401,6 +1405,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
         pass
 
 def escribir_orden_real(bot: str, ciclo: int):
+    global REAL_OWNER_LOCK
     """
     Wrapper oficial:
     - Escribe orden_real.json (RAW)
@@ -1410,9 +1415,9 @@ def escribir_orden_real(bot: str, ciclo: int):
 
     # 🔒 No crear orden si ya hay otro owner REAL activo.
     try:
-        owner_lock = leer_token_actual()
+        owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
     except Exception:
-        owner_lock = None
+        owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
 
     if owner_lock in BOT_NAMES and owner_lock != bot:
         try:
@@ -1581,6 +1586,7 @@ def activar_remate(bot: str, reason: str):
 
 # Cerrar por WIN
 def cerrar_por_win(bot: str, reason: str):
+    global REAL_OWNER_LOCK
     # Limpieza total de “estado REAL” para evitar REAL fantasma
     try:
         estado_bots[bot]["token"] = "DEMO"
@@ -1605,6 +1611,7 @@ def cerrar_por_win(bot: str, reason: str):
         pass
 
     # Liberar token global REAL
+    REAL_OWNER_LOCK = None
     try:
         with file_lock():
             write_token_atomic(TOKEN_FILE, "REAL:none")
@@ -4155,6 +4162,7 @@ def reiniciar_bot(bot, borrar_csv=False):
         huellas_usadas[bot] = set()
 
 def cerrar_por_fin_de_ciclo(bot: str, reason: str):
+    global REAL_OWNER_LOCK
     # Limpieza total de “estado REAL” para evitar HUD/estado fantasma
     try:
         estado_bots[bot]["token"] = "DEMO"
@@ -4180,6 +4188,7 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
         pass
 
     # Liberar token global REAL
+    REAL_OWNER_LOCK = None
     try:
         with file_lock():
             write_token_atomic(TOKEN_FILE, "REAL:none")
@@ -7393,7 +7402,7 @@ if sys.stdout.isatty():
 # Main - Añadida pasada inicial para sincronizar HUD con CSV existentes
 async def main():
     global salir, pausado, reinicio_manual, SALDO_INICIAL
-    global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA
+    global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA, REAL_OWNER_LOCK
 
     try:
         set_etapa("BOOT_01", "Inicializando main()", anunciar=True)
@@ -7456,7 +7465,11 @@ async def main():
                 token_actual_loop = leer_token_actual()
                 # Heartbeat: mantiene ACK alineado al HUD aunque no entren filas nuevas ese tick.
                 refrescar_ia_ack_desde_hud(intervalo_s=1.0)
-                activo_real = next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
+                owner_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+                owner_file = token_actual_loop if token_actual_loop in BOT_NAMES else None
+                activo_real = owner_mem or owner_file or next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
+                if activo_real in BOT_NAMES:
+                    _set_ui_token_holder(activo_real)
                 for bot in BOT_NAMES:
                     try:  # Aislamiento per-bot para evitar skips globales
                         if reinicio_forzado.is_set():
@@ -7485,6 +7498,7 @@ async def main():
                                 estado_bots[bot]["fuente"] = None
                                 with file_lock():
                                     write_token_atomic(TOKEN_FILE, "REAL:none")
+                                REAL_OWNER_LOCK = None
                                 reinicio_forzado.set()
 
                     for bot in BOT_NAMES:
@@ -7522,7 +7536,7 @@ async def main():
 
                         # 🔒 Lock estricto: si token_actual.txt ya tiene dueño REAL,
                         # no evaluamos ni promovemos otro bot aunque cumpla umbral.
-                        owner_lock = leer_token_actual()
+                        owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
                         lock_activo = owner_lock in BOT_NAMES
                         if lock_activo:
                             activo_real = owner_lock
