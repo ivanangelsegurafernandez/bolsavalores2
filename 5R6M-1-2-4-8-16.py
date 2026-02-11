@@ -34,7 +34,7 @@
 # === BLOQUE 1 — IMPORTS Y ENTORNO BÁSICO ===
 import os, csv, time, random, asyncio, websockets, json, re
 from collections import deque
-from colorama import Fore, init
+from colorama import Fore, Style, init
 import pygame
 try:
     import winsound
@@ -3609,8 +3609,8 @@ _last_pred_ts = {b: 0.0 for b in BOT_NAMES}
 def actualizar_prob_ia_bot(bot: str):
     """
     Actualiza estado_bots[bot]['prob_ia'] de forma segura:
-    - Si hay prob válida: la escribe y marca ia_ready=True
-    - Si falla: NO pisa prob_ia a 0. Solo registra ia_ready=False y ia_last_err
+    - Si hay prob válida: la escribe, define modo_ia y marca ia_ready=True.
+    - Si falla: NO pisa prob_ia a 0. Conserva último valor por TTL para no vaciar el HUD.
     """
     try:
         now = time.time()
@@ -3626,16 +3626,39 @@ def actualizar_prob_ia_bot(bot: str):
             estado_bots[bot]["ia_ready"] = True
             estado_bots[bot]["ia_last_err"] = None
             estado_bots[bot]["ia_last_prob_ts"] = now
+
+            # FIX UI/AUTO: garantizar modo_ia distinto de OFF cuando hay predicción.
+            try:
+                meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+                reliable = bool(meta_local.get("reliable", False))
+                n_samples = int(meta_local.get("n_samples", meta_local.get("n", 0)) or 0)
+                if reliable:
+                    modo = "confiable"
+                elif n_samples >= int(MIN_FIT_ROWS_LOW):
+                    modo = "modelo"
+                else:
+                    modo = "low_data"
+                estado_bots[bot]["modo_ia"] = modo
+            except Exception:
+                estado_bots[bot]["modo_ia"] = "modelo"
             return
 
         # fallo: no mates la última prob, solo marca error
-        estado_bots[bot]["ia_ready"] = False
         estado_bots[bot]["ia_last_err"] = err or "ERR"
 
-        # si hace demasiado que no hay prob válida, limpia a None (pero NO a 0)
+        # si hace demasiado que no hay prob válida, limpia a None
         last_ok = float(estado_bots[bot].get("ia_last_prob_ts", 0.0) or 0.0)
-        if last_ok <= 0.0 or (now - last_ok) > IA_PRED_TTL_S:
+        age = (now - last_ok) if last_ok > 0 else 10**9
+
+        if age <= IA_PRED_TTL_S and estado_bots[bot].get("prob_ia") is not None:
+            # Mantener último dato útil para que la UI no quede en '--'.
+            estado_bots[bot]["ia_ready"] = True
+            if str(estado_bots[bot].get("modo_ia", "")).strip().lower() in ("", "off"):
+                estado_bots[bot]["modo_ia"] = "stale"
+        else:
+            estado_bots[bot]["ia_ready"] = False
             estado_bots[bot]["prob_ia"] = None
+            estado_bots[bot]["modo_ia"] = "off"
 
     except Exception:
         # ultra defensivo: no romper loop
@@ -5968,6 +5991,26 @@ def mostrar_panel():
 
     print(padding + Fore.GREEN + f"💰 SALDO INICIAL {inicial_str} 🎯 META {meta_str}")
 
+    # Resumen rápido para que el HUD no se vea "vacío"
+    try:
+        bots_con_prob = 0
+        bots_80 = 0
+        mejor = None
+        for b in BOT_NAMES:
+            pb = estado_bots.get(b, {}).get("prob_ia")
+            if isinstance(pb, (int, float)):
+                bots_con_prob += 1
+                if float(pb) >= float(AUTO_REAL_THR):
+                    bots_80 += 1
+                if (mejor is None) or (float(pb) > mejor[1]):
+                    mejor = (b, float(pb))
+        owner = leer_token_actual()
+        owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
+        mejor_txt = "--" if mejor is None else f"{mejor[0]} {mejor[1]*100:.1f}%"
+        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥80%: {bots_80} | Mejor: {mejor_txt} | Token: {owner_txt}")
+    except Exception:
+        pass
+
     # Marcar meta_mostrada si ya se alcanzó la META y todavía no fue aceptada
     try:
         if valor is not None and META is not None and valor >= META and not META_ACEPTADA:
@@ -5981,7 +6024,7 @@ def mostrar_panel():
     # ==========================
 
     print(padding + Fore.CYAN + "┌────────┬────────────────────────────────────────────────────────────────────────────────┬─────────┬──────────┬──────────┬──────────┬──────────┬──────────┐")
-    print(padding + Fore.CYAN + "│ ESTADO ACTUAL DE LOS BOTS - ÚLTIMOS 40 RESULTADOS + TOKEN + GANANCIAS/PÉRDIDAS 🌟 │")
+    print(padding + Fore.CYAN + Style.BRIGHT + "│ ✨ ESTADO INTELIGENTE DE BOTS · ÚLTIMOS 40 · TOKEN · IA · RENDIMIENTO      │" + Style.RESET_ALL)
     print(padding + Fore.CYAN + "├────────┼────────────────────────────────────────────────────────────────────────────────┼─────────┬──────────┬──────────┬──────────┬──────────┬──────────┤")
     print(padding + Fore.CYAN + "│ BOT    │ Últimos 40 Resultados                                                  │ Token   │ GANANCIAS│ PÉRDIDAS │ % ÉXITO  │ Prob IA  │ Modo IA  │")
     print(padding + Fore.CYAN + "├────────┼────────────────────────────────────────────────────────────────────────────────┼─────────┬──────────┬──────────┬──────────┬──────────┬──────────┤")
@@ -6072,7 +6115,7 @@ def mostrar_panel():
         # 2) IA ON pero prob no fresca/valida => "--"
         # 3) IA ON + prob fresca => mostrar %
         try:
-            if modo != "off" and ia_prob_valida(bot, max_age_s=30.0):
+            if modo != "off" and ia_prob_valida(bot, max_age_s=120.0):
                 p_now = estado_bots[bot].get("prob_ia", None)
                 try:
                     import math
@@ -6093,6 +6136,22 @@ def mostrar_panel():
             prob_ok = False
             prob = 0.0
             prob_str = "--"
+
+        # Fallback visual: si hay última prob reciente pero no cumplió gate, mostrarla con *
+        if not prob_ok:
+            try:
+                p_last = estado_bots[bot].get("prob_ia", None)
+                ts_last = float(estado_bots[bot].get("ia_last_prob_ts", 0.0) or 0.0)
+                if isinstance(p_last, (int, float)) and ts_last > 0 and (time.time() - ts_last) <= IA_PRED_TTL_S:
+                    p_aux = float(p_last)
+                    if p_aux > 1.0 and p_aux <= 100.0:
+                        p_aux = p_aux / 100.0
+                    if 0.0 <= p_aux <= 1.0:
+                        prob_ok = True
+                        prob = p_aux
+                        prob_str = f"{p_aux*100.0:.1f}%*"
+            except Exception:
+                pass
 
         # Confianza IA (NECESARIA: se usa para colorear modo_str)
         confianza = calcular_confianza_ia(bot, meta)
