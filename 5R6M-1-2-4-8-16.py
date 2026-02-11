@@ -1530,8 +1530,15 @@ def leer_token_actual():
     """
     Lee token_actual.txt y además sincroniza el HUD (estado_bots[*]["token"])
     para que REAL/DEMO se refleje sin esperar compra del bot.
+    Prioriza lock en memoria para evitar parpadeos DEMO durante REAL en curso.
     """
-    holder = None
+    holder = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+
+    # Si ya hay owner REAL en memoria, mantenemos sincronía visual inmediata.
+    if holder in BOT_NAMES:
+        _set_ui_token_holder(holder)
+        return holder
+
     if not os.path.exists(TOKEN_FILE):
         _set_ui_token_holder(None)
         return None
@@ -1551,8 +1558,9 @@ def leer_token_actual():
             print(f"⚠️ Error leyendo token: {e}")
         except Exception:
             pass
-        _set_ui_token_holder(None)
-        return None
+        fallback = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        _set_ui_token_holder(fallback)
+        return fallback
 
 # Escribir token actual
 async def escribir_token_actual(bot):
