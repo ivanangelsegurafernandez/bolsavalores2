@@ -7489,6 +7489,17 @@ async def main():
 
                     if not activo_real:
                         set_etapa("TICK_03")
+
+                        # 🔒 Lock estricto: si token_actual.txt ya tiene dueño REAL,
+                        # no evaluamos ni promovemos otro bot aunque cumpla umbral.
+                        owner_lock = leer_token_actual()
+                        if owner_lock in BOT_NAMES:
+                            activo_real = owner_lock
+                            for b in BOT_NAMES:
+                                if b != owner_lock:
+                                    estado_bots[b]["ia_senal_pendiente"] = False
+                                    estado_bots[b]["ia_prob_senal"] = None
+                            continue
                         # Usamos el MISMO umbral operativo que HUD + audio
                         meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta()
                         umbral_ia = max(get_umbral_operativo(meta_local or {}), float(AUTO_REAL_THR))
