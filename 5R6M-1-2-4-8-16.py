@@ -420,6 +420,7 @@ SNAPSHOT_FILAS = {bot: 0 for bot in BOT_NAMES}
 OCULTAR_HASTA_NUEVO = {bot: False for bot in BOT_NAMES}
 t_inicio_indef = {bot: None for bot in BOT_NAMES}
 last_update_time = {bot: time.time() for bot in BOT_NAMES}
+LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mismo cierre REAL varias veces
 
 try:
     last_sig_por_bot
@@ -4064,6 +4065,8 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
         if not isinstance(huellas_usadas.get(bot), set):
             huellas_usadas[bot] = set()
     eventos_recentes.clear()
+    for b in BOT_NAMES:
+        LAST_REAL_CLOSE_SIG[b] = None
     marti_paso = 0
     marti_activa = False
     marti_ciclos_perdidos = 0
@@ -4106,6 +4109,7 @@ def reiniciar_bot(bot, borrar_csv=False):
     SNAPSHOT_FILAS[bot] = contar_filas_csv(bot)
     OCULTAR_HASTA_NUEVO[bot] = False  # Cambiado para no ocultar
     IA90_stats[bot] = {"n": 0, "ok": 0, "pct": 0.0}
+    LAST_REAL_CLOSE_SIG[bot] = None
     if not isinstance(huellas_usadas.get(bot), set):
         huellas_usadas[bot] = set()
 
@@ -6008,6 +6012,9 @@ def mostrar_panel():
         owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
         mejor_txt = "--" if mejor is None else f"{mejor[0]} {mejor[1]*100:.1f}%"
         print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥80%: {bots_80} | Mejor: {mejor_txt} | Token: {owner_txt}")
+
+        if owner not in (None, "none") and mejor is not None and owner != mejor[0]:
+            print(padding + Fore.YELLOW + f"⛓️ Token bloqueado en {owner}; mejor IA actual es {mejor[0]} ({mejor[1]*100:.1f}%).")
     except Exception:
         pass
 
@@ -7455,24 +7462,26 @@ async def main():
                                 reinicio_forzado.set()
 
                     for bot in BOT_NAMES:
-                        if estado_bots[bot]["token"] == "REAL":                           
-                            # 1) Solo cierres NUEVOS: si no hay nueva fila post-activación, no cierres (evita cierre por fila vieja)
-                            try:
-                                filas_now = contar_filas_csv(bot)
-                            except Exception:
-                                filas_now = 0
-                            filas_base = SNAPSHOT_FILAS.get(bot, 0)
-                            if filas_now <= filas_base:
-                                continue
+                        if estado_bots[bot]["token"] == "REAL":
+                            # Detecta el último cierre REAL de forma robusta (sin depender de SNAPSHOT_FILAS,
+                            # porque TICK_01 ya puede haber avanzado el snapshot antes de este bloque).
+                            cierre_info = detectar_cierre_martingala(bot, min_fila=None, require_closed=True)
 
-                            # 2) Detecta el último resultado real
-                            cierre_info = detectar_cierre_martingala(bot, min_fila=filas_base, require_closed=True)
-                            # 3) Ventana anti-stale tras activar REAL (tu protección actual)
+                            # Ventana anti-stale tras activar REAL (protección vigente)
                             if time.time() < (estado_bots[bot].get("ignore_cierres_hasta") or 0):
                                 cierre_info = None
-                            # 4) Cierre inmediato: en REAL siempre 1 operación y vuelve a DEMO (gane o pierda)
-                            if cierre_info and isinstance(cierre_info, dict):
-                                res = cierre_info.get("resultado")
+
+                            # Cierre inmediato: en REAL siempre 1 operación y vuelve a DEMO (gane o pierda)
+                            if cierre_info and isinstance(cierre_info, tuple) and len(cierre_info) >= 4:
+                                res, monto, ciclo, payout_total = cierre_info
+                                sig = (res, round(float(monto or 0.0), 2), int(ciclo or 0), round(float(payout_total or 0.0), 4))
+
+                                # Evita reprocesar el mismo cierre en ticks consecutivos
+                                if sig == LAST_REAL_CLOSE_SIG.get(bot):
+                                    continue
+
+                                LAST_REAL_CLOSE_SIG[bot] = sig
+
                                 if res in ("GANANCIA", "PÉRDIDA"):
                                     registrar_resultado_real(res, bot=bot)
                                     if res == "GANANCIA":
