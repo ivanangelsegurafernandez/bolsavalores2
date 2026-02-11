@@ -1277,6 +1277,16 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
 
         ciclo_obj = max(1, min(int(ciclo), MAX_CICLOS))
 
+        # Idempotencia token_sync: evita re-enganche/spam si ya está el mismo holder/ciclo.
+        if origen == "token_sync":
+            try:
+                owner_now = leer_token_actual()
+                cyc_now = int(estado_bots.get(bot, {}).get("ciclo_actual", 1) or 1)
+                if owner_now == bot and cyc_now == ciclo_obj:
+                    return
+            except Exception:
+                pass
+
         # ✅ Solo “manual” auto-escribe orden_real (la orden explícita)
         if origen == "manual":
             try:
@@ -6732,22 +6742,7 @@ def forzar_real_manual(bot: str, ciclo: int):
                 pass
             time.sleep(0.2)
 
-        if MAIN_LOOP:
-            fut = asyncio.run_coroutine_threadsafe(escribir_token_actual(bot), MAIN_LOOP)
-            try:
-                fut.result(timeout=3)
-            except Exception as e:
-                print(f"⚠️ Timeout en escritura token: {e}")
-        else:
-            with file_lock():
-                ok_tok = write_token_atomic(TOKEN_FILE, f"REAL:{bot}")
-            if not ok_tok:
-                try:
-                    agregar_evento(f"⚠️ No se pudo escribir {TOKEN_FILE}. REAL NO confirmado para {bot.upper()}.")
-                except Exception:
-                    pass
-                return
-
+        # escribir_orden_real(...) ya dejó token+HUD sincronizados; evitamos doble token_sync.
         agregar_evento(f"⚡ Forzar REAL: {bot} → ciclo #{ciclo} (fuente=MANUAL)")
         with RENDER_LOCK:
             mostrar_panel()
@@ -7569,9 +7564,11 @@ async def main():
                             else:
                                 estado_bots[mejor_bot]["ia_senal_pendiente"] = True
                                 estado_bots[mejor_bot]["ia_prob_senal"] = prob
-                                await escribir_token_actual(mejor_bot)
+                                ciclo_auto = int(marti_paso) + 1
+                                escribir_orden_real(mejor_bot, ciclo_auto)
+                                estado_bots[mejor_bot]["fuente"] = "IA_AUTO"
                                 estado_bots[mejor_bot]["token"] = "REAL"
-                                estado_bots[mejor_bot]["ciclo_actual"] = marti_paso + 1
+                                estado_bots[mejor_bot]["ciclo_actual"] = ciclo_auto
                                 activo_real = mejor_bot
                                 marti_activa = True
                         else:
