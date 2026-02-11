@@ -52,6 +52,22 @@ except Exception as _e:
 script_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(script_dir)
 
+def validar_sin_conflictos_merge_en_fuente(path: str):
+    """
+    Falla rápido si quedaron marcadores de merge sin resolver en el script.
+    Evita ejecutar el bot con conflictos ocultos (<<<<<<<, =======, >>>>>>>).
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, raw in enumerate(f, start=1):
+                s = raw.rstrip("\r\n")
+                if s.startswith("<<<<<<< ") or s.startswith(">>>>>>> ") or s == "=======":
+                    raise RuntimeError(f"Conflicto de merge no resuelto en {os.path.basename(path)}:{i}")
+    except FileNotFoundError:
+        return
+
+validar_sin_conflictos_merge_en_fuente(__file__)
+
 # === PATCH SFX: audio seguro, canales y rate-limit ===
 AUDIO_ENABLED = False
 try:
@@ -2204,12 +2220,21 @@ async def ejecutar_panel():
                             try:
                                 if ack and int(ack.get("epoch", 0)) == int(epoch_pre):
                                     p = ack.get("prob", None)
+                                    p_hud = ack.get("prob_hud", None)
                                     p_raw = ack.get("prob_raw", None)
                                     auc = float(ack.get("auc", 0.0) or 0.0)
                                     modo = ack.get("modo", "OFF")
+                                    modo_hud = str(ack.get("modo_hud", "") or "").upper()
 
-                                    # Preferimos prob calibrada; fallback a prob_raw si calibrada viene nula.
-                                    p_show = p if isinstance(p, (int, float)) else (p_raw if isinstance(p_raw, (int, float)) else None)
+                                    # Prioridad visual: igualar HUD maestro cuando esté disponible.
+                                    # Orden: prob_hud -> prob(calibrada del ACK) -> prob_raw.
+                                    p_show = (
+                                        p_hud if isinstance(p_hud, (int, float))
+                                        else (p if isinstance(p, (int, float)) else (p_raw if isinstance(p_raw, (int, float)) else None))
+                                    )
+
+                                    # Modo visual: prioriza modo_hud para coincidir con el panel maestro.
+                                    modo_show = modo_hud if modo_hud else modo
 
                                     if isinstance(p_show, (int, float)):
                                         p_show = max(0.0, min(1.0, float(p_show)))
@@ -2218,18 +2243,18 @@ async def ejecutar_panel():
                                         (not ack_visto)
                                         or (ack_prob_ultima != p_show)
                                         or (ack_auc_ultima != auc)
-                                        or (ack_modo_ultimo != modo)
+                                        or (ack_modo_ultimo != modo_show)
                                     )
 
                                     ack_prob_ultima = p_show
                                     ack_auc_ultima = auc
-                                    ack_modo_ultimo = modo
+                                    ack_modo_ultimo = modo_show
 
                                     if hubo_cambio:
                                         if isinstance(p_show, (int, float)):
-                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | AUC={auc:.3f} | modo={modo}")
+                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | AUC={auc:.3f} | modo={modo_show}")
                                         else:
-                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → (sin prob) | AUC={auc:.3f} | modo={modo}")
+                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → (sin prob) | AUC={auc:.3f} | modo={modo_show}")
 
                                     ack_visto = True
                             except Exception:
