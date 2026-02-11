@@ -3020,6 +3020,34 @@ def semaforo_calibracion(n: int, infl_pp: float | None):
 
     return "🟢", "CONFIABLE", f"n={n}, |infl|={infl:.1f}pp"
 
+def diagnostico_calibracion(n: int, pred_mean: float, win_rate: float, infl_pp: float | None):
+    """Mensaje corto para saber si la calibración va por buen camino."""
+    try:
+        n = int(n or 0)
+    except Exception:
+        n = 0
+
+    try:
+        infl_abs = abs(float(infl_pp)) if infl_pp is not None else None
+    except Exception:
+        infl_abs = None
+
+    if n < SEM_CAL_N_ROJO:
+        return "Todavía no se puede concluir (muestra muy chica): sigue juntando cierres reales."
+
+    if infl_abs is None:
+        return "Hay cierres, pero aún no alcanza para medir la brecha Pred vs Real con confianza."
+
+    if infl_abs <= SEM_CAL_INFL_OK_PP:
+        return "Vas por buen camino: la probabilidad predicha está cerca del resultado real."
+
+    if infl_abs <= SEM_CAL_INFL_WARN_PP:
+        sesgo = "sobreestima" if pred_mean >= win_rate else "subestima"
+        return f"Hay avance, pero la IA aún {sesgo} el resultado real; conviene más muestra."
+
+    sesgo = "sobreestimando" if pred_mean >= win_rate else "subestimando"
+    return f"Se detecta descalibración fuerte ({sesgo}); no usar la probabilidad sola para decidir."
+
 def auditar_calibracion_seniales_reales(min_prob: float = 0.70, max_rows: int = 20000, n_bins: int = 10):
     """
     Auditoría REAL vs PRED (señales cerradas en ia_signals_log.csv).
@@ -6250,6 +6278,11 @@ def mostrar_panel():
 
             sem_emoji, sem_label, sem_det = semaforo_calibracion(n, infl_pp)
             print(Fore.MAGENTA + f"   Semáforo calibración: {sem_emoji} {sem_label} ({sem_det})")
+            print(
+                Fore.MAGENTA
+                + "   "
+                + diagnostico_calibracion(n=n, pred_mean=pred_mean, win_rate=win_rate, infl_pp=infl_pp)
+            )
 
             if n < int(MIN_IA_SENIALES_CONF):
                 print(
