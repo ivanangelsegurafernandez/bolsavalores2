@@ -2164,11 +2164,17 @@ async def ejecutar_panel():
                             try:
                                 if ack and int(ack.get("epoch", 0)) >= int(epoch_pre):
                                     p = ack.get("prob", None)
+                                    p_hud = ack.get("prob_hud", None)
+                                    p_show = p_hud if isinstance(p_hud, (int, float)) else p
                                     auc = float(ack.get("auc", 0.0) or 0.0)
                                     modo = ack.get("modo", "OFF")
+                                    thr_real = ack.get("real_thr", None)
 
-                                    if isinstance(p, (int, float)):
-                                        print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p*100:.1f}% | AUC={auc:.3f} | modo={modo}")
+                                    if isinstance(p_show, (int, float)):
+                                        if isinstance(thr_real, (int, float)):
+                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | Gate REAL={float(thr_real)*100:.1f}% | AUC={auc:.3f} | modo={modo}")
+                                        else:
+                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | AUC={auc:.3f} | modo={modo}")
                                     else:
                                         print(f"🤖 IA ACK ({NOMBRE_BOT}) → (sin prob) | AUC={auc:.3f} | modo={modo}")
 

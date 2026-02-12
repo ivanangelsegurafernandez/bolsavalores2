@@ -1543,6 +1543,8 @@ def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: st
             "calib_factor": float(st.get("cal_factor")) if isinstance(st.get("cal_factor"), (int, float)) else None,
             "auc": float((meta or {}).get("auc", 0.0) or 0.0),
             "thr": float((meta or {}).get("threshold", 0.0) or 0.0),
+            "real_thr": float(get_umbral_real_calibrado()),
+            "real_thr_cap": float(AUTO_REAL_THR),
             "reliable": bool((meta or {}).get("reliable", True)),
             "modo": str(modo_ia).upper() if modo_ia else "OFF",
             "ts": time.time()
