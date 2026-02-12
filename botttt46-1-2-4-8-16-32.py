@@ -143,6 +143,10 @@ PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado
 # (0 para desactivar)
 VENTANA_DECISION_IA_S = 60        # segundos
 VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
+# === Filtro avanzado (sin cambiar 13 features) ===
+SCORE_MIN = 2.80            # score mínimo para aceptar un setup
+SCORE_DROP_MAX = 0.70       # caída máxima tolerada al revalidar pre-buy
+REVALIDAR_VELAS_N = 8       # velas mínimas para revalidación rápida
 resultado_global = {"demo": 0.0, "real": 0.0}
 ultimo_token = None
 reinicio_forzado = asyncio.Event()
@@ -154,7 +158,8 @@ estado_bot = {
     "ciclo_forzado": None,
     "reinicios_consecutivos": 0,
     "modo_manual": False,
-    "barra_activa": False
+    "barra_activa": False,
+    "score_senal": None,
 }  # Added modo_manual and barra_activa
 racha_actual_bot = 0  # racha del bot: >0 = racha de GANANCIAS, <0 = racha de PÉRDIDAS
 
@@ -983,6 +988,49 @@ def evaluar_estrategia(velas):
 
     # Importante: mantenemos el orden de retorno que tu bot ya espera
     return condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce_sma, rsi_reversion
+
+
+def puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce_sma, rsi_reversion):
+    """
+    Score interno para elegir MEJOR activo entre candidatos válidos (sin cambiar 13 features).
+    Mantiene la regla base (>=2/3), pero evita tomar el primer símbolo "aceptable".
+    """
+    try:
+        score = float(condiciones)
+
+        # Alineación de tendencia con la dirección sugerida
+        tendencia_call = (sma5 > sma20)
+        tendencia_put = (sma5 < sma20)
+        alineado = (direccion == "CALL" and tendencia_call) or (direccion == "PUT" and tendencia_put)
+        if alineado:
+            score += 0.75
+
+        # Fortaleza del cruce (distancia relativa entre medias)
+        den = max(abs(float(sma20)), 1e-9)
+        gap = abs(float(sma5) - float(sma20)) / den
+        score += min(0.50, gap * 25.0)
+
+        # Confirmaciones de setup
+        if breakout:
+            score += 0.35
+        if rsi_reversion:
+            score += 0.25
+
+        # Penalización suave si RSI está en zona "gris" (menos edge)
+        if 45.0 <= float(rsi14) <= 55.0:
+            score -= 0.15
+
+        return float(score)
+    except Exception:
+        return float(condiciones or 0)
+
+
+def setup_pasa_filtro(score: float, condiciones: int) -> bool:
+    """Gate de calidad: mantiene >=2/3 y exige score mínimo."""
+    try:
+        return (int(condiciones) >= 2) and (float(score) >= float(SCORE_MIN))
+    except Exception:
+        return False
 # ==================== WS HELPERS ====================
 # BLOQUE 1: api_call wrapper
 _req_counter = itertools.count(1)
@@ -1302,6 +1350,7 @@ async def buscar_estrategia(ws, ciclo, token):
             print(Fore.YELLOW + f"Intento #{intento}...")
         errores_intento = []
         activos_invalidos = []
+        mejores = []
         for symbol in ACTIVOS:
             velas = await obtener_velas(ws, symbol, token, reintentos=4)
             await asyncio.sleep(0.12 + random.uniform(0.0, 0.18))
@@ -1313,12 +1362,24 @@ async def buscar_estrategia(ws, ciclo, token):
                     continue
                 condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion = evaluar_estrategia(velas)
                 if condiciones >= 2:
-                    print(Fore.GREEN + Style.BRIGHT + f"Estrategia válida en {symbol} | Dirección: {direccion} | Condiciones: {condiciones}/3")
-                    return symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion
+                    score = puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion)
+                    if setup_pasa_filtro(score, condiciones):
+                        mejores.append((score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion))
+                    else:
+                        activos_invalidos.append(symbol)
                 else:
                     activos_invalidos.append(symbol)
             except Exception as e:
                 errores_intento.append(symbol)
+
+        if mejores:
+            # Prioridad: mayor score; desempate por más condiciones
+            mejores.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion = mejores[0]
+            estado_bot["score_senal"] = float(score)
+            print(Fore.GREEN + Style.BRIGHT + f"Estrategia válida en {symbol} | Dirección: {direccion} | Condiciones: {condiciones}/3 | Score={score:.3f}")
+            return symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion
+
         if errores_intento:
             print(Fore.RED + f"Error WS en activos: {', '.join(errores_intento)} | Intento #{intento}")
         if activos_invalidos:
@@ -1981,6 +2042,28 @@ async def ejecutar_panel():
                             print(Fore.RED + Style.BRIGHT + f"Saldo REAL insuficiente: {saldo:.2f} < {monto:.2f}. Espero y reintento MISMO ciclo ({estado_bot['intentos_saldo']}/3).")
                             await asyncio.sleep(15 + random.uniform(0.0, 0.5))
                         continue
+
+                # ========= REVALIDACIÓN PRE-BUY =========
+                try:
+                    score_sel = estado_bot.get("score_senal")
+                    velas_rv = await obtener_velas(ws, symbol, current_token, reintentos=2)
+                    if velas_rv and len(velas_rv) >= int(REVALIDAR_VELAS_N):
+                        cond2, dir2, rsi9_2, rsi14_2, sma5_2, sma20_2, br2, cr2, rev2 = evaluar_estrategia(velas_rv)
+                        score2 = puntuar_setups(cond2, dir2, rsi9_2, rsi14_2, sma5_2, sma20_2, br2, cr2, rev2)
+                        piso = float(SCORE_MIN)
+                        if isinstance(score_sel, (int, float)):
+                            piso = max(piso, float(score_sel) - float(SCORE_DROP_MAX))
+
+                        if (dir2 != direccion) or (int(cond2) < 2) or (float(score2) < piso):
+                            print(Fore.YELLOW + Style.BRIGHT + f"Revalidación falló en {symbol}: dir {direccion}->{dir2}, cond={cond2}, score={score2:.3f}<piso {piso:.3f}. Reintentando ciclo...")
+                            await asyncio.sleep(2.0 + random.uniform(0.0, 0.5))
+                            continue
+
+                        # refresca snapshot para compra/log consistentes
+                        direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion, condiciones = dir2, rsi9_2, rsi14_2, sma5_2, sma20_2, br2, cr2, rev2, cond2
+                        estado_bot["score_senal"] = float(score2)
+                except Exception:
+                    pass
 
                 # ========= PROPOSAL =========
                 try:
