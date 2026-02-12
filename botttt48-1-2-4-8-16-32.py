@@ -933,7 +933,7 @@ if not os.path.exists(ARCHIVO_CSV):
 
 def leer_token_desde_archivo():
     """
-    Lee ARCHIVO_TOKEN. Si contiene 'REAL:fulll46' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
+    Lee ARCHIVO_TOKEN. Si contiene 'REAL:fulll48' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
     """
     try:
         with open(ARCHIVO_TOKEN, "r", encoding="utf-8", errors="replace") as f:
@@ -983,6 +983,41 @@ def evaluar_estrategia(velas):
 
     # Importante: mantenemos el orden de retorno que tu bot ya espera
     return condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce_sma, rsi_reversion
+
+
+def puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce_sma, rsi_reversion):
+    """
+    Score interno para elegir MEJOR activo entre candidatos válidos (sin cambiar 13 features).
+    Mantiene la regla base (>=2/3), pero evita tomar el primer símbolo "aceptable".
+    """
+    try:
+        score = float(condiciones)
+
+        # Alineación de tendencia con la dirección sugerida
+        tendencia_call = (sma5 > sma20)
+        tendencia_put = (sma5 < sma20)
+        alineado = (direccion == "CALL" and tendencia_call) or (direccion == "PUT" and tendencia_put)
+        if alineado:
+            score += 0.75
+
+        # Fortaleza del cruce (distancia relativa entre medias)
+        den = max(abs(float(sma20)), 1e-9)
+        gap = abs(float(sma5) - float(sma20)) / den
+        score += min(0.50, gap * 25.0)
+
+        # Confirmaciones de setup
+        if breakout:
+            score += 0.35
+        if rsi_reversion:
+            score += 0.25
+
+        # Penalización suave si RSI está en zona "gris" (menos edge)
+        if 45.0 <= float(rsi14) <= 55.0:
+            score -= 0.15
+
+        return float(score)
+    except Exception:
+        return float(condiciones or 0)
 # ==================== WS HELPERS ====================
 # BLOQUE 1: api_call wrapper
 _req_counter = itertools.count(1)
@@ -1302,6 +1337,7 @@ async def buscar_estrategia(ws, ciclo, token):
             print(Fore.YELLOW + f"Intento #{intento}...")
         errores_intento = []
         activos_invalidos = []
+        mejores = []
         for symbol in ACTIVOS:
             velas = await obtener_velas(ws, symbol, token, reintentos=4)
             await asyncio.sleep(0.12 + random.uniform(0.0, 0.18))
@@ -1313,12 +1349,20 @@ async def buscar_estrategia(ws, ciclo, token):
                     continue
                 condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion = evaluar_estrategia(velas)
                 if condiciones >= 2:
-                    print(Fore.GREEN + Style.BRIGHT + f"Estrategia válida en {symbol} | Dirección: {direccion} | Condiciones: {condiciones}/3")
-                    return symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion
+                    score = puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion)
+                    mejores.append((score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion))
                 else:
                     activos_invalidos.append(symbol)
             except Exception as e:
                 errores_intento.append(symbol)
+
+        if mejores:
+            # Prioridad: mayor score; desempate por más condiciones
+            mejores.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion = mejores[0]
+            print(Fore.GREEN + Style.BRIGHT + f"Estrategia válida en {symbol} | Dirección: {direccion} | Condiciones: {condiciones}/3 | Score={score:.3f}")
+            return symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion
+
         if errores_intento:
             print(Fore.RED + f"Error WS en activos: {', '.join(errores_intento)} | Intento #{intento}")
         if activos_invalidos:
@@ -1343,7 +1387,7 @@ async def buscar_estrategia(ws, ciclo, token):
     await asyncio.sleep(30)
     return "REINTENTAR", None, None, None, None, None, None, None, None, None
 
-async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, ciclo, payout, condiciones, token_usado_buy):
+async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, ciclo, payout, condiciones, token_usado_buy, epoch_pretrade=None):
     # ✅ SIEMPRE cerramos/logueamos con el token real del BUY (aunque el maestro cambie token_actual.txt)
     token_antes = token_usado_buy
     print(Fore.CYAN + "=" * 80)
@@ -1358,7 +1402,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                 asyncio.create_task(finalizar_contrato_bg(
                     contract_id, remaining, symbol, direccion, monto,
                     rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                    ciclo, payout, condiciones, token_antes
+                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade
                 ))
                 estado_bot["interrumpir_ciclo"] = False
                 estado_bot["ciclo_en_progreso"] = False
@@ -1464,7 +1508,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                     ratio_total = 0.0
 
                 now = datetime.now(timezone.utc)
-                epoch_val = int(now.timestamp())
+                epoch_val = int(epoch_pretrade) if epoch_pretrade is not None else int(now.timestamp())
                 ts_val = now.isoformat()
                 
                 async with csv_lock:
@@ -1486,7 +1530,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                         "cruce_sma": int(cruce),
                         "breakout": int(breakout),
                         "rsi_reversion": int(rsi_reversion),
-                        "racha_actual": int(racha_actual_bot),
+                        "racha_actual": int(racha_anterior),
                         "es_rebote": int(es_rebote_flag),
                         "ciclo_martingala": int(ciclo),
                         "payout_total": float(round(payout_total_f, 2)),
@@ -1558,7 +1602,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
 
 async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto,
                                 rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                                ciclo, payout, condiciones, token_usado):
+                                ciclo, payout, condiciones, token_usado, epoch_pretrade=None):
     """
     Finaliza un contrato en background cuando hubo cambio de token / reinicio.
     Importante IA:
@@ -1617,7 +1661,7 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
 
         # === Escribir fila resultado en CSV enriquecido ===
         now = datetime.now(timezone.utc)
-        epoch_val = int(now.timestamp())
+        epoch_val = int(epoch_pretrade) if epoch_pretrade is not None else int(now.timestamp())
         ts_val = now.isoformat()
 
         # ==========================================================
@@ -1700,7 +1744,7 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
                 "cruce_sma": int(cruce),
                 "breakout": int(breakout),
                 "rsi_reversion": int(rsi_reversion),
-                "racha_actual": int(racha_actual_bot),
+                "racha_actual": int(racha_anterior),
                 "es_rebote": int(es_rebote_flag),
                 "ciclo_martingala": int(ciclo),
                 "payout_total": float(round(payout_total_f, 2)),
@@ -2145,7 +2189,7 @@ async def ejecutar_panel():
                 resultado, profit = await esperar_resultado(
                     ws, contract_id, symbol, direccion, monto,
                     rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                    ciclo, payout, condiciones, current_token
+                    ciclo, payout, condiciones, current_token, epoch_pre
                 )
 
                 if resultado == "INDEFINIDO":

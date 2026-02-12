@@ -933,7 +933,7 @@ if not os.path.exists(ARCHIVO_CSV):
 
 def leer_token_desde_archivo():
     """
-    Lee ARCHIVO_TOKEN. Si contiene 'REAL:fulll46' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
+    Lee ARCHIVO_TOKEN. Si contiene 'REAL:fulll49' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
     """
     try:
         with open(ARCHIVO_TOKEN, "r", encoding="utf-8", errors="replace") as f:
@@ -983,6 +983,41 @@ def evaluar_estrategia(velas):
 
     # Importante: mantenemos el orden de retorno que tu bot ya espera
     return condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce_sma, rsi_reversion
+
+
+def puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce_sma, rsi_reversion):
+    """
+    Score interno para elegir MEJOR activo entre candidatos válidos (sin cambiar 13 features).
+    Mantiene la regla base (>=2/3), pero evita tomar el primer símbolo "aceptable".
+    """
+    try:
+        score = float(condiciones)
+
+        # Alineación de tendencia con la dirección sugerida
+        tendencia_call = (sma5 > sma20)
+        tendencia_put = (sma5 < sma20)
+        alineado = (direccion == "CALL" and tendencia_call) or (direccion == "PUT" and tendencia_put)
+        if alineado:
+            score += 0.75
+
+        # Fortaleza del cruce (distancia relativa entre medias)
+        den = max(abs(float(sma20)), 1e-9)
+        gap = abs(float(sma5) - float(sma20)) / den
+        score += min(0.50, gap * 25.0)
+
+        # Confirmaciones de setup
+        if breakout:
+            score += 0.35
+        if rsi_reversion:
+            score += 0.25
+
+        # Penalización suave si RSI está en zona "gris" (menos edge)
+        if 45.0 <= float(rsi14) <= 55.0:
+            score -= 0.15
+
+        return float(score)
+    except Exception:
+        return float(condiciones or 0)
 # ==================== WS HELPERS ====================
 # BLOQUE 1: api_call wrapper
 _req_counter = itertools.count(1)
@@ -1302,6 +1337,7 @@ async def buscar_estrategia(ws, ciclo, token):
             print(Fore.YELLOW + f"Intento #{intento}...")
         errores_intento = []
         activos_invalidos = []
+        mejores = []
         for symbol in ACTIVOS:
             velas = await obtener_velas(ws, symbol, token, reintentos=4)
             await asyncio.sleep(0.12 + random.uniform(0.0, 0.18))
@@ -1313,12 +1349,20 @@ async def buscar_estrategia(ws, ciclo, token):
                     continue
                 condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion = evaluar_estrategia(velas)
                 if condiciones >= 2:
-                    print(Fore.GREEN + Style.BRIGHT + f"Estrategia válida en {symbol} | Dirección: {direccion} | Condiciones: {condiciones}/3")
-                    return symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion
+                    score = puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion)
+                    mejores.append((score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion))
                 else:
                     activos_invalidos.append(symbol)
             except Exception as e:
                 errores_intento.append(symbol)
+
+        if mejores:
+            # Prioridad: mayor score; desempate por más condiciones
+            mejores.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion = mejores[0]
+            print(Fore.GREEN + Style.BRIGHT + f"Estrategia válida en {symbol} | Dirección: {direccion} | Condiciones: {condiciones}/3 | Score={score:.3f}")
+            return symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion
+
         if errores_intento:
             print(Fore.RED + f"Error WS en activos: {', '.join(errores_intento)} | Intento #{intento}")
         if activos_invalidos:
