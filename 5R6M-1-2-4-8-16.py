@@ -134,10 +134,11 @@ ORACULO_DELTA_PRE = 0.05
 # Umbral único (verde + aviso IA)  -> esto NO lo tocamos
 IA_VERDE_THR = 0.75
 AUTO_REAL_THR = 0.75  # umbral techo para auto-promoción a REAL
-AUTO_REAL_THR_MIN = 0.70  # piso adaptativo para activar REAL con la data reciente
+AUTO_REAL_THR_MIN = 0.45  # piso adaptativo para activar REAL con la data reciente
 AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
 AUTO_REAL_MARGIN = 0.01   # pequeño margen para evitar quedar fuera por décimas
 AUTO_REAL_LOG_MAX_ROWS = 300  # máximo de señales históricas usadas en la calibración
+AUTO_REAL_LIVE_MIN_BOTS = 3   # mínimos bots con prob viva para calibración por tick
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
 # OJO: también se usa como piso en get_umbral_operativo(), así que NO lo bajamos para no cambiar conducta del bot.
@@ -4014,29 +4015,53 @@ def _leer_probs_historicas_ia(max_rows: int = AUTO_REAL_LOG_MAX_ROWS) -> list[fl
 
 def get_umbral_real_calibrado(force: bool = False) -> float:
     """
-    Umbral adaptativo para activar REAL usando los mayores valores observados de Prob IA.
-    - Usa cuantíl alto (AUTO_REAL_TOP_Q) de ia_signals_log.prob
-    - Aplica margen pequeño y límites [AUTO_REAL_THR_MIN .. AUTO_REAL_THR]
-    - Cache corto para evitar I/O excesivo en cada tick
+    Umbral adaptativo para activar REAL usando históricos + probabilidad viva actual.
+    Reglas:
+    - Histórico: cuantíl alto de ia_signals_log.prob (estabilidad).
+    - Vivo: mejor prob IA actual de bots (sensibilidad al régimen actual).
+    - Resultado: min(thr_hist, thr_live) acotado en [AUTO_REAL_THR_MIN .. AUTO_REAL_THR].
     """
     now = time.time()
     try:
-        if (not force) and ((now - float(_AUTO_REAL_CACHE.get("ts", 0.0) or 0.0)) < 20.0):
+        if (not force) and ((now - float(_AUTO_REAL_CACHE.get("ts", 0.0) or 0.0)) < 8.0):
             return float(_AUTO_REAL_CACHE.get("thr", AUTO_REAL_THR))
 
+        # 1) Histórico
         probs = _leer_probs_historicas_ia(AUTO_REAL_LOG_MAX_ROWS)
         if len(probs) >= 12:
-            q = float(np.quantile(np.array(probs, dtype=float), float(AUTO_REAL_TOP_Q)))
-            thr = max(float(AUTO_REAL_THR_MIN), min(float(AUTO_REAL_THR), q - float(AUTO_REAL_MARGIN)))
-            pmax = float(max(probs))
+            q_hist = float(np.quantile(np.array(probs, dtype=float), float(AUTO_REAL_TOP_Q)))
+            thr_hist = q_hist - float(AUTO_REAL_MARGIN)
+            pmax_hist = float(max(probs))
         else:
-            thr = float(AUTO_REAL_THR)
-            pmax = float(max(probs)) if probs else 0.0
+            thr_hist = float(AUTO_REAL_THR)
+            pmax_hist = float(max(probs)) if probs else 0.0
+
+        # 2) Vivo (último tick): si el mercado/modelo se aplana, el gate también baja
+        live_probs = []
+        for b in BOT_NAMES:
+            try:
+                if not ia_prob_valida(b, max_age_s=12.0):
+                    continue
+                p = float(estado_bots.get(b, {}).get("prob_ia", 0.0) or 0.0)
+                if np.isfinite(p) and 0.0 <= p <= 1.0:
+                    live_probs.append(p)
+            except Exception:
+                continue
+
+        if len(live_probs) >= int(AUTO_REAL_LIVE_MIN_BOTS):
+            pmax_live = float(max(live_probs))
+            thr_live = pmax_live - float(AUTO_REAL_MARGIN)
+        else:
+            pmax_live = 0.0
+            thr_live = float(AUTO_REAL_THR)
+
+        thr_raw = min(float(thr_hist), float(thr_live))
+        thr = max(float(AUTO_REAL_THR_MIN), min(float(AUTO_REAL_THR), float(thr_raw)))
 
         _AUTO_REAL_CACHE["ts"] = now
         _AUTO_REAL_CACHE["thr"] = float(thr)
         _AUTO_REAL_CACHE["n"] = int(len(probs))
-        _AUTO_REAL_CACHE["max"] = float(pmax)
+        _AUTO_REAL_CACHE["max"] = float(max(pmax_hist, pmax_live))
         return float(thr)
     except Exception:
         return float(AUTO_REAL_THR)
