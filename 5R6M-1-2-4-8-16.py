@@ -3864,13 +3864,15 @@ def ia_prob_valida(bot: str, max_age_s: float = 10.0) -> bool:
     except Exception:
         return False
                                               
-def detectar_cierre_martingala(bot, min_fila=None, require_closed=True):
+def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_real_token=False, expected_ciclo=None):
     """
     Devuelve: (resultado_norm, monto, ciclo, payout_total)
     - min_fila: solo acepta filas con número > min_fila (evita cierres viejos)
               Nota: min_fila se interpreta como "cantidad de filas de datos" (sin header),
               y cuadra con contar_filas_csv().
     - require_closed: si existe trade_status, exige CERRADO/CLOSED.
+    - require_real_token: si hay columna de token/cuenta, ignora cierres DEMO.
+    - expected_ciclo: si existe columna de ciclo, exige coincidencia con ese ciclo.
     """
     path = f"registro_enriquecido_{bot}.csv"
     if not os.path.exists(path):
@@ -3913,6 +3915,7 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True):
     i_status = _col("trade_status", "status")
     i_monto = _col("monto", "stake", "buy_price", "amount")
     i_ciclo = _col("ciclo", "ciclo_martingala", "ciclo_actual", "marti_ciclo", "martingale_step")
+    i_token = _col("token", "account", "account_type", "cuenta", "modo", "mode")
     # payout_total puede venir explícito o calculable
     # (extraer_payout_total ya se encarga, pero igual ayudamos con nombres)
     i_payout_total = _col("payout_total")
@@ -3943,6 +3946,16 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True):
             st = str(row[i_status]).strip().upper()
             if st not in ("CERRADO", "CLOSED"):
                 continue
+
+        # Si el CSV informa token/cuenta, en REAL ignoramos cierres explícitos de DEMO.
+        if require_real_token and (i_token is not None) and (i_token < len(row)):
+            tok_raw = str(row[i_token] or "").strip().upper()
+            if tok_raw:
+                # Heurística robusta: DEMO en Deriv suele venir como VRTC*
+                es_demo = ("DEMO" in tok_raw) or tok_raw.startswith("VRTC")
+                es_real = ("REAL" in tok_raw) or tok_raw.startswith("CR")
+                if es_demo and not es_real:
+                    continue
 
         # resultado
         try:
@@ -3978,6 +3991,14 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True):
                 ciclo = int(float(ciclo)) if ciclo is not None else None
         except Exception:
             ciclo = None
+
+        # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
+        if expected_ciclo is not None and ciclo is not None:
+            try:
+                if int(ciclo) != int(expected_ciclo):
+                    continue
+            except Exception:
+                pass
 
         # payout_total: preferimos extractor (maneja legacy y ratio)
         payout_total = None
@@ -7535,7 +7556,13 @@ async def main():
                         if estado_bots[bot]["token"] == "REAL":
                             # Detecta el último cierre REAL de forma robusta (sin depender de SNAPSHOT_FILAS,
                             # porque TICK_01 ya puede haber avanzado el snapshot antes de este bloque).
-                            cierre_info = detectar_cierre_martingala(bot, min_fila=REAL_ENTRY_BASELINE.get(bot, 0), require_closed=True)
+                            cierre_info = detectar_cierre_martingala(
+                                bot,
+                                min_fila=REAL_ENTRY_BASELINE.get(bot, 0),
+                                require_closed=True,
+                                require_real_token=True,
+                                expected_ciclo=estado_bots.get(bot, {}).get("ciclo_actual", None),
+                            )
 
                             # Ventana anti-stale tras activar REAL (protección vigente)
                             if time.time() < (estado_bots[bot].get("ignore_cierres_hasta") or 0):
