@@ -3980,6 +3980,16 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
                 if es_demo and not es_real:
                     continue
 
+        # Si el CSV informa token/cuenta, en REAL ignoramos cierres explícitos de DEMO.
+        if require_real_token and (i_token is not None) and (i_token < len(row)):
+            tok_raw = str(row[i_token] or "").strip().upper()
+            if tok_raw:
+                # Heurística robusta: DEMO en Deriv suele venir como VRTC*
+                es_demo = ("DEMO" in tok_raw) or tok_raw.startswith("VRTC")
+                es_real = ("REAL" in tok_raw) or tok_raw.startswith("CR")
+                if es_demo and not es_real:
+                    continue
+
         # resultado
         try:
             raw_res = row[i_res] if i_res < len(row) else ""
@@ -4014,6 +4024,14 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
                 ciclo = int(float(ciclo)) if ciclo is not None else None
         except Exception:
             ciclo = None
+
+        # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
+        if expected_ciclo is not None and ciclo is not None:
+            try:
+                if int(ciclo) != int(expected_ciclo):
+                    continue
+            except Exception:
+                pass
 
         # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
         if expected_ciclo is not None and ciclo is not None:
