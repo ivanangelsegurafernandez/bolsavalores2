@@ -1257,6 +1257,24 @@ def _enforce_single_real_standby(owner: str | None):
     except Exception:
         pass
 
+def _enforce_single_real_standby(owner: str | None):
+    """
+    Si hay owner REAL activo, deja a los demás bots en standby estricto:
+    - token DEMO visual
+    - sin señal IA pendiente
+    """
+    try:
+        if owner not in BOT_NAMES:
+            return
+        for b in BOT_NAMES:
+            if b == owner:
+                continue
+            estado_bots[b]["token"] = "DEMO"
+            estado_bots[b]["ia_senal_pendiente"] = False
+            estado_bots[b]["ia_prob_senal"] = None
+    except Exception:
+        pass
+
 def _escribir_orden_real_raw(bot: str, ciclo: int):
     """
     Escritura RAW de orden_real (sin activar_real_inmediato, sin recursión).
@@ -3990,6 +4008,16 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
                 if es_demo and not es_real:
                     continue
 
+        # Si el CSV informa token/cuenta, en REAL ignoramos cierres explícitos de DEMO.
+        if require_real_token and (i_token is not None) and (i_token < len(row)):
+            tok_raw = str(row[i_token] or "").strip().upper()
+            if tok_raw:
+                # Heurística robusta: DEMO en Deriv suele venir como VRTC*
+                es_demo = ("DEMO" in tok_raw) or tok_raw.startswith("VRTC")
+                es_real = ("REAL" in tok_raw) or tok_raw.startswith("CR")
+                if es_demo and not es_real:
+                    continue
+
         # resultado
         try:
             raw_res = row[i_res] if i_res < len(row) else ""
@@ -4024,6 +4052,14 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
                 ciclo = int(float(ciclo)) if ciclo is not None else None
         except Exception:
             ciclo = None
+
+        # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
+        if expected_ciclo is not None and ciclo is not None:
+            try:
+                if int(ciclo) != int(expected_ciclo):
+                    continue
+            except Exception:
+                pass
 
         # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
         if expected_ciclo is not None and ciclo is not None:
@@ -4323,7 +4359,7 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     except Exception:
         pass
 
-def registrar_resultado_real(resultado: str, bot: str | None = None):
+def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_operado: int | None = None):
     """
     Actualiza el contador global de ciclos martingala para el HUD y la próxima
     autoasignación REAL.
@@ -4339,7 +4375,17 @@ def registrar_resultado_real(resultado: str, bot: str | None = None):
         marti_ciclos_perdidos = 0
         marti_paso = 0
     elif res == "PÉRDIDA":
-        marti_ciclos_perdidos = min(MAX_CICLOS, int(marti_ciclos_perdidos) + 1)
+        # Robustez anti-desincronización:
+        # si conocemos el ciclo realmente operado, el próximo estado de pérdidas
+        # debe ser al menos ese ciclo (p.ej. perder en C2 => pérdidas=2 => próximo C3).
+        try:
+            ciclo_ref = int(ciclo_operado) if ciclo_operado is not None else 0
+        except Exception:
+            ciclo_ref = 0
+        marti_ciclos_perdidos = min(
+            MAX_CICLOS,
+            max(int(marti_ciclos_perdidos) + 1, max(0, ciclo_ref))
+        )
         marti_paso = min(MAX_CICLOS - 1, int(marti_ciclos_perdidos))
     else:
         return
@@ -4349,6 +4395,16 @@ def registrar_resultado_real(resultado: str, bot: str | None = None):
     agregar_evento(
         f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo={ciclo_sig}"
     )
+
+def ciclo_martingala_siguiente() -> int:
+    """
+    Fuente canónica del ciclo a abrir en REAL:
+    - ciclo = pérdidas_consecutivas + 1, con límites [1..MAX_CICLOS]
+    """
+    try:
+        return max(1, min(int(MAX_CICLOS), int(marti_ciclos_perdidos) + 1))
+    except Exception:
+        return 1
 
 def ciclo_martingala_siguiente() -> int:
     """
@@ -7632,7 +7688,7 @@ async def main():
                                 LAST_REAL_CLOSE_SIG[bot] = sig
 
                                 if res in ("GANANCIA", "PÉRDIDA"):
-                                    registrar_resultado_real(res, bot=bot)
+                                    registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
                                     if res == "GANANCIA":
                                         cerrar_por_fin_de_ciclo(bot, "Ganancia en REAL (fin de turno)")
                                     else:
