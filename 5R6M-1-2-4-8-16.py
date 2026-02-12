@@ -1239,6 +1239,24 @@ def _set_ui_token_holder(holder: str | None):
     except Exception:
         pass
 
+def _enforce_single_real_standby(owner: str | None):
+    """
+    Si hay owner REAL activo, deja a los demás bots en standby estricto:
+    - token DEMO visual
+    - sin señal IA pendiente
+    """
+    try:
+        if owner not in BOT_NAMES:
+            return
+        for b in BOT_NAMES:
+            if b == owner:
+                continue
+            estado_bots[b]["token"] = "DEMO"
+            estado_bots[b]["ia_senal_pendiente"] = False
+            estado_bots[b]["ia_prob_senal"] = None
+    except Exception:
+        pass
+
 def _escribir_orden_real_raw(bot: str, ciclo: int):
     """
     Escritura RAW de orden_real (sin activar_real_inmediato, sin recursión).
@@ -1537,6 +1555,7 @@ def leer_token_actual():
     # Si ya hay owner REAL en memoria, mantenemos sincronía visual inmediata.
     if holder in BOT_NAMES:
         _set_ui_token_holder(holder)
+        _enforce_single_real_standby(holder)
         return holder
 
     if not os.path.exists(TOKEN_FILE):
@@ -1552,6 +1571,8 @@ def leer_token_actual():
             elif bot_name == "none":
                 holder = None
         _set_ui_token_holder(holder)
+        if holder in BOT_NAMES:
+            _enforce_single_real_standby(holder)
         return holder
     except Exception as e:
         try:
@@ -1560,6 +1581,8 @@ def leer_token_actual():
             pass
         fallback = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
         _set_ui_token_holder(fallback)
+        if fallback in BOT_NAMES:
+            _enforce_single_real_standby(fallback)
         return fallback
 
 # Escribir token actual
@@ -3957,6 +3980,16 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
                 if es_demo and not es_real:
                     continue
 
+        # Si el CSV informa token/cuenta, en REAL ignoramos cierres explícitos de DEMO.
+        if require_real_token and (i_token is not None) and (i_token < len(row)):
+            tok_raw = str(row[i_token] or "").strip().upper()
+            if tok_raw:
+                # Heurística robusta: DEMO en Deriv suele venir como VRTC*
+                es_demo = ("DEMO" in tok_raw) or tok_raw.startswith("VRTC")
+                es_real = ("REAL" in tok_raw) or tok_raw.startswith("CR")
+                if es_demo and not es_real:
+                    continue
+
         # resultado
         try:
             raw_res = row[i_res] if i_res < len(row) else ""
@@ -3991,6 +4024,14 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
                 ciclo = int(float(ciclo)) if ciclo is not None else None
         except Exception:
             ciclo = None
+
+        # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
+        if expected_ciclo is not None and ciclo is not None:
+            try:
+                if int(ciclo) != int(expected_ciclo):
+                    continue
+            except Exception:
+                pass
 
         # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
         if expected_ciclo is not None and ciclo is not None:
@@ -4308,6 +4349,16 @@ def registrar_resultado_real(resultado: str, bot: str | None = None):
     agregar_evento(
         f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo={ciclo_sig}"
     )
+
+def ciclo_martingala_siguiente() -> int:
+    """
+    Fuente canónica del ciclo a abrir en REAL:
+    - ciclo = pérdidas_consecutivas + 1, con límites [1..MAX_CICLOS]
+    """
+    try:
+        return max(1, min(int(MAX_CICLOS), int(marti_ciclos_perdidos) + 1))
+    except Exception:
+        return 1
 
 # === FIN BLOQUE 9 ===
 
@@ -6716,7 +6767,7 @@ def dibujar_hud_gatewin(panel_height=8, layout=None):
     if activo_real:
         cyc = estado_bots[activo_real].get("ciclo_actual", 1)
         hud_lines.insert(-1, f"│ Bot REAL: {activo_real} · Ciclo {cyc}/{MAX_CICLOS}".ljust(HUD_INNER_WIDTH) + " │")
-    hud_lines.insert(-1, f"│ Martingala: {marti_ciclos_perdidos}/{MAX_CICLOS} pérdidas seguidas · Próx C{marti_paso+1}".ljust(HUD_INNER_WIDTH) + " │")
+    hud_lines.insert(-1, f"│ Martingala: {marti_ciclos_perdidos}/{MAX_CICLOS} pérdidas seguidas · Próx C{ciclo_martingala_siguiente()}".ljust(HUD_INNER_WIDTH) + " │")
     hud_lines.append("└" + "─" * HUD_INNER_WIDTH + "┘")
     layout = (layout or HUD_LAYOUT).lower()
     hud_height = len(hud_lines)
@@ -7522,6 +7573,7 @@ async def main():
                 activo_real = owner_mem or owner_file or next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
                 if activo_real in BOT_NAMES:
                     _set_ui_token_holder(activo_real)
+                    _enforce_single_real_standby(activo_real)
                 for bot in BOT_NAMES:
                     try:  # Aislamiento per-bot para evitar skips globales
                         if reinicio_forzado.is_set():
@@ -7597,10 +7649,7 @@ async def main():
                         lock_activo = owner_lock in BOT_NAMES
                         if lock_activo:
                             activo_real = owner_lock
-                            for b in BOT_NAMES:
-                                if b != owner_lock:
-                                    estado_bots[b]["ia_senal_pendiente"] = False
-                                    estado_bots[b]["ia_prob_senal"] = None
+                            _enforce_single_real_standby(owner_lock)
 
                         # Usamos el MISMO umbral operativo que HUD + audio
                         meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta()
@@ -7671,14 +7720,14 @@ async def main():
                         if candidatos and not MODO_REAL_MANUAL:
                             candidatos.sort(reverse=True)
                             prob, mejor_bot = candidatos[0]
-                            monto = MARTI_ESCALADO[marti_paso]
+                            ciclo_auto = ciclo_martingala_siguiente()
+                            monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
                             val = obtener_valor_saldo()
                             if val is None or val < monto:
                                 pass
                             else:
                                 estado_bots[mejor_bot]["ia_senal_pendiente"] = True
                                 estado_bots[mejor_bot]["ia_prob_senal"] = prob
-                                ciclo_auto = int(marti_paso) + 1
                                 ok_real = escribir_orden_real(mejor_bot, ciclo_auto)
                                 if ok_real:
                                     estado_bots[mejor_bot]["fuente"] = "IA_AUTO"
