@@ -7745,17 +7745,20 @@ async def main():
                     if not activo_real:
                         set_etapa("TICK_03")
 
-                        # 🔒 Lock estricto: si token_actual.txt ya tiene dueño REAL,
+                        # 🔒 Lock estricto: una sola inversión REAL a la vez.
+                        # Si token_actual.txt o el estado en memoria ya tienen dueño REAL,
                         # no evaluamos ni promovemos otro bot aunque cumpla umbral.
                         owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-                        lock_activo = owner_lock in BOT_NAMES
+                        holder_memoria = next((b for b in BOT_NAMES if estado_bots.get(b, {}).get("token") == "REAL"), None)
+                        lock_activo = (owner_lock in BOT_NAMES) or (holder_memoria in BOT_NAMES)
                         if lock_activo:
-                            activo_real = owner_lock
-                            _enforce_single_real_standby(owner_lock)
+                            activo_real = owner_lock if owner_lock in BOT_NAMES else holder_memoria
+                            _enforce_single_real_standby(activo_real)
 
-                        # Usamos el MISMO umbral operativo que HUD + audio
-                        meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta()
-                        umbral_ia = max(get_umbral_operativo(meta_local or {}), float(AUTO_REAL_THR))
+                        # Umbral maestro fijo para promoción automática: 75% o mayor.
+                        # (HUD/audio pueden seguir mostrando umbral operativo dinámico,
+                        # pero la compuerta de compra automática mantiene esta regla central.)
+                        umbral_ia_real = float(AUTO_REAL_THR)
 
                         # Bloqueo por saldo (no abras ventanas si no puedes ejecutar ciclo1)
                         try:
@@ -7775,7 +7778,7 @@ async def main():
                                     if not ia_prob_valida(b, max_age_s=12.0):
                                         continue
                                     p = estado_bots[b].get("prob_ia", None)
-                                    if isinstance(p, (int, float)) and float(p) >= float(umbral_ia):
+                                    if isinstance(p, (int, float)) and float(p) >= float(umbral_ia_real):
                                         candidatos.append((float(p), b))
                                 except Exception:
                                     continue
@@ -7841,7 +7844,7 @@ async def main():
                                     estado_bots[mejor_bot]["ia_prob_senal"] = None
                         else:
                             max_prob = max((estado_bots[bot]["prob_ia"] for bot in BOT_NAMES if estado_bots[bot]["ia_ready"]), default=0)
-                            if max_prob < umbral_ia:
+                            if max_prob < umbral_ia_real:
                                 pass
 
                     set_etapa("TICK_04")
