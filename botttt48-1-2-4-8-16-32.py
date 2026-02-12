@@ -933,7 +933,7 @@ if not os.path.exists(ARCHIVO_CSV):
 
 def leer_token_desde_archivo():
     """
-    Lee ARCHIVO_TOKEN. Si contiene 'REAL:fulll46' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
+    Lee ARCHIVO_TOKEN. Si contiene 'REAL:fulll48' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
     """
     try:
         with open(ARCHIVO_TOKEN, "r", encoding="utf-8", errors="replace") as f:
@@ -1387,7 +1387,7 @@ async def buscar_estrategia(ws, ciclo, token):
     await asyncio.sleep(30)
     return "REINTENTAR", None, None, None, None, None, None, None, None, None
 
-async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, ciclo, payout, condiciones, token_usado_buy):
+async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, ciclo, payout, condiciones, token_usado_buy, epoch_pretrade=None):
     # ✅ SIEMPRE cerramos/logueamos con el token real del BUY (aunque el maestro cambie token_actual.txt)
     token_antes = token_usado_buy
     print(Fore.CYAN + "=" * 80)
@@ -1402,7 +1402,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                 asyncio.create_task(finalizar_contrato_bg(
                     contract_id, remaining, symbol, direccion, monto,
                     rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                    ciclo, payout, condiciones, token_antes
+                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade
                 ))
                 estado_bot["interrumpir_ciclo"] = False
                 estado_bot["ciclo_en_progreso"] = False
@@ -1508,7 +1508,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                     ratio_total = 0.0
 
                 now = datetime.now(timezone.utc)
-                epoch_val = int(now.timestamp())
+                epoch_val = int(epoch_pretrade) if epoch_pretrade is not None else int(now.timestamp())
                 ts_val = now.isoformat()
                 
                 async with csv_lock:
@@ -1530,7 +1530,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                         "cruce_sma": int(cruce),
                         "breakout": int(breakout),
                         "rsi_reversion": int(rsi_reversion),
-                        "racha_actual": int(racha_actual_bot),
+                        "racha_actual": int(racha_anterior),
                         "es_rebote": int(es_rebote_flag),
                         "ciclo_martingala": int(ciclo),
                         "payout_total": float(round(payout_total_f, 2)),
@@ -1602,7 +1602,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
 
 async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto,
                                 rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                                ciclo, payout, condiciones, token_usado):
+                                ciclo, payout, condiciones, token_usado, epoch_pretrade=None):
     """
     Finaliza un contrato en background cuando hubo cambio de token / reinicio.
     Importante IA:
@@ -1661,7 +1661,7 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
 
         # === Escribir fila resultado en CSV enriquecido ===
         now = datetime.now(timezone.utc)
-        epoch_val = int(now.timestamp())
+        epoch_val = int(epoch_pretrade) if epoch_pretrade is not None else int(now.timestamp())
         ts_val = now.isoformat()
 
         # ==========================================================
@@ -1744,7 +1744,7 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
                 "cruce_sma": int(cruce),
                 "breakout": int(breakout),
                 "rsi_reversion": int(rsi_reversion),
-                "racha_actual": int(racha_actual_bot),
+                "racha_actual": int(racha_anterior),
                 "es_rebote": int(es_rebote_flag),
                 "ciclo_martingala": int(ciclo),
                 "payout_total": float(round(payout_total_f, 2)),
@@ -2189,7 +2189,7 @@ async def ejecutar_panel():
                 resultado, profit = await esperar_resultado(
                     ws, contract_id, symbol, direccion, monto,
                     rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                    ciclo, payout, condiciones, current_token
+                    ciclo, payout, condiciones, current_token, epoch_pre
                 )
 
                 if resultado == "INDEFINIDO":

@@ -933,7 +933,7 @@ if not os.path.exists(ARCHIVO_CSV):
 
 def leer_token_desde_archivo():
     """
-    Lee ARCHIVO_TOKEN. Si contiene 'REAL:fulll46' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
+    Lee ARCHIVO_TOKEN. Si contiene 'REAL:fulll50' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
     """
     try:
         with open(ARCHIVO_TOKEN, "r", encoding="utf-8", errors="replace") as f:
