@@ -145,6 +145,12 @@ IA_CALIB_THRESHOLD = 0.60
 IA_CALIB_GOAL_THRESHOLD = 0.70  # objetivo: medir cierres fuertes (≥70%)
 IA_CALIB_MIN_CLOSED = 200  # mínimo recomendado para considerar estable la auditoría
 
+# Recomendaciones operativas conservadoras (anti-sobreconfianza)
+IA_TEMP_THR_HIGH = 0.80              # umbral temporal sugerido cuando la muestra fuerte es baja
+IA_MIN_CLOSED_70_FOR_STRUCT = 200    # mínimo de cierres IA>=70% para cambios estructurales
+IA_SHRINK_ALPHA = 0.60               # p_ajustada = alpha*p + (1-alpha)*tasa_base
+IA_BASE_RATE_WINDOW = 300            # cierres recientes para tasa base rolling
+
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
 AUDIO_IA53_THR = 0.75
 
@@ -2677,6 +2683,62 @@ def _safe_read_csv_any_encoding(path: str) -> pd.DataFrame | None:
             continue
     return None
 
+_IA_RUNTIME_CAL_CACHE = {"ts": 0.0, "base_rate": 0.5, "n70": 0}
+
+
+def _leer_base_rate_y_n70(ttl_s: float = 30.0):
+    """
+    Lee métricas rápidas desde ia_signals_log para estabilizar operación:
+    - base_rate rolling en cierres recientes (y en {0,1})
+    - n70: cantidad de cierres con prob >= IA_CALIB_GOAL_THRESHOLD
+    Cacheado para no cargar CSV en cada tick.
+    """
+    global _IA_RUNTIME_CAL_CACHE
+    now = time.time()
+    try:
+        if (now - float(_IA_RUNTIME_CAL_CACHE.get("ts", 0.0))) <= float(ttl_s):
+            return float(_IA_RUNTIME_CAL_CACHE.get("base_rate", 0.5)), int(_IA_RUNTIME_CAL_CACHE.get("n70", 0))
+
+        _ensure_ia_signals_log()
+        df = _safe_read_csv_any_encoding(IA_SIGNALS_LOG)
+        base_rate = 0.5
+        n70 = 0
+
+        if df is not None and not df.empty and ("y" in df.columns):
+            y = pd.to_numeric(df["y"], errors="coerce")
+            mask_closed = y.isin([0, 1])
+            d = df.loc[mask_closed].copy()
+            if not d.empty:
+                yv = pd.to_numeric(d["y"], errors="coerce")
+                tail = yv.tail(int(max(20, IA_BASE_RATE_WINDOW)))
+                if len(tail) > 0:
+                    base_rate = float(tail.mean())
+
+                if "prob" in d.columns:
+                    pv = pd.to_numeric(d["prob"], errors="coerce")
+                    n70 = int(((pv >= float(IA_CALIB_GOAL_THRESHOLD)) & yv.isin([0, 1])).sum())
+
+        _IA_RUNTIME_CAL_CACHE = {"ts": now, "base_rate": float(base_rate), "n70": int(n70)}
+        return float(base_rate), int(n70)
+    except Exception:
+        return 0.5, 0
+
+
+def _ajustar_prob_operativa(prob: float | None) -> float | None:
+    """
+    Shrinkage anti-sobreconfianza: p_ajustada = a*p + (1-a)*tasa_base_rolling.
+    """
+    try:
+        if not isinstance(prob, (int, float)):
+            return prob
+        p = max(0.0, min(1.0, float(prob)))
+        base_rate, _ = _leer_base_rate_y_n70(ttl_s=30.0)
+        a = max(0.0, min(1.0, float(IA_SHRINK_ALPHA)))
+        p_adj = (a * p) + ((1.0 - a) * float(base_rate))
+        return max(0.0, min(1.0, float(p_adj)))
+    except Exception:
+        return prob
+
 def _ensure_ia_signals_log():
     """Crea el archivo con header si no existe."""
     if os.path.exists(IA_SIGNALS_LOG):
@@ -3742,6 +3804,7 @@ def actualizar_prob_ia_bot(bot: str):
         p, err = predecir_prob_ia_bot(bot)
 
         if p is not None:
+            p = _ajustar_prob_operativa(float(p))
             estado_bots[bot]["prob_ia"] = float(p)
             estado_bots[bot]["ia_ready"] = True
             estado_bots[bot]["ia_last_err"] = None
@@ -5405,6 +5468,14 @@ def get_umbral_operativo(meta: dict | None = None) -> float:
         n_samples = 0
 
     thr = get_umbral_dinamico(meta or {}, base_thr)
+
+    # Endurecer umbral temporal si la muestra fuerte (>=70%) aún es baja.
+    try:
+        _, n70 = _leer_base_rate_y_n70(ttl_s=30.0)
+        if int(n70) < int(IA_MIN_CLOSED_70_FOR_STRUCT):
+            thr = max(float(thr), float(IA_TEMP_THR_HIGH))
+    except Exception:
+        pass
 
     # 🔒 BLOQUEO DE SEÑALES CUANDO ES EXPERIMENTAL / BAJO DATOS
     MIN_AUC_GREEN = 0.55  # “al menos no somos un dado”
@@ -7309,6 +7380,7 @@ async def cargar_datos_bot(bot, token_actual):
                         except Exception:
                             prob_norm = None
 
+                        prob_norm = _ajustar_prob_operativa(prob_norm)
                         estado_bots[bot]["prob_ia"] = prob_norm
                         estado_bots[bot]["modo_ia"] = modo_norm
 
