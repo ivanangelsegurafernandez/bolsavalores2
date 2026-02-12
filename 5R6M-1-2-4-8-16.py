@@ -1257,42 +1257,6 @@ def _enforce_single_real_standby(owner: str | None):
     except Exception:
         pass
 
-def _enforce_single_real_standby(owner: str | None):
-    """
-    Si hay owner REAL activo, deja a los demás bots en standby estricto:
-    - token DEMO visual
-    - sin señal IA pendiente
-    """
-    try:
-        if owner not in BOT_NAMES:
-            return
-        for b in BOT_NAMES:
-            if b == owner:
-                continue
-            estado_bots[b]["token"] = "DEMO"
-            estado_bots[b]["ia_senal_pendiente"] = False
-            estado_bots[b]["ia_prob_senal"] = None
-    except Exception:
-        pass
-
-def _enforce_single_real_standby(owner: str | None):
-    """
-    Si hay owner REAL activo, deja a los demás bots en standby estricto:
-    - token DEMO visual
-    - sin señal IA pendiente
-    """
-    try:
-        if owner not in BOT_NAMES:
-            return
-        for b in BOT_NAMES:
-            if b == owner:
-                continue
-            estado_bots[b]["token"] = "DEMO"
-            estado_bots[b]["ia_senal_pendiente"] = False
-            estado_bots[b]["ia_prob_senal"] = None
-    except Exception:
-        pass
-
 def _escribir_orden_real_raw(bot: str, ciclo: int):
     """
     Escritura RAW de orden_real (sin activar_real_inmediato, sin recursión).
@@ -1398,6 +1362,16 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
         _set_ui_token_holder(bot)
         estado_bots[bot]["trigger_real"] = True
         estado_bots[bot]["ciclo_actual"] = ciclo_obj
+
+        # Congelar probabilidad de señal al entrar REAL (si no estaba ya fijada)
+        # para evitar divergencia visual/ACK durante toda la operación.
+        try:
+            if not isinstance(estado_bots[bot].get("ia_prob_senal"), (int, float)):
+                p_live = estado_bots[bot].get("prob_ia", None)
+                if isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0:
+                    estado_bots[bot]["ia_prob_senal"] = float(p_live)
+        except Exception:
+            pass
 
         # Marcas de “entrada a real”
         first_entry = not bool(estado_bots[bot].get("modo_real_anunciado", False))
@@ -1514,6 +1488,25 @@ def path_ia_ack(bot: str) -> str:
     _ensure_dir(IA_ACK_DIR)
     return os.path.join(IA_ACK_DIR, f"{bot}.json")
 
+def _prob_ia_para_ack(bot: str, st: dict | None = None):
+    """
+    Prob IA efectiva para ACK:
+    - Si el bot tiene una señal ya seleccionada (ia_prob_senal), la conservamos para
+      evitar que el ACK oscile durante reintentos/token-sync.
+    - Si no, usamos la probabilidad viva del HUD.
+    """
+    try:
+        st = st if isinstance(st, dict) else estado_bots.get(str(bot), {})
+        p_lock = st.get("ia_prob_senal", None)
+        if isinstance(p_lock, (int, float)) and 0.0 <= float(p_lock) <= 1.0:
+            return float(p_lock)
+        p_live = st.get("prob_ia", None)
+        if isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0:
+            return float(p_live)
+    except Exception:
+        pass
+    return None
+
 def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: str, meta: dict | None):
     """
     Escribe un ACK por-bot para que el bot muestre la prob IA asociada a su PRE.
@@ -1534,7 +1527,7 @@ def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: st
             "epoch": int(epoch) if epoch is not None else 0,
             "prob": float(prob) if isinstance(prob, (int, float)) else None,
             # prob_hud/modo_hud = valor vigente que pinta el HUD del maestro (fuente visual principal)
-            "prob_hud": float(st.get("prob_ia")) if isinstance(st.get("prob_ia"), (int, float)) else None,
+            "prob_hud": _prob_ia_para_ack(bot, st),
             "modo_hud": str(st.get("modo_ia", "off") or "off").upper(),
             "prob_raw": float(st.get("prob_ia_raw")) if isinstance(st.get("prob_ia_raw"), (int, float)) else None,
             "calib_factor": float(st.get("cal_factor")) if isinstance(st.get("cal_factor"), (int, float)) else None,
@@ -1572,9 +1565,9 @@ def refrescar_ia_ack_desde_hud(intervalo_s: float = 1.0):
             if ep <= 0:
                 continue
 
-            p = st.get("prob_ia", None)
+            p_eff = _prob_ia_para_ack(bot, st)
             modo = str(st.get("modo_ia", "off") or "off").upper()
-            escribir_ia_ack(bot, ep, p if isinstance(p, (int, float)) else None, modo, meta)
+            escribir_ia_ack(bot, ep, p_eff if isinstance(p_eff, (int, float)) else None, modo, meta)
         except Exception:
             continue
 
@@ -4016,36 +4009,6 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
                 if es_demo and not es_real:
                     continue
 
-        # Si el CSV informa token/cuenta, en REAL ignoramos cierres explícitos de DEMO.
-        if require_real_token and (i_token is not None) and (i_token < len(row)):
-            tok_raw = str(row[i_token] or "").strip().upper()
-            if tok_raw:
-                # Heurística robusta: DEMO en Deriv suele venir como VRTC*
-                es_demo = ("DEMO" in tok_raw) or tok_raw.startswith("VRTC")
-                es_real = ("REAL" in tok_raw) or tok_raw.startswith("CR")
-                if es_demo and not es_real:
-                    continue
-
-        # Si el CSV informa token/cuenta, en REAL ignoramos cierres explícitos de DEMO.
-        if require_real_token and (i_token is not None) and (i_token < len(row)):
-            tok_raw = str(row[i_token] or "").strip().upper()
-            if tok_raw:
-                # Heurística robusta: DEMO en Deriv suele venir como VRTC*
-                es_demo = ("DEMO" in tok_raw) or tok_raw.startswith("VRTC")
-                es_real = ("REAL" in tok_raw) or tok_raw.startswith("CR")
-                if es_demo and not es_real:
-                    continue
-
-        # Si el CSV informa token/cuenta, en REAL ignoramos cierres explícitos de DEMO.
-        if require_real_token and (i_token is not None) and (i_token < len(row)):
-            tok_raw = str(row[i_token] or "").strip().upper()
-            if tok_raw:
-                # Heurística robusta: DEMO en Deriv suele venir como VRTC*
-                es_demo = ("DEMO" in tok_raw) or tok_raw.startswith("VRTC")
-                es_real = ("REAL" in tok_raw) or tok_raw.startswith("CR")
-                if es_demo and not es_real:
-                    continue
-
         # resultado
         try:
             raw_res = row[i_res] if i_res < len(row) else ""
@@ -4080,30 +4043,6 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
                 ciclo = int(float(ciclo)) if ciclo is not None else None
         except Exception:
             ciclo = None
-
-        # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
-        if expected_ciclo is not None and ciclo is not None:
-            try:
-                if int(ciclo) != int(expected_ciclo):
-                    continue
-            except Exception:
-                pass
-
-        # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
-        if expected_ciclo is not None and ciclo is not None:
-            try:
-                if int(ciclo) != int(expected_ciclo):
-                    continue
-            except Exception:
-                pass
-
-        # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
-        if expected_ciclo is not None and ciclo is not None:
-            try:
-                if int(ciclo) != int(expected_ciclo):
-                    continue
-            except Exception:
-                pass
 
         # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
         if expected_ciclo is not None and ciclo is not None:
@@ -4440,26 +4379,6 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
     agregar_evento(
         f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo={ciclo_sig}"
     )
-
-def ciclo_martingala_siguiente() -> int:
-    """
-    Fuente canónica del ciclo a abrir en REAL:
-    - ciclo = pérdidas_consecutivas + 1, con límites [1..MAX_CICLOS]
-    """
-    try:
-        return max(1, min(int(MAX_CICLOS), int(marti_ciclos_perdidos) + 1))
-    except Exception:
-        return 1
-
-def ciclo_martingala_siguiente() -> int:
-    """
-    Fuente canónica del ciclo a abrir en REAL:
-    - ciclo = pérdidas_consecutivas + 1, con límites [1..MAX_CICLOS]
-    """
-    try:
-        return max(1, min(int(MAX_CICLOS), int(marti_ciclos_perdidos) + 1))
-    except Exception:
-        return 1
 
 def ciclo_martingala_siguiente() -> int:
     """
