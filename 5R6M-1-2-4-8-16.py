@@ -133,7 +133,11 @@ ORACULO_DELTA_PRE = 0.05
 
 # Umbral único (verde + aviso IA)  -> esto NO lo tocamos
 IA_VERDE_THR = 0.75
-AUTO_REAL_THR = 0.75  # umbral fijo para auto-promoción a REAL
+AUTO_REAL_THR = 0.75  # umbral techo para auto-promoción a REAL
+AUTO_REAL_THR_MIN = 0.70  # piso adaptativo para activar REAL con la data reciente
+AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
+AUTO_REAL_MARGIN = 0.01   # pequeño margen para evitar quedar fuera por décimas
+AUTO_REAL_LOG_MAX_ROWS = 300  # máximo de señales históricas usadas en la calibración
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
 # OJO: también se usa como piso en get_umbral_operativo(), así que NO lo bajamos para no cambiar conducta del bot.
@@ -3979,6 +3983,63 @@ def ia_prob_valida(bot: str, max_age_s: float = 10.0) -> bool:
     except Exception:
         return False
                                               
+_AUTO_REAL_CACHE = {"ts": 0.0, "thr": float(AUTO_REAL_THR), "n": 0, "max": 0.0}
+
+
+def _leer_probs_historicas_ia(max_rows: int = AUTO_REAL_LOG_MAX_ROWS) -> list[float]:
+    """Lee probs históricas del log de señales IA cerradas para calibrar umbral REAL."""
+    path = IA_SIGNALS_LOG
+    if not os.path.exists(path):
+        return []
+    vals = []
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            r = csv.DictReader(f)
+            rows = list(r)
+        if max_rows and len(rows) > int(max_rows):
+            rows = rows[-int(max_rows):]
+        for row in rows:
+            try:
+                p = float(str(row.get("prob", "")).replace(",", "."))
+                if np.isfinite(p) and 0.0 <= p <= 1.0:
+                    vals.append(p)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return vals
+
+
+def get_umbral_real_calibrado(force: bool = False) -> float:
+    """
+    Umbral adaptativo para activar REAL usando los mayores valores observados de Prob IA.
+    - Usa cuantíl alto (AUTO_REAL_TOP_Q) de ia_signals_log.prob
+    - Aplica margen pequeño y límites [AUTO_REAL_THR_MIN .. AUTO_REAL_THR]
+    - Cache corto para evitar I/O excesivo en cada tick
+    """
+    now = time.time()
+    try:
+        if (not force) and ((now - float(_AUTO_REAL_CACHE.get("ts", 0.0) or 0.0)) < 20.0):
+            return float(_AUTO_REAL_CACHE.get("thr", AUTO_REAL_THR))
+
+        probs = _leer_probs_historicas_ia(AUTO_REAL_LOG_MAX_ROWS)
+        if len(probs) >= 12:
+            q = float(np.quantile(np.array(probs, dtype=float), float(AUTO_REAL_TOP_Q)))
+            thr = max(float(AUTO_REAL_THR_MIN), min(float(AUTO_REAL_THR), q - float(AUTO_REAL_MARGIN)))
+            pmax = float(max(probs))
+        else:
+            thr = float(AUTO_REAL_THR)
+            pmax = float(max(probs)) if probs else 0.0
+
+        _AUTO_REAL_CACHE["ts"] = now
+        _AUTO_REAL_CACHE["thr"] = float(thr)
+        _AUTO_REAL_CACHE["n"] = int(len(probs))
+        _AUTO_REAL_CACHE["max"] = float(pmax)
+        return float(thr)
+    except Exception:
+        return float(AUTO_REAL_THR)
+
+
 def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_real_token=False, expected_ciclo=None):
     """
     Devuelve: (resultado_norm, monto, ciclo, payout_total)
@@ -6251,20 +6312,21 @@ def mostrar_panel():
     # Resumen rápido para que el HUD no se vea "vacío"
     try:
         bots_con_prob = 0
+        umbral_real_vigente = float(get_umbral_real_calibrado())
         bots_75 = 0
         mejor = None
         for b in BOT_NAMES:
             pb = estado_bots.get(b, {}).get("prob_ia")
             if isinstance(pb, (int, float)):
                 bots_con_prob += 1
-                if float(pb) >= float(AUTO_REAL_THR):
+                if float(pb) >= float(umbral_real_vigente):
                     bots_75 += 1
                 if (mejor is None) or (float(pb) > mejor[1]):
                     mejor = (b, float(pb))
         owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
         owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
         mejor_txt = "--" if mejor is None else f"{mejor[0]} {mejor[1]*100:.1f}%"
-        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥75%: {bots_75} | Mejor: {mejor_txt} | Token: {owner_txt}")
+        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥{umbral_real_vigente*100:.1f}%: {bots_75} | Mejor: {mejor_txt} | Token: {owner_txt}")
 
         if owner not in (None, "none") and mejor is not None and owner != mejor[0]:
             print(padding + Fore.YELLOW + f"⛓️ Token bloqueado en {owner}; mejor IA actual es {mejor[0]} ({mejor[1]*100:.1f}%).")
@@ -7755,10 +7817,10 @@ async def main():
                             activo_real = owner_lock if owner_lock in BOT_NAMES else holder_memoria
                             _enforce_single_real_standby(activo_real)
 
-                        # Umbral maestro fijo para promoción automática: 75% o mayor.
-                        # (HUD/audio pueden seguir mostrando umbral operativo dinámico,
-                        # pero la compuerta de compra automática mantiene esta regla central.)
-                        umbral_ia_real = float(AUTO_REAL_THR)
+                        # Umbral maestro calibrado con históricos de Prob IA (top quantil),
+                        # acotado por [AUTO_REAL_THR_MIN .. AUTO_REAL_THR] para activar REAL
+                        # usando los valores altos observados recientemente.
+                        umbral_ia_real = float(get_umbral_real_calibrado())
 
                         # Bloqueo por saldo (no abras ventanas si no puedes ejecutar ciclo1)
                         try:
