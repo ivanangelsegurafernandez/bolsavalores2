@@ -134,7 +134,7 @@ ORACULO_DELTA_PRE = 0.05
 # Umbral único (verde + aviso IA)  -> esto NO lo tocamos
 IA_VERDE_THR = 0.75
 AUTO_REAL_THR = 0.75  # umbral techo para auto-promoción a REAL
-AUTO_REAL_THR_MIN = 0.45  # piso adaptativo para activar REAL con la data reciente
+AUTO_REAL_THR_MIN = 0.75  # piso rígido: no activar REAL por debajo de 75%
 AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
 AUTO_REAL_MARGIN = 0.01   # pequeño margen para evitar quedar fuera por décimas
 AUTO_REAL_LOG_MAX_ROWS = 300  # máximo de señales históricas usadas en la calibración
@@ -4312,7 +4312,7 @@ def detectar_martingala_perdida_completa(bot):
 
 # Reinicio completo - Corregido para no resetear métricas en modo suave
 def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True):
-    global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos, ultimo_bot_real
+    global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos, ultimo_bot_real, REAL_OWNER_LOCK
     with file_lock():
         write_token_atomic(TOKEN_FILE, "REAL:none")
     
@@ -4372,6 +4372,7 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
     marti_activa = False
     marti_ciclos_perdidos = 0
     ultimo_bot_real = None
+    REAL_OWNER_LOCK = None
     LIMPIEZA_PANEL_HASTA = time.time() + limpiar_visual_segundos
 
 # Reinicio de bot individual - Corregido similar
@@ -6974,12 +6975,7 @@ def dibujar_hud_gatewin(panel_height=8, layout=None):
         cyc = estado_bots[activo_real].get("ciclo_actual", 1)
         hud_lines.insert(-1, f"│ Bot REAL: {activo_real} · Ciclo {cyc}/{MAX_CICLOS}".ljust(HUD_INNER_WIDTH) + " │")
     hud_lines.insert(-1, f"│ Martingala: {marti_ciclos_perdidos}/{MAX_CICLOS} pérdidas seguidas · Próx C{ciclo_martingala_siguiente()}".ljust(HUD_INNER_WIDTH) + " │")
-    try:
-        cyc_sig = int(ciclo_martingala_siguiente())
-    except Exception:
-        cyc_sig = 1
-    if cyc_sig > 1 and ultimo_bot_real in BOT_NAMES:
-        hud_lines.insert(-1, f"│ Regla anti-repetición: bloqueado {ultimo_bot_real.upper()} hasta volver a C1".ljust(HUD_INNER_WIDTH) + " │")
+    # HUD muestra ciclo actual/siguiente de martingala; sin bloqueo duro de anti-repetición.
     hud_lines.append("└" + "─" * HUD_INNER_WIDTH + "┘")
     layout = (layout or HUD_LAYOUT).lower()
     hud_height = len(hud_lines)
@@ -7391,6 +7387,7 @@ def set_etapa(codigo, detalle_extra=None, anunciar=False):
 # Nueva constante para watchdog de REAL - Bajado para más reactividad
 REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme
 REAL_STUCK_FORCE_RELEASE_S = 90  # segundos extra tras aviso para liberar REAL si no hay cierre
+REAL_TRIGGER_MIN = 0.75  # regla operativa: entrada REAL desde 75% o mayor
 
 # Cargar datos bot
 # Cargar datos bot
@@ -7876,7 +7873,7 @@ async def main():
                         # Umbral maestro calibrado con históricos de Prob IA (top quantil),
                         # acotado por [AUTO_REAL_THR_MIN .. AUTO_REAL_THR] para activar REAL
                         # usando los valores altos observados recientemente.
-                        umbral_ia_real = float(get_umbral_real_calibrado())
+                        umbral_ia_real = max(float(REAL_TRIGGER_MIN), float(get_umbral_real_calibrado()))
 
                         # Bloqueo por saldo (no abras ventanas si no puedes ejecutar ciclo1)
                         try:
@@ -7903,15 +7900,7 @@ async def main():
 
                             candidatos.sort(key=lambda x: x[0], reverse=True)
 
-                            # Regla solicitada: no repetir el último bot REAL si el HUD no está en C1.
-                            ciclo_objetivo = ciclo_martingala_siguiente()
-                            if int(ciclo_objetivo) > 1 and ultimo_bot_real in BOT_NAMES:
-                                antes = len(candidatos)
-                                candidatos = [(p, b) for (p, b) in candidatos if b != ultimo_bot_real]
-                                if antes > 0 and len(candidatos) == 0:
-                                    agregar_evento(
-                                        f"⛔ Anti-repetición activa: solo había señal en {ultimo_bot_real.upper()} y HUD está en C{ciclo_objetivo}."
-                                    )
+                            # Selección automática: tomar la mejor señal elegible >= 75%.
 
                         # Si hay señal pero saldo insuficiente -> avisar y NO abrir ventana
                         if candidatos and saldo_val < costo_ciclo1:
