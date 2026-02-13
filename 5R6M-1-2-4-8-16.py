@@ -212,6 +212,11 @@ marti_activa = False
 # 0 = sin pérdidas consecutivas en REAL; 1..MAX_CICLOS = racha de pérdidas vigente.
 marti_ciclos_perdidos = 0
 
+# Anti-repetición de bot en REAL:
+# - Si el HUD está en C1, se puede repetir bot.
+# - Si el HUD está en C2..C{MAX_CICLOS}, se evita reusar el último bot REAL.
+ultimo_bot_real = None
+
 # Nueva: Umbrales mínimos para historial IA
 MIN_IA_SENIALES_CONF = 10  # Mínimo señales cerradas para confiar en prob_hist
 MIN_AUC_CONF = 0.65        # AUC mínimo para audios/colores verdes
@@ -4303,7 +4308,7 @@ def detectar_martingala_perdida_completa(bot):
 
 # Reinicio completo - Corregido para no resetear métricas en modo suave
 def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True):
-    global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos
+    global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos, ultimo_bot_real
     with file_lock():
         write_token_atomic(TOKEN_FILE, "REAL:none")
     
@@ -4361,6 +4366,7 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
     marti_paso = 0
     marti_activa = False
     marti_ciclos_perdidos = 0
+    ultimo_bot_real = None
     LIMPIEZA_PANEL_HASTA = time.time() + limpiar_visual_segundos
 
 # Reinicio de bot individual - Corregido similar
@@ -4494,7 +4500,7 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
     - GANANCIA: resetea a ciclo #1 (contador de pérdidas = 0).
     - PÉRDIDA: incrementa ciclo hasta MAX_CICLOS (tope de blindaje).
     """
-    global marti_ciclos_perdidos, marti_paso
+    global marti_ciclos_perdidos, marti_paso, ultimo_bot_real
 
     res = normalizar_resultado(resultado)
     if res == "GANANCIA":
@@ -4524,6 +4530,9 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
             marti_paso = min(MAX_CICLOS - 1, int(marti_ciclos_perdidos))
     else:
         return
+
+    if bot in BOT_NAMES:
+        ultimo_bot_real = bot
 
     ciclo_sig = int(marti_paso) + 1
     bot_msg = f" [{bot}]" if bot else ""
@@ -6958,6 +6967,12 @@ def dibujar_hud_gatewin(panel_height=8, layout=None):
         cyc = estado_bots[activo_real].get("ciclo_actual", 1)
         hud_lines.insert(-1, f"│ Bot REAL: {activo_real} · Ciclo {cyc}/{MAX_CICLOS}".ljust(HUD_INNER_WIDTH) + " │")
     hud_lines.insert(-1, f"│ Martingala: {marti_ciclos_perdidos}/{MAX_CICLOS} pérdidas seguidas · Próx C{ciclo_martingala_siguiente()}".ljust(HUD_INNER_WIDTH) + " │")
+    try:
+        cyc_sig = int(ciclo_martingala_siguiente())
+    except Exception:
+        cyc_sig = 1
+    if cyc_sig > 1 and ultimo_bot_real in BOT_NAMES:
+        hud_lines.insert(-1, f"│ Regla anti-repetición: bloqueado {ultimo_bot_real.upper()} hasta volver a C1".ljust(HUD_INNER_WIDTH) + " │")
     hud_lines.append("└" + "─" * HUD_INNER_WIDTH + "┘")
     layout = (layout or HUD_LAYOUT).lower()
     hud_height = len(hud_lines)
@@ -7873,6 +7888,16 @@ async def main():
                                     continue
 
                             candidatos.sort(key=lambda x: x[0], reverse=True)
+
+                            # Regla solicitada: no repetir el último bot REAL si el HUD no está en C1.
+                            ciclo_objetivo = ciclo_martingala_siguiente()
+                            if int(ciclo_objetivo) > 1 and ultimo_bot_real in BOT_NAMES:
+                                antes = len(candidatos)
+                                candidatos = [(p, b) for (p, b) in candidatos if b != ultimo_bot_real]
+                                if antes > 0 and len(candidatos) == 0:
+                                    agregar_evento(
+                                        f"⛔ Anti-repetición activa: solo había señal en {ultimo_bot_real.upper()} y HUD está en C{ciclo_objetivo}."
+                                    )
 
                         # Si hay señal pero saldo insuficiente -> avisar y NO abrir ventana
                         if candidatos and saldo_val < costo_ciclo1:
