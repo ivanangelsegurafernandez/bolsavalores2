@@ -1,8 +1,8 @@
 # Estado IA y avance al objetivo
 
-- Actualizado (UTC): 2026-02-13T20:38:00.400837+00:00
+- Actualizado (UTC): 2026-02-13T22:10:16.584935+00:00
 - Objetivo principal (Prob IA real): 70%
-- Efectividad real global de cierres (bots 45-50): 49.67% (17988/36214)
+- Efectividad real global de cierres (bots 45-50): 49.67% (18010/36261)
 - Brecha vs objetivo: -20.33%
 
 ## Señales IA cerradas (log)
@@ -33,12 +33,12 @@
 ## Resumen por bot (cierres)
 | Bot | Cerrados | Ganancias | Pérdidas | % Éxito |
 |---|---:|---:|---:|---:|
-| fulll45 | 5377 | 2640 | 2737 | 49.10% |
-| fulll46 | 6168 | 3092 | 3076 | 50.13% |
-| fulll47 | 6167 | 3075 | 3092 | 49.86% |
-| fulll48 | 6152 | 3057 | 3095 | 49.69% |
-| fulll49 | 6167 | 3103 | 3064 | 50.32% |
-| fulll50 | 6183 | 3021 | 3162 | 48.86% |
+| fulll45 | 5385 | 2645 | 2740 | 49.12% |
+| fulll46 | 6176 | 3095 | 3081 | 50.11% |
+| fulll47 | 6174 | 3077 | 3097 | 49.84% |
+| fulll48 | 6160 | 3062 | 3098 | 49.71% |
+| fulll49 | 6175 | 3105 | 3070 | 50.28% |
+| fulll50 | 6191 | 3026 | 3165 | 48.88% |
 
 ## Sensibilidad por umbral (señales IA cerradas)
 | Umbral | n | hit rate | IC95% | Muestra suficiente |
