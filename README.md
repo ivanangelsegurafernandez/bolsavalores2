@@ -74,3 +74,40 @@ En `5R6M-1-2-4-8-16.py` se añadió un flujo explícito por etapas para operaci�
 - `STOP` → Salida controlada.
 
 Además, el HUD muestra la etapa activa (`ETAPA ...`) con segundos transcurridos para localizar más rápido dónde se atora el ciclo.
+
+## Qué hacer cuando la pantalla sigue en rojo (plan práctico)
+
+Si ves varios bots con `Prob IA` alta pero `Real` bajo (inflación grande), no significa que el sistema esté “roto”; normalmente significa **descalibración + poca muestra útil**. Usa este orden:
+
+1. **Congelar decisiones por score alto con poca muestra**
+   - Si `n < 200` por bot/ciclo, evita usar umbrales agresivos (`>=70%`) para operar fuerte.
+   - Mantén modo conservador hasta reunir muestra más estable.
+
+2. **Entrenar más, pero con calidad y ventana temporal correcta**
+   - Sí, conviene dejar entrenar más, pero en modo walk-forward.
+   - Objetivo mínimo por bot: `n>=200` cierres útiles recientes (mejor `300-500`) antes de confiar en probas altas.
+
+3. **Subir umbral de “CONFIABLE” mientras haya sobreestimación**
+   - Si `Pred - Real > 15pp` de forma persistente, sube el filtro de entrada y reduce tamaño de apuesta.
+   - Ejemplo: pasar temporalmente de `>=60%` a `>=72%` hasta que baje la inflación.
+
+4. **Aplicar penalización por bot (bot-specific shrinkage)**
+   - Ajuste recomendado: `p_final = p_calibrada - beta_bot`, con `beta_bot` ligado a la inflación rolling de ese bot.
+   - Si un bot infla +25pp, no debe mostrar señal fuerte aunque el score bruto sea alto.
+
+5. **Separar ranking de ejecución**
+   - Usa el modelo para rankear candidatos.
+   - Pero ejecuta solo los top con `EV positivo` y con intervalo de confianza aceptable.
+
+6. **Control de régimen de mercado**
+   - Etiqueta sesión/tendencia/volatilidad y evalúa métricas por régimen.
+   - Si cambia el régimen, recalibra primero; después reentrena.
+
+7. **Meta realista de mejora**
+   - No busques que todo sea verde en horas.
+   - Señal saludable: inflación bajando semana a semana y `Real` acercándose a `Pred` en cada bin de probabilidad.
+
+### Regla rápida para decidir hoy
+- Si la calibración está en crítico y hay pocos cierres por bot, **síguelo entrenando**, pero en modo prudente.
+- Reduce exposición, sube umbral temporalmente y exige más muestra antes de declarar “IA confiable”.
+- Prioriza estabilidad de calibración (Brier/ECE) sobre ganar “ticks” aislados.
