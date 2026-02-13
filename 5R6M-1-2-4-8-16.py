@@ -158,6 +158,13 @@ IA_SHRINK_ALPHA_MIN = 0.45           # piso de mezcla (más conservador en desca
 IA_SHRINK_ALPHA_MAX = 0.85           # techo de mezcla (más sensible cuando la calibración mejora)
 IA_BASE_RATE_WINDOW = 300            # cierres recientes para tasa base rolling
 
+# Gate de calidad operativo (objetivo: mejorar precisión real, no volumen)
+GATE_RACHA_NEG_BLOQUEO = -2.0        # bloquear señales con racha <= -2
+GATE_PERMITE_REBOTE_EN_NEG = True    # permitir excepción si hay rebote confirmado
+GATE_ACTIVO_MIN_MUESTRA = 40         # mínimo de cierres por activo para evaluar régimen
+GATE_ACTIVO_MIN_WR = 0.48            # si WR reciente por activo cae debajo, bloquear temporalmente
+GATE_ACTIVO_LOOKBACK = 180           # cierres recientes por bot para estimar régimen
+
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
 AUDIO_IA53_THR = 0.75
 
@@ -254,7 +261,11 @@ FEATURE_NAMES_CORE_13 = [
 ]
 
 # Por defecto entrenamos SOLO con las 13 core (modo estable)
-FEATURE_NAMES_DEFAULT = list(FEATURE_NAMES_CORE_13)
+FEATURE_NAMES_INTERACCIONES = [
+    "racha_x_rebote",
+    "rev_x_breakout",
+]
+FEATURE_NAMES_DEFAULT = list(FEATURE_NAMES_CORE_13) + list(FEATURE_NAMES_INTERACCIONES)
 
 class ModeloXGBCalibrado:
     """
@@ -2700,6 +2711,94 @@ def _safe_read_csv_any_encoding(path: str) -> pd.DataFrame | None:
     return None
 
 _IA_RUNTIME_CAL_CACHE = {"ts": 0.0, "base_rate": 0.5, "n70": 0}
+_GATE_ACTIVO_CACHE = {}
+
+
+def _ultimo_contexto_operativo_bot(bot: str) -> dict:
+    """Lee contexto reciente (racha/es_rebote/activo) para gate de calidad por señal."""
+    out = {"racha_actual": 0.0, "es_rebote": 0.0, "activo": ""}
+    try:
+        row = leer_ultima_fila_features_para_pred(bot)
+        if isinstance(row, dict):
+            out["racha_actual"] = float(row.get("racha_actual", 0.0) or 0.0)
+            out["es_rebote"] = float(row.get("es_rebote", 0.0) or 0.0)
+            out["activo"] = str(row.get("activo", "") or "").strip()
+            return out
+    except Exception:
+        pass
+
+    # Fallback robusto: leer la última fila del CSV enriquecido
+    try:
+        ruta = f"registro_enriquecido_{bot}.csv"
+        if not os.path.exists(ruta):
+            return out
+        for enc in ("utf-8", "latin-1", "windows-1252"):
+            try:
+                df = pd.read_csv(ruta, encoding=enc, on_bad_lines="skip")
+                if df is None or df.empty:
+                    continue
+                last = df.iloc[-1].to_dict()
+                out["racha_actual"] = float(last.get("racha_actual", 0.0) or 0.0)
+                out["es_rebote"] = float(last.get("es_rebote", 0.0) or 0.0)
+                out["activo"] = str(last.get("activo", "") or "").strip()
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _gate_regimen_activo_ok(bot: str, activo: str = "", ttl_s: float = 45.0):
+    """Valida régimen por activo reciente (HZ10/HZ25/HZ50/HZ75) para no mezclar contextos."""
+    try:
+        now = time.time()
+        key = f"{bot}|{activo or '*'}"
+        c = _GATE_ACTIVO_CACHE.get(key)
+        if c and (now - float(c.get("ts", 0.0))) <= float(ttl_s):
+            return bool(c.get("ok", True)), float(c.get("wr", 0.5)), int(c.get("n", 0))
+
+        ruta = f"registro_enriquecido_{bot}.csv"
+        if not os.path.exists(ruta):
+            return True, 0.5, 0
+
+        df = None
+        for enc in ("utf-8", "latin-1", "windows-1252"):
+            try:
+                df = pd.read_csv(ruta, encoding=enc, on_bad_lines="skip")
+                break
+            except Exception:
+                continue
+        if df is None or df.empty:
+            return True, 0.5, 0
+
+        if "trade_status" in df.columns:
+            d = df[df["trade_status"].astype(str).str.upper().eq("CERRADO")].copy()
+        else:
+            d = df.copy()
+
+        if "result_bin" not in d.columns:
+            return True, 0.5, 0
+
+        d["result_bin"] = pd.to_numeric(d["result_bin"], errors="coerce")
+        d = d[d["result_bin"].isin([0, 1])]
+
+        if activo and "activo" in d.columns:
+            d = d[d["activo"].astype(str).eq(str(activo))]
+
+        if int(GATE_ACTIVO_LOOKBACK) > 0 and len(d) > int(GATE_ACTIVO_LOOKBACK):
+            d = d.tail(int(GATE_ACTIVO_LOOKBACK))
+
+        n = int(len(d))
+        wr = float(d["result_bin"].mean()) if n > 0 else 0.5
+        ok = True
+        if n >= int(GATE_ACTIVO_MIN_MUESTRA):
+            ok = bool(wr >= float(GATE_ACTIVO_MIN_WR))
+
+        _GATE_ACTIVO_CACHE[key] = {"ts": now, "ok": ok, "wr": wr, "n": n}
+        return ok, wr, n
+    except Exception:
+        return True, 0.5, 0
 
 
 def _leer_base_rate_y_n70(ttl_s: float = 30.0):
@@ -3584,6 +3683,12 @@ def _add_derived_for_model(d: dict):
     d["pay_x_puntaje"] = payout * pe
     d["vol_x_breakout"] = vol * brk
     d["hora_x_rebote"] = hb * er
+    d["racha_x_rebote"] = racha * er
+    try:
+        rsi_rev = float(d.get("rsi_reversion", 0.0) or 0.0)
+    except Exception:
+        rsi_rev = 0.0
+    d["rev_x_breakout"] = rsi_rev * brk
 
     return d
 
@@ -4840,6 +4945,32 @@ def _coerce_label_to_01(series: pd.Series) -> pd.Series:
     return out
 
 
+def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataFrame:
+    """Genera columnas derivadas solo si el modelo las pide."""
+    try:
+        out = df.copy()
+
+        def _col_num(name, default=0.0):
+            if name in out.columns:
+                return pd.to_numeric(out[name], errors="coerce").fillna(default)
+            return pd.Series([default] * len(out), index=out.index, dtype="float64")
+
+        if "pay_x_puntaje" in feats:
+            out["pay_x_puntaje"] = _col_num("payout", 0.0) * _col_num("puntaje_estrategia", 0.0)
+        if "vol_x_breakout" in feats:
+            out["vol_x_breakout"] = _col_num("volatilidad", 0.0) * _col_num("breakout", 0.0)
+        if "hora_x_rebote" in feats:
+            out["hora_x_rebote"] = _col_num("hora_bucket", 0.0) * _col_num("es_rebote", 0.0)
+        if "racha_x_rebote" in feats:
+            out["racha_x_rebote"] = _col_num("racha_actual", 0.0) * _col_num("es_rebote", 0.0)
+        if "rev_x_breakout" in feats:
+            out["rev_x_breakout"] = _col_num("rsi_reversion", 0.0) * _col_num("breakout", 0.0)
+
+        return out
+    except Exception:
+        return df
+
+
 def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = None):
     """
     Builder ultra-robusto:
@@ -4853,6 +4984,7 @@ def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = Non
         return None, None, None
 
     feats = list(feature_names) if feature_names else list(INCREMENTAL_FEATURES_V2)
+    df = _enriquecer_df_con_derivadas(df, feats)
     label_col = _pick_label_col_incremental(df)
 
     # y
@@ -5279,6 +5411,10 @@ def oraculo_predict(fila_dict, modelo, scaler, meta, bot_name=""):
 
         if "hora_x_rebote" in feature_names and "hora_x_rebote" not in fila_dict:
             fila_dict["hora_x_rebote"] = float(fila_dict.get("hora_bucket", 0.0) or 0.0) * float(fila_dict.get("es_rebote", 0.0) or 0.0)
+        if "racha_x_rebote" in feature_names and "racha_x_rebote" not in fila_dict:
+            fila_dict["racha_x_rebote"] = float(fila_dict.get("racha_actual", 0.0) or 0.0) * float(fila_dict.get("es_rebote", 0.0) or 0.0)
+        if "rev_x_breakout" in feature_names and "rev_x_breakout" not in fila_dict:
+            fila_dict["rev_x_breakout"] = float(fila_dict.get("rsi_reversion", 0.0) or 0.0) * float(fila_dict.get("breakout", 0.0) or 0.0)
 
         if not feature_names:
             return 0.0
@@ -5867,6 +6003,51 @@ def anexar_incremental_desde_bot(bot: str):
         return
 
 # --- Nueva: maybe_retrain (con validaciones) ---
+def _seleccionar_features_utiles_train(X_df: pd.DataFrame, feats: list[str]):
+    """
+    Reduce ruido de variables casi constantes/redundantes antes del fit.
+    Mantiene al menos 6 columnas para evitar colapsar el modelo.
+    """
+    try:
+        X = X_df.copy()
+        keep = []
+        dropped = []
+        n = max(1, len(X))
+
+        for c in feats:
+            if c not in X.columns:
+                dropped.append((c, "missing"))
+                continue
+            s = pd.to_numeric(X[c], errors="coerce").fillna(0.0)
+            vc = s.value_counts(dropna=False)
+            top_ratio = (float(vc.iloc[0]) / float(n)) if len(vc) else 1.0
+            nun = int(s.nunique(dropna=False))
+            if nun <= 1 or ((nun <= 2) and top_ratio >= 0.985):
+                dropped.append((c, f"quasi_constant({top_ratio:.3f})"))
+            else:
+                keep.append(c)
+
+        # Evitar colinealidad extrema en SMA
+        if ("sma_5" in keep) and ("sma_20" in keep):
+            try:
+                corr = abs(pd.to_numeric(X["sma_5"], errors="coerce").fillna(0.0).corr(
+                    pd.to_numeric(X["sma_20"], errors="coerce").fillna(0.0)
+                ))
+                if pd.notna(corr) and float(corr) >= 0.9999:
+                    keep.remove("sma_20")
+                    dropped.append(("sma_20", f"collinear({corr:.5f})"))
+            except Exception:
+                pass
+
+        if len(keep) < 6:
+            keep = list(feats)
+            dropped = []
+
+        return X[keep].copy(), list(keep), dropped
+    except Exception:
+        return X_df, list(feats), []
+
+
 def maybe_retrain(force: bool = False):
     """
     Reentreno IA HONESTO (sin fuga temporal) + uso REAL de TimeSeriesSplit.
@@ -5944,6 +6125,15 @@ def maybe_retrain(force: bool = False):
         X, y, feats_used, label_col = _build_Xy_incremental(df, feature_names=feats_pref)
         if X is None or y is None or feats_used is None:
             return False
+
+        # 4.1) Reducir features casi constantes/redundantes para subir eficiencia real
+        X, feats_used, dropped_feats = _seleccionar_features_utiles_train(X, feats_used)
+        if dropped_feats:
+            try:
+                txt = ", ".join([f"{k}:{r}" for k, r in dropped_feats[:8]])
+                agregar_evento(f"🧪 IA: features filtradas pre-fit ({len(dropped_feats)}): {txt}")
+            except Exception:
+                pass
 
         # 5) Recorte a MAX_DATASET_ROWS (manteniendo orden temporal)
         try:
@@ -7920,9 +8110,30 @@ async def main():
                                         continue
                                     if not ia_prob_valida(b, max_age_s=12.0):
                                         continue
+
                                     p = estado_bots[b].get("prob_ia", None)
-                                    if isinstance(p, (int, float)) and float(p) >= float(umbral_ia_real):
-                                        candidatos.append((float(p), b))
+                                    if not (isinstance(p, (int, float)) and float(p) >= float(umbral_ia_real)):
+                                        continue
+
+                                    # 1) Gate de calidad por racha/rebote (priorizar precisión real)
+                                    ctx = _ultimo_contexto_operativo_bot(b)
+                                    racha_now = float(ctx.get("racha_actual", 0.0) or 0.0)
+                                    rebote_now = float(ctx.get("es_rebote", 0.0) or 0.0)
+                                    if racha_now <= float(GATE_RACHA_NEG_BLOQUEO):
+                                        if not (bool(GATE_PERMITE_REBOTE_EN_NEG) and rebote_now >= 0.5):
+                                            continue
+
+                                    # 2) Validación por régimen/activo (evita mezclar HZ con mal tramo reciente)
+                                    activo_now = str(ctx.get("activo", "") or "").strip()
+                                    ok_reg, wr_reg, n_reg = _gate_regimen_activo_ok(b, activo=activo_now)
+                                    if not ok_reg:
+                                        agregar_evento(
+                                            f"🧯 Gate régimen: {b}/{activo_now or 'NA'} bloqueado "
+                                            f"(WR{n_reg}={wr_reg*100:.1f}% < {GATE_ACTIVO_MIN_WR*100:.1f}%)."
+                                        )
+                                        continue
+
+                                    candidatos.append((float(p), b))
                                 except Exception:
                                     continue
 
