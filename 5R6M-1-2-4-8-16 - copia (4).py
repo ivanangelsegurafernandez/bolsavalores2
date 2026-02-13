@@ -133,7 +133,12 @@ ORACULO_DELTA_PRE = 0.05
 
 # Umbral único (verde + aviso IA)  -> esto NO lo tocamos
 IA_VERDE_THR = 0.75
-AUTO_REAL_THR = 0.75  # umbral fijo para auto-promoción a REAL
+AUTO_REAL_THR = 0.75  # umbral techo para auto-promoción a REAL
+AUTO_REAL_THR_MIN = 0.45  # piso adaptativo para activar REAL con la data reciente
+AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
+AUTO_REAL_MARGIN = 0.01   # pequeño margen para evitar quedar fuera por décimas
+AUTO_REAL_LOG_MAX_ROWS = 300  # máximo de señales históricas usadas en la calibración
+AUTO_REAL_LIVE_MIN_BOTS = 3   # mínimos bots con prob viva para calibración por tick
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
 # OJO: también se usa como piso en get_umbral_operativo(), así que NO lo bajamos para no cambiar conducta del bot.
@@ -144,6 +149,12 @@ IA_METRIC_THRESHOLD = IA_VERDE_THR
 IA_CALIB_THRESHOLD = 0.60
 IA_CALIB_GOAL_THRESHOLD = 0.70  # objetivo: medir cierres fuertes (≥70%)
 IA_CALIB_MIN_CLOSED = 200  # mínimo recomendado para considerar estable la auditoría
+
+# Recomendaciones operativas conservadoras (anti-sobreconfianza)
+IA_TEMP_THR_HIGH = 0.80              # umbral temporal sugerido cuando la muestra fuerte es baja
+IA_MIN_CLOSED_70_FOR_STRUCT = 200    # mínimo de cierres IA>=70% para cambios estructurales
+IA_SHRINK_ALPHA = 0.60               # p_ajustada = alpha*p + (1-alpha)*tasa_base
+IA_BASE_RATE_WINDOW = 300            # cierres recientes para tasa base rolling
 
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
 AUDIO_IA53_THR = 0.75
@@ -200,6 +211,11 @@ marti_activa = False
 # Contador global de ciclos de martingala (HUD + orquestación automática)
 # 0 = sin pérdidas consecutivas en REAL; 1..MAX_CICLOS = racha de pérdidas vigente.
 marti_ciclos_perdidos = 0
+
+# Anti-repetición de bot en REAL:
+# - Si el HUD está en C1, se puede repetir bot.
+# - Si el HUD está en C2..C{MAX_CICLOS}, se evita reusar el último bot REAL.
+ultimo_bot_real = None
 
 # Nueva: Umbrales mínimos para historial IA
 MIN_IA_SENIALES_CONF = 10  # Mínimo señales cerradas para confiar en prob_hist
@@ -452,6 +468,7 @@ estado_bots = {
         "fuente": None,  
         "real_activado_en": 0.0,  
         "ignore_cierres_hasta": 0.0,
+        "real_timeout_first_warn": 0.0,
         "modo_ia": "off",  # Nueva para modo (off, low_data, modelo)
         "ia_seniales": 0,  # contadores para medir IA
         "ia_aciertos": 0,
@@ -1257,42 +1274,6 @@ def _enforce_single_real_standby(owner: str | None):
     except Exception:
         pass
 
-def _enforce_single_real_standby(owner: str | None):
-    """
-    Si hay owner REAL activo, deja a los demás bots en standby estricto:
-    - token DEMO visual
-    - sin señal IA pendiente
-    """
-    try:
-        if owner not in BOT_NAMES:
-            return
-        for b in BOT_NAMES:
-            if b == owner:
-                continue
-            estado_bots[b]["token"] = "DEMO"
-            estado_bots[b]["ia_senal_pendiente"] = False
-            estado_bots[b]["ia_prob_senal"] = None
-    except Exception:
-        pass
-
-def _enforce_single_real_standby(owner: str | None):
-    """
-    Si hay owner REAL activo, deja a los demás bots en standby estricto:
-    - token DEMO visual
-    - sin señal IA pendiente
-    """
-    try:
-        if owner not in BOT_NAMES:
-            return
-        for b in BOT_NAMES:
-            if b == owner:
-                continue
-            estado_bots[b]["token"] = "DEMO"
-            estado_bots[b]["ia_senal_pendiente"] = False
-            estado_bots[b]["ia_prob_senal"] = None
-    except Exception:
-        pass
-
 def _escribir_orden_real_raw(bot: str, ciclo: int):
     """
     Escritura RAW de orden_real (sin activar_real_inmediato, sin recursión).
@@ -1399,12 +1380,23 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
         estado_bots[bot]["trigger_real"] = True
         estado_bots[bot]["ciclo_actual"] = ciclo_obj
 
+        # Congelar probabilidad de señal al entrar REAL (si no estaba ya fijada)
+        # para evitar divergencia visual/ACK durante toda la operación.
+        try:
+            if not isinstance(estado_bots[bot].get("ia_prob_senal"), (int, float)):
+                p_live = estado_bots[bot].get("prob_ia", None)
+                if isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0:
+                    estado_bots[bot]["ia_prob_senal"] = float(p_live)
+        except Exception:
+            pass
+
         # Marcas de “entrada a real”
         first_entry = not bool(estado_bots[bot].get("modo_real_anunciado", False))
         if first_entry or (prev_holder != bot):
             estado_bots[bot]["modo_real_anunciado"] = True
             estado_bots[bot]["real_activado_en"] = now
             estado_bots[bot]["ignore_cierres_hasta"] = now + 15.0
+            estado_bots[bot]["real_timeout_first_warn"] = 0.0
 
             # Snapshot visual/diagnóstico (independiente del baseline REAL)
             try:
@@ -1514,6 +1506,25 @@ def path_ia_ack(bot: str) -> str:
     _ensure_dir(IA_ACK_DIR)
     return os.path.join(IA_ACK_DIR, f"{bot}.json")
 
+def _prob_ia_para_ack(bot: str, st: dict | None = None):
+    """
+    Prob IA efectiva para ACK:
+    - Si el bot tiene una señal ya seleccionada (ia_prob_senal), la conservamos para
+      evitar que el ACK oscile durante reintentos/token-sync.
+    - Si no, usamos la probabilidad viva del HUD.
+    """
+    try:
+        st = st if isinstance(st, dict) else estado_bots.get(str(bot), {})
+        p_lock = st.get("ia_prob_senal", None)
+        if isinstance(p_lock, (int, float)) and 0.0 <= float(p_lock) <= 1.0:
+            return float(p_lock)
+        p_live = st.get("prob_ia", None)
+        if isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0:
+            return float(p_live)
+    except Exception:
+        pass
+    return None
+
 def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: str, meta: dict | None):
     """
     Escribe un ACK por-bot para que el bot muestre la prob IA asociada a su PRE.
@@ -1534,12 +1545,14 @@ def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: st
             "epoch": int(epoch) if epoch is not None else 0,
             "prob": float(prob) if isinstance(prob, (int, float)) else None,
             # prob_hud/modo_hud = valor vigente que pinta el HUD del maestro (fuente visual principal)
-            "prob_hud": float(st.get("prob_ia")) if isinstance(st.get("prob_ia"), (int, float)) else None,
+            "prob_hud": _prob_ia_para_ack(bot, st),
             "modo_hud": str(st.get("modo_ia", "off") or "off").upper(),
             "prob_raw": float(st.get("prob_ia_raw")) if isinstance(st.get("prob_ia_raw"), (int, float)) else None,
             "calib_factor": float(st.get("cal_factor")) if isinstance(st.get("cal_factor"), (int, float)) else None,
             "auc": float((meta or {}).get("auc", 0.0) or 0.0),
             "thr": float((meta or {}).get("threshold", 0.0) or 0.0),
+            "real_thr": float(get_umbral_real_calibrado()),
+            "real_thr_cap": float(AUTO_REAL_THR),
             "reliable": bool((meta or {}).get("reliable", True)),
             "modo": str(modo_ia).upper() if modo_ia else "OFF",
             "ts": time.time()
@@ -1572,9 +1585,9 @@ def refrescar_ia_ack_desde_hud(intervalo_s: float = 1.0):
             if ep <= 0:
                 continue
 
-            p = st.get("prob_ia", None)
+            p_eff = _prob_ia_para_ack(bot, st)
             modo = str(st.get("modo_ia", "off") or "off").upper()
-            escribir_ia_ack(bot, ep, p if isinstance(p, (int, float)) else None, modo, meta)
+            escribir_ia_ack(bot, ep, p_eff if isinstance(p_eff, (int, float)) else None, modo, meta)
         except Exception:
             continue
 
@@ -2684,6 +2697,62 @@ def _safe_read_csv_any_encoding(path: str) -> pd.DataFrame | None:
             continue
     return None
 
+_IA_RUNTIME_CAL_CACHE = {"ts": 0.0, "base_rate": 0.5, "n70": 0}
+
+
+def _leer_base_rate_y_n70(ttl_s: float = 30.0):
+    """
+    Lee métricas rápidas desde ia_signals_log para estabilizar operación:
+    - base_rate rolling en cierres recientes (y en {0,1})
+    - n70: cantidad de cierres con prob >= IA_CALIB_GOAL_THRESHOLD
+    Cacheado para no cargar CSV en cada tick.
+    """
+    global _IA_RUNTIME_CAL_CACHE
+    now = time.time()
+    try:
+        if (now - float(_IA_RUNTIME_CAL_CACHE.get("ts", 0.0))) <= float(ttl_s):
+            return float(_IA_RUNTIME_CAL_CACHE.get("base_rate", 0.5)), int(_IA_RUNTIME_CAL_CACHE.get("n70", 0))
+
+        _ensure_ia_signals_log()
+        df = _safe_read_csv_any_encoding(IA_SIGNALS_LOG)
+        base_rate = 0.5
+        n70 = 0
+
+        if df is not None and not df.empty and ("y" in df.columns):
+            y = pd.to_numeric(df["y"], errors="coerce")
+            mask_closed = y.isin([0, 1])
+            d = df.loc[mask_closed].copy()
+            if not d.empty:
+                yv = pd.to_numeric(d["y"], errors="coerce")
+                tail = yv.tail(int(max(20, IA_BASE_RATE_WINDOW)))
+                if len(tail) > 0:
+                    base_rate = float(tail.mean())
+
+                if "prob" in d.columns:
+                    pv = pd.to_numeric(d["prob"], errors="coerce")
+                    n70 = int(((pv >= float(IA_CALIB_GOAL_THRESHOLD)) & yv.isin([0, 1])).sum())
+
+        _IA_RUNTIME_CAL_CACHE = {"ts": now, "base_rate": float(base_rate), "n70": int(n70)}
+        return float(base_rate), int(n70)
+    except Exception:
+        return 0.5, 0
+
+
+def _ajustar_prob_operativa(prob: float | None) -> float | None:
+    """
+    Shrinkage anti-sobreconfianza: p_ajustada = a*p + (1-a)*tasa_base_rolling.
+    """
+    try:
+        if not isinstance(prob, (int, float)):
+            return prob
+        p = max(0.0, min(1.0, float(prob)))
+        base_rate, _ = _leer_base_rate_y_n70(ttl_s=30.0)
+        a = max(0.0, min(1.0, float(IA_SHRINK_ALPHA)))
+        p_adj = (a * p) + ((1.0 - a) * float(base_rate))
+        return max(0.0, min(1.0, float(p_adj)))
+    except Exception:
+        return prob
+
 def _ensure_ia_signals_log():
     """Crea el archivo con header si no existe."""
     if os.path.exists(IA_SIGNALS_LOG):
@@ -3749,6 +3818,7 @@ def actualizar_prob_ia_bot(bot: str):
         p, err = predecir_prob_ia_bot(bot)
 
         if p is not None:
+            p = _ajustar_prob_operativa(float(p))
             estado_bots[bot]["prob_ia"] = float(p)
             estado_bots[bot]["ia_ready"] = True
             estado_bots[bot]["ia_last_err"] = None
@@ -3923,6 +3993,87 @@ def ia_prob_valida(bot: str, max_age_s: float = 10.0) -> bool:
     except Exception:
         return False
                                               
+_AUTO_REAL_CACHE = {"ts": 0.0, "thr": float(AUTO_REAL_THR), "n": 0, "max": 0.0}
+
+
+def _leer_probs_historicas_ia(max_rows: int = AUTO_REAL_LOG_MAX_ROWS) -> list[float]:
+    """Lee probs históricas del log de señales IA cerradas para calibrar umbral REAL."""
+    path = IA_SIGNALS_LOG
+    if not os.path.exists(path):
+        return []
+    vals = []
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            r = csv.DictReader(f)
+            rows = list(r)
+        if max_rows and len(rows) > int(max_rows):
+            rows = rows[-int(max_rows):]
+        for row in rows:
+            try:
+                p = float(str(row.get("prob", "")).replace(",", "."))
+                if np.isfinite(p) and 0.0 <= p <= 1.0:
+                    vals.append(p)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return vals
+
+
+def get_umbral_real_calibrado(force: bool = False) -> float:
+    """
+    Umbral adaptativo para activar REAL usando históricos + probabilidad viva actual.
+    Reglas:
+    - Histórico: cuantíl alto de ia_signals_log.prob (estabilidad).
+    - Vivo: mejor prob IA actual de bots (sensibilidad al régimen actual).
+    - Resultado: min(thr_hist, thr_live) acotado en [AUTO_REAL_THR_MIN .. AUTO_REAL_THR].
+    """
+    now = time.time()
+    try:
+        if (not force) and ((now - float(_AUTO_REAL_CACHE.get("ts", 0.0) or 0.0)) < 8.0):
+            return float(_AUTO_REAL_CACHE.get("thr", AUTO_REAL_THR))
+
+        # 1) Histórico
+        probs = _leer_probs_historicas_ia(AUTO_REAL_LOG_MAX_ROWS)
+        if len(probs) >= 12:
+            q_hist = float(np.quantile(np.array(probs, dtype=float), float(AUTO_REAL_TOP_Q)))
+            thr_hist = q_hist - float(AUTO_REAL_MARGIN)
+            pmax_hist = float(max(probs))
+        else:
+            thr_hist = float(AUTO_REAL_THR)
+            pmax_hist = float(max(probs)) if probs else 0.0
+
+        # 2) Vivo (último tick): si el mercado/modelo se aplana, el gate también baja
+        live_probs = []
+        for b in BOT_NAMES:
+            try:
+                if not ia_prob_valida(b, max_age_s=12.0):
+                    continue
+                p = float(estado_bots.get(b, {}).get("prob_ia", 0.0) or 0.0)
+                if np.isfinite(p) and 0.0 <= p <= 1.0:
+                    live_probs.append(p)
+            except Exception:
+                continue
+
+        if len(live_probs) >= int(AUTO_REAL_LIVE_MIN_BOTS):
+            pmax_live = float(max(live_probs))
+            thr_live = pmax_live - float(AUTO_REAL_MARGIN)
+        else:
+            pmax_live = 0.0
+            thr_live = float(AUTO_REAL_THR)
+
+        thr_raw = min(float(thr_hist), float(thr_live))
+        thr = max(float(AUTO_REAL_THR_MIN), min(float(AUTO_REAL_THR), float(thr_raw)))
+
+        _AUTO_REAL_CACHE["ts"] = now
+        _AUTO_REAL_CACHE["thr"] = float(thr)
+        _AUTO_REAL_CACHE["n"] = int(len(probs))
+        _AUTO_REAL_CACHE["max"] = float(max(pmax_hist, pmax_live))
+        return float(thr)
+    except Exception:
+        return float(AUTO_REAL_THR)
+
+
 def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_real_token=False, expected_ciclo=None):
     """
     Devuelve: (resultado_norm, monto, ciclo, payout_total)
@@ -4016,36 +4167,6 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
                 if es_demo and not es_real:
                     continue
 
-        # Si el CSV informa token/cuenta, en REAL ignoramos cierres explícitos de DEMO.
-        if require_real_token and (i_token is not None) and (i_token < len(row)):
-            tok_raw = str(row[i_token] or "").strip().upper()
-            if tok_raw:
-                # Heurística robusta: DEMO en Deriv suele venir como VRTC*
-                es_demo = ("DEMO" in tok_raw) or tok_raw.startswith("VRTC")
-                es_real = ("REAL" in tok_raw) or tok_raw.startswith("CR")
-                if es_demo and not es_real:
-                    continue
-
-        # Si el CSV informa token/cuenta, en REAL ignoramos cierres explícitos de DEMO.
-        if require_real_token and (i_token is not None) and (i_token < len(row)):
-            tok_raw = str(row[i_token] or "").strip().upper()
-            if tok_raw:
-                # Heurística robusta: DEMO en Deriv suele venir como VRTC*
-                es_demo = ("DEMO" in tok_raw) or tok_raw.startswith("VRTC")
-                es_real = ("REAL" in tok_raw) or tok_raw.startswith("CR")
-                if es_demo and not es_real:
-                    continue
-
-        # Si el CSV informa token/cuenta, en REAL ignoramos cierres explícitos de DEMO.
-        if require_real_token and (i_token is not None) and (i_token < len(row)):
-            tok_raw = str(row[i_token] or "").strip().upper()
-            if tok_raw:
-                # Heurística robusta: DEMO en Deriv suele venir como VRTC*
-                es_demo = ("DEMO" in tok_raw) or tok_raw.startswith("VRTC")
-                es_real = ("REAL" in tok_raw) or tok_raw.startswith("CR")
-                if es_demo and not es_real:
-                    continue
-
         # resultado
         try:
             raw_res = row[i_res] if i_res < len(row) else ""
@@ -4081,37 +4202,15 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
         except Exception:
             ciclo = None
 
-        # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
-        if expected_ciclo is not None and ciclo is not None:
+        # Si esperamos un ciclo concreto, exige que exista y coincida.
+        if expected_ciclo is not None:
             try:
+                if ciclo is None:
+                    continue
                 if int(ciclo) != int(expected_ciclo):
                     continue
             except Exception:
-                pass
-
-        # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
-        if expected_ciclo is not None and ciclo is not None:
-            try:
-                if int(ciclo) != int(expected_ciclo):
-                    continue
-            except Exception:
-                pass
-
-        # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
-        if expected_ciclo is not None and ciclo is not None:
-            try:
-                if int(ciclo) != int(expected_ciclo):
-                    continue
-            except Exception:
-                pass
-
-        # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
-        if expected_ciclo is not None and ciclo is not None:
-            try:
-                if int(ciclo) != int(expected_ciclo):
-                    continue
-            except Exception:
-                pass
+                continue
 
         # payout_total: preferimos extractor (maneja legacy y ratio)
         payout_total = None
@@ -4213,7 +4312,7 @@ def detectar_martingala_perdida_completa(bot):
 
 # Reinicio completo - Corregido para no resetear métricas en modo suave
 def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True):
-    global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos
+    global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos, ultimo_bot_real
     with file_lock():
         write_token_atomic(TOKEN_FILE, "REAL:none")
     
@@ -4252,6 +4351,7 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
             "fuente": None,
             "real_activado_en": 0.0,  
             "ignore_cierres_hasta": 0.0,
+            "real_timeout_first_warn": 0.0,
             "modo_ia": "off",
             "ia_seniales": 0,
             "ia_aciertos": 0,
@@ -4271,6 +4371,7 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
     marti_paso = 0
     marti_activa = False
     marti_ciclos_perdidos = 0
+    ultimo_bot_real = None
     LIMPIEZA_PANEL_HASTA = time.time() + limpiar_visual_segundos
 
 # Reinicio de bot individual - Corregido similar
@@ -4310,6 +4411,7 @@ def reiniciar_bot(bot, borrar_csv=False):
         "fuente": None,
         "real_activado_en": 0.0,  
         "ignore_cierres_hasta": 0.0,
+        "real_timeout_first_warn": 0.0,
         "modo_ia": "off",
         "ia_seniales": 0,
         "ia_aciertos": 0,
@@ -4337,6 +4439,7 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
         # ✅ Extra blindaje (evita “escudos” de cierre pegados en DEMO)
         estado_bots[bot]["real_activado_en"] = 0.0
         estado_bots[bot]["ignore_cierres_hasta"] = 0.0
+        estado_bots[bot]["real_timeout_first_warn"] = 0.0
 
         # Flags IA/pending (si quedó algo colgado)
         estado_bots[bot]["ia_senal_pendiente"] = False
@@ -4404,7 +4507,7 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
     - GANANCIA: resetea a ciclo #1 (contador de pérdidas = 0).
     - PÉRDIDA: incrementa ciclo hasta MAX_CICLOS (tope de blindaje).
     """
-    global marti_ciclos_perdidos, marti_paso
+    global marti_ciclos_perdidos, marti_paso, ultimo_bot_real
 
     res = normalizar_resultado(resultado)
     if res == "GANANCIA":
@@ -4435,31 +4538,14 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
     else:
         return
 
+    if bot in BOT_NAMES:
+        ultimo_bot_real = bot
+
     ciclo_sig = int(marti_paso) + 1
     bot_msg = f" [{bot}]" if bot else ""
     agregar_evento(
         f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo={ciclo_sig}"
     )
-
-def ciclo_martingala_siguiente() -> int:
-    """
-    Fuente canónica del ciclo a abrir en REAL:
-    - ciclo = pérdidas_consecutivas + 1, con límites [1..MAX_CICLOS]
-    """
-    try:
-        return max(1, min(int(MAX_CICLOS), int(marti_ciclos_perdidos) + 1))
-    except Exception:
-        return 1
-
-def ciclo_martingala_siguiente() -> int:
-    """
-    Fuente canónica del ciclo a abrir en REAL:
-    - ciclo = pérdidas_consecutivas + 1, con límites [1..MAX_CICLOS]
-    """
-    try:
-        return max(1, min(int(MAX_CICLOS), int(marti_ciclos_perdidos) + 1))
-    except Exception:
-        return 1
 
 def ciclo_martingala_siguiente() -> int:
     """
@@ -5487,6 +5573,14 @@ def get_umbral_operativo(meta: dict | None = None) -> float:
 
     thr = get_umbral_dinamico(meta or {}, base_thr)
 
+    # Endurecer umbral temporal si la muestra fuerte (>=70%) aún es baja.
+    try:
+        _, n70 = _leer_base_rate_y_n70(ttl_s=30.0)
+        if int(n70) < int(IA_MIN_CLOSED_70_FOR_STRUCT):
+            thr = max(float(thr), float(IA_TEMP_THR_HIGH))
+    except Exception:
+        pass
+
     # 🔒 BLOQUEO DE SEÑALES CUANDO ES EXPERIMENTAL / BAJO DATOS
     MIN_AUC_GREEN = 0.55  # “al menos no somos un dado”
     if (not reliable) or (n_samples < MIN_FIT_ROWS_PROD) or (auc < MIN_AUC_GREEN):
@@ -6261,20 +6355,21 @@ def mostrar_panel():
     # Resumen rápido para que el HUD no se vea "vacío"
     try:
         bots_con_prob = 0
+        umbral_real_vigente = float(get_umbral_real_calibrado())
         bots_75 = 0
         mejor = None
         for b in BOT_NAMES:
             pb = estado_bots.get(b, {}).get("prob_ia")
             if isinstance(pb, (int, float)):
                 bots_con_prob += 1
-                if float(pb) >= float(AUTO_REAL_THR):
+                if float(pb) >= float(umbral_real_vigente):
                     bots_75 += 1
                 if (mejor is None) or (float(pb) > mejor[1]):
                     mejor = (b, float(pb))
         owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
         owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
         mejor_txt = "--" if mejor is None else f"{mejor[0]} {mejor[1]*100:.1f}%"
-        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥75%: {bots_75} | Mejor: {mejor_txt} | Token: {owner_txt}")
+        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥{umbral_real_vigente*100:.1f}%: {bots_75} | Mejor: {mejor_txt} | Token: {owner_txt}")
 
         if owner not in (None, "none") and mejor is not None and owner != mejor[0]:
             print(padding + Fore.YELLOW + f"⛓️ Token bloqueado en {owner}; mejor IA actual es {mejor[0]} ({mejor[1]*100:.1f}%).")
@@ -6879,6 +6974,12 @@ def dibujar_hud_gatewin(panel_height=8, layout=None):
         cyc = estado_bots[activo_real].get("ciclo_actual", 1)
         hud_lines.insert(-1, f"│ Bot REAL: {activo_real} · Ciclo {cyc}/{MAX_CICLOS}".ljust(HUD_INNER_WIDTH) + " │")
     hud_lines.insert(-1, f"│ Martingala: {marti_ciclos_perdidos}/{MAX_CICLOS} pérdidas seguidas · Próx C{ciclo_martingala_siguiente()}".ljust(HUD_INNER_WIDTH) + " │")
+    try:
+        cyc_sig = int(ciclo_martingala_siguiente())
+    except Exception:
+        cyc_sig = 1
+    if cyc_sig > 1 and ultimo_bot_real in BOT_NAMES:
+        hud_lines.insert(-1, f"│ Regla anti-repetición: bloqueado {ultimo_bot_real.upper()} hasta volver a C1".ljust(HUD_INNER_WIDTH) + " │")
     hud_lines.append("└" + "─" * HUD_INNER_WIDTH + "┘")
     layout = (layout or HUD_LAYOUT).lower()
     hud_height = len(hud_lines)
@@ -7288,7 +7389,8 @@ def set_etapa(codigo, detalle_extra=None, anunciar=False):
         agregar_evento(f"🧭 ETAPA {codigo}: {detalle}")
 
 # Nueva constante para watchdog de REAL - Bajado para más reactividad
-REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme (sin salir de REAL)
+REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme
+REAL_STUCK_FORCE_RELEASE_S = 90  # segundos extra tras aviso para liberar REAL si no hay cierre
 
 # Cargar datos bot
 # Cargar datos bot
@@ -7390,6 +7492,7 @@ async def cargar_datos_bot(bot, token_actual):
                         except Exception:
                             prob_norm = None
 
+                        prob_norm = _ajustar_prob_operativa(prob_norm)
                         estado_bots[bot]["prob_ia"] = prob_norm
                         estado_bots[bot]["modo_ia"] = modo_norm
 
@@ -7711,9 +7814,15 @@ async def main():
                             # Si lleva demasiado sin actualizarse desde que entró a REAL:
                             # NO salir a DEMO aquí: la salida solo ocurre con cierre GANANCIA/PÉRDIDA.
                             if t_real > 0 and (ahora - max(t_last, t_real) > REAL_TIMEOUT_S):
-                                agregar_evento(f"⏱️ Seguridad: {bot} sin actividad reciente en REAL. Se mantiene REAL hasta cierre (G/P).")
-                                # Rearme anti-spam del watchdog (sin liberar token ni cambiar owner).
-                                estado_bots[bot]["real_activado_en"] = ahora
+                                first_warn = float(estado_bots[bot].get("real_timeout_first_warn", 0.0) or 0.0)
+                                if first_warn <= 0.0:
+                                    estado_bots[bot]["real_timeout_first_warn"] = ahora
+                                    agregar_evento(f"⏱️ Seguridad: {bot} sin actividad reciente en REAL. Esperando cierre por {REAL_STUCK_FORCE_RELEASE_S}s antes de liberar.")
+                                elif (ahora - first_warn) > REAL_STUCK_FORCE_RELEASE_S:
+                                    agregar_evento(f"🧯 Timeout REAL en {bot}: sin cierre confirmado. Liberando a DEMO sin avanzar martingala.")
+                                    cerrar_por_fin_de_ciclo(bot, "Timeout sin cierre")
+                                    activo_real = None
+                                    break
 
                     for bot in BOT_NAMES:
                         if estado_bots[bot]["token"] == "REAL":
@@ -7754,17 +7863,20 @@ async def main():
                     if not activo_real:
                         set_etapa("TICK_03")
 
-                        # 🔒 Lock estricto: si token_actual.txt ya tiene dueño REAL,
+                        # 🔒 Lock estricto: una sola inversión REAL a la vez.
+                        # Si token_actual.txt o el estado en memoria ya tienen dueño REAL,
                         # no evaluamos ni promovemos otro bot aunque cumpla umbral.
                         owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-                        lock_activo = owner_lock in BOT_NAMES
+                        holder_memoria = next((b for b in BOT_NAMES if estado_bots.get(b, {}).get("token") == "REAL"), None)
+                        lock_activo = (owner_lock in BOT_NAMES) or (holder_memoria in BOT_NAMES)
                         if lock_activo:
-                            activo_real = owner_lock
-                            _enforce_single_real_standby(owner_lock)
+                            activo_real = owner_lock if owner_lock in BOT_NAMES else holder_memoria
+                            _enforce_single_real_standby(activo_real)
 
-                        # Usamos el MISMO umbral operativo que HUD + audio
-                        meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta()
-                        umbral_ia = max(get_umbral_operativo(meta_local or {}), float(AUTO_REAL_THR))
+                        # Umbral maestro calibrado con históricos de Prob IA (top quantil),
+                        # acotado por [AUTO_REAL_THR_MIN .. AUTO_REAL_THR] para activar REAL
+                        # usando los valores altos observados recientemente.
+                        umbral_ia_real = float(get_umbral_real_calibrado())
 
                         # Bloqueo por saldo (no abras ventanas si no puedes ejecutar ciclo1)
                         try:
@@ -7784,12 +7896,22 @@ async def main():
                                     if not ia_prob_valida(b, max_age_s=12.0):
                                         continue
                                     p = estado_bots[b].get("prob_ia", None)
-                                    if isinstance(p, (int, float)) and float(p) >= float(umbral_ia):
+                                    if isinstance(p, (int, float)) and float(p) >= float(umbral_ia_real):
                                         candidatos.append((float(p), b))
                                 except Exception:
                                     continue
 
                             candidatos.sort(key=lambda x: x[0], reverse=True)
+
+                            # Regla solicitada: no repetir el último bot REAL si el HUD no está en C1.
+                            ciclo_objetivo = ciclo_martingala_siguiente()
+                            if int(ciclo_objetivo) > 1 and ultimo_bot_real in BOT_NAMES:
+                                antes = len(candidatos)
+                                candidatos = [(p, b) for (p, b) in candidatos if b != ultimo_bot_real]
+                                if antes > 0 and len(candidatos) == 0:
+                                    agregar_evento(
+                                        f"⛔ Anti-repetición activa: solo había señal en {ultimo_bot_real.upper()} y HUD está en C{ciclo_objetivo}."
+                                    )
 
                         # Si hay señal pero saldo insuficiente -> avisar y NO abrir ventana
                         if candidatos and saldo_val < costo_ciclo1:
@@ -7850,7 +7972,7 @@ async def main():
                                     estado_bots[mejor_bot]["ia_prob_senal"] = None
                         else:
                             max_prob = max((estado_bots[bot]["prob_ia"] for bot in BOT_NAMES if estado_bots[bot]["ia_ready"]), default=0)
-                            if max_prob < umbral_ia:
+                            if max_prob < umbral_ia_real:
                                 pass
 
                     set_etapa("TICK_04")

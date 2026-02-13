@@ -468,6 +468,7 @@ estado_bots = {
         "fuente": None,  
         "real_activado_en": 0.0,  
         "ignore_cierres_hasta": 0.0,
+        "real_timeout_first_warn": 0.0,
         "modo_ia": "off",  # Nueva para modo (off, low_data, modelo)
         "ia_seniales": 0,  # contadores para medir IA
         "ia_aciertos": 0,
@@ -1395,6 +1396,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
             estado_bots[bot]["modo_real_anunciado"] = True
             estado_bots[bot]["real_activado_en"] = now
             estado_bots[bot]["ignore_cierres_hasta"] = now + 15.0
+            estado_bots[bot]["real_timeout_first_warn"] = 0.0
 
             # Snapshot visual/diagnóstico (independiente del baseline REAL)
             try:
@@ -4200,13 +4202,15 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
         except Exception:
             ciclo = None
 
-        # Si esperamos un ciclo concreto, descarta cierres de otro ciclo.
-        if expected_ciclo is not None and ciclo is not None:
+        # Si esperamos un ciclo concreto, exige que exista y coincida.
+        if expected_ciclo is not None:
             try:
+                if ciclo is None:
+                    continue
                 if int(ciclo) != int(expected_ciclo):
                     continue
             except Exception:
-                pass
+                continue
 
         # payout_total: preferimos extractor (maneja legacy y ratio)
         payout_total = None
@@ -4347,6 +4351,7 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
             "fuente": None,
             "real_activado_en": 0.0,  
             "ignore_cierres_hasta": 0.0,
+            "real_timeout_first_warn": 0.0,
             "modo_ia": "off",
             "ia_seniales": 0,
             "ia_aciertos": 0,
@@ -4406,6 +4411,7 @@ def reiniciar_bot(bot, borrar_csv=False):
         "fuente": None,
         "real_activado_en": 0.0,  
         "ignore_cierres_hasta": 0.0,
+        "real_timeout_first_warn": 0.0,
         "modo_ia": "off",
         "ia_seniales": 0,
         "ia_aciertos": 0,
@@ -4433,6 +4439,7 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
         # ✅ Extra blindaje (evita “escudos” de cierre pegados en DEMO)
         estado_bots[bot]["real_activado_en"] = 0.0
         estado_bots[bot]["ignore_cierres_hasta"] = 0.0
+        estado_bots[bot]["real_timeout_first_warn"] = 0.0
 
         # Flags IA/pending (si quedó algo colgado)
         estado_bots[bot]["ia_senal_pendiente"] = False
@@ -7382,7 +7389,8 @@ def set_etapa(codigo, detalle_extra=None, anunciar=False):
         agregar_evento(f"🧭 ETAPA {codigo}: {detalle}")
 
 # Nueva constante para watchdog de REAL - Bajado para más reactividad
-REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme (sin salir de REAL)
+REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme
+REAL_STUCK_FORCE_RELEASE_S = 90  # segundos extra tras aviso para liberar REAL si no hay cierre
 
 # Cargar datos bot
 # Cargar datos bot
@@ -7806,9 +7814,15 @@ async def main():
                             # Si lleva demasiado sin actualizarse desde que entró a REAL:
                             # NO salir a DEMO aquí: la salida solo ocurre con cierre GANANCIA/PÉRDIDA.
                             if t_real > 0 and (ahora - max(t_last, t_real) > REAL_TIMEOUT_S):
-                                agregar_evento(f"⏱️ Seguridad: {bot} sin actividad reciente en REAL. Se mantiene REAL hasta cierre (G/P).")
-                                # Rearme anti-spam del watchdog (sin liberar token ni cambiar owner).
-                                estado_bots[bot]["real_activado_en"] = ahora
+                                first_warn = float(estado_bots[bot].get("real_timeout_first_warn", 0.0) or 0.0)
+                                if first_warn <= 0.0:
+                                    estado_bots[bot]["real_timeout_first_warn"] = ahora
+                                    agregar_evento(f"⏱️ Seguridad: {bot} sin actividad reciente en REAL. Esperando cierre por {REAL_STUCK_FORCE_RELEASE_S}s antes de liberar.")
+                                elif (ahora - first_warn) > REAL_STUCK_FORCE_RELEASE_S:
+                                    agregar_evento(f"🧯 Timeout REAL en {bot}: sin cierre confirmado. Liberando a DEMO sin avanzar martingala.")
+                                    cerrar_por_fin_de_ciclo(bot, "Timeout sin cierre")
+                                    activo_real = None
+                                    break
 
                     for bot in BOT_NAMES:
                         if estado_bots[bot]["token"] == "REAL":
