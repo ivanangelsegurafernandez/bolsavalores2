@@ -178,6 +178,27 @@ def calibration_bins(closed_rows):
     return out
 
 
+def classify_bot_risk(n, inflation):
+    if n < 15:
+        maturity = 'BAJA_MUESTRA'
+    elif n < 30:
+        maturity = 'MEDIA_MUESTRA'
+    else:
+        maturity = 'ALTA_MUESTRA'
+
+    if inflation >= 0.25:
+        semaforo = 'CRITICO'
+        action = 'Reducir stake 50% y aplicar beta_bot completo'
+    elif inflation >= 0.15:
+        semaforo = 'ALERTA'
+        action = 'Reducir stake 25% y aplicar beta_bot parcial'
+    else:
+        semaforo = 'OK'
+        action = 'Mantener stake, monitoreo semanal'
+
+    return maturity, semaforo, action
+
+
 def per_bot_signal_table(closed_rows):
     grouped = defaultdict(list)
     for row in closed_rows:
@@ -194,12 +215,11 @@ def per_bot_signal_table(closed_rows):
         lo, hi = _wilson_interval(hits, n)
 
         beta_bot = max(0.0, inflation - 0.05)
-        if n < 15 or inflation >= 0.25:
-            semaforo = 'CRITICO'
-        elif inflation >= 0.15:
-            semaforo = 'ALERTA'
-        else:
-            semaforo = 'OK'
+        maturity, semaforo, action = classify_bot_risk(n, inflation)
+
+        # Prioriza por inflación ponderada por madurez de muestra (evita sobrecastigar n muy chico)
+        weight = min(1.0, n / 30)
+        priority_score = inflation * weight
 
         out.append({
             'bot': bot,
@@ -211,10 +231,13 @@ def per_bot_signal_table(closed_rows):
             'wilson_low': lo,
             'wilson_high': hi,
             'beta_bot': beta_bot,
+            'maturity': maturity,
             'semaforo': semaforo,
+            'action': action,
+            'priority_score': priority_score,
         })
 
-    return sorted(out, key=lambda x: (x['semaforo'], -x['inflation']), reverse=True)
+    return sorted(out, key=lambda x: x['priority_score'], reverse=True)
 
 
 def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signal_rows, model_meta):
@@ -249,10 +272,14 @@ def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signa
         )
 
     if bot_signal_rows:
-        worst = max(bot_signal_rows, key=lambda x: x['inflation'])
+        top2 = bot_signal_rows[:2]
+        bots_txt = ', '.join(
+            f"{r['bot']}({r['inflation']:+.1%}, n={r['n']}, prioridad={r['priority_score']:.2f})"
+            for r in top2
+        )
         recs.append(
-            f"Bot más inflado del log IA: {worst['bot']} (inflación={worst['inflation']:+.1%}, n={worst['n']}). "
-            "Aplicar penalización por bot (beta_bot) y bajar stake hasta salir de ALERTA/CRITICO."
+            f"Bots a intervenir primero (impacto ponderado): {bots_txt}. "
+            "Aplicar beta_bot y reducción de stake según semáforo."
         )
 
     if isinstance(model_meta, dict):
@@ -302,7 +329,7 @@ def main():
             w.writerow(row)
 
     with (ROOT / 'status_objetivo_ia_por_bot.csv').open('w', encoding='utf-8', newline='') as f:
-        fieldnames = ['bot', 'n', 'hits', 'hit_rate', 'avg_pred', 'inflation', 'wilson_low', 'wilson_high', 'beta_bot', 'semaforo']
+        fieldnames = ['bot', 'n', 'hits', 'hit_rate', 'avg_pred', 'inflation', 'wilson_low', 'wilson_high', 'beta_bot', 'maturity', 'semaforo', 'action', 'priority_score']
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for row in bot_signal_rows:
@@ -336,12 +363,11 @@ def main():
     md.append('')
 
     md.append('## Riesgo de calibración por bot (log IA)')
-    md.append('| Bot | n | %Real | %Pred media | Inflación | beta_bot sugerido | IC95% real | Semáforo |')
-    md.append('|---|---:|---:|---:|---:|---:|---:|:---:|')
+    md.append('| Bot | n | Madurez | %Real | %Pred media | Inflación | beta_bot | Prioridad | Semáforo | Acción sugerida |')
+    md.append('|---|---:|:---:|---:|---:|---:|---:|---:|:---:|---|')
     for r in bot_signal_rows:
         md.append(
-            f"| {r['bot']} | {r['n']} | {r['hit_rate']:.2%} | {r['avg_pred']:.2%} | {r['inflation']:+.2%} | {r['beta_bot']:.2%} | "
-            f"[{r['wilson_low']:.2%},{r['wilson_high']:.2%}] | {r['semaforo']} |"
+            f"| {r['bot']} | {r['n']} | {r['maturity']} | {r['hit_rate']:.2%} | {r['avg_pred']:.2%} | {r['inflation']:+.2%} | {r['beta_bot']:.2%} | {r['priority_score']:.2f} | {r['semaforo']} | {r['action']} |"
         )
     md.append('')
 
