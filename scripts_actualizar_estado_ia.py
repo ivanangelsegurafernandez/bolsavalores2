@@ -2,6 +2,7 @@
 import csv
 import json
 import math
+from collections import defaultdict
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -168,7 +169,7 @@ def calibration_bins(closed_rows):
             avg_real = 0.0
             gap = 0.0
         out.append({
-            'bin': f'[{lo:.2f},{min(hi,1.0):.2f})',
+            'bin': f'[{lo:.2f},{min(hi, 1.0):.2f})',
             'n': n,
             'avg_pred': avg_pred,
             'avg_real': avg_real,
@@ -177,17 +178,77 @@ def calibration_bins(closed_rows):
     return out
 
 
-def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, model_meta):
+def classify_bot_risk(n, inflation):
+    if n < 15:
+        maturity = 'BAJA_MUESTRA'
+    elif n < 30:
+        maturity = 'MEDIA_MUESTRA'
+    else:
+        maturity = 'ALTA_MUESTRA'
+
+    if inflation >= 0.25:
+        semaforo = 'CRITICO'
+        action = 'Reducir stake 50% y aplicar beta_bot completo'
+    elif inflation >= 0.15:
+        semaforo = 'ALERTA'
+        action = 'Reducir stake 25% y aplicar beta_bot parcial'
+    else:
+        semaforo = 'OK'
+        action = 'Mantener stake, monitoreo semanal'
+
+    return maturity, semaforo, action
+
+
+def per_bot_signal_table(closed_rows):
+    grouped = defaultdict(list)
+    for row in closed_rows:
+        grouped[row['bot']].append(row)
+
+    out = []
+    for bot in sorted(grouped.keys()):
+        grp = grouped[bot]
+        n = len(grp)
+        hits = sum(1 for r in grp if r['y'] >= 0.5)
+        avg_pred = sum(r['prob'] for r in grp) / n if n else 0.0
+        avg_real = hits / n if n else 0.0
+        inflation = avg_pred - avg_real
+        lo, hi = _wilson_interval(hits, n)
+
+        beta_bot = max(0.0, inflation - 0.05)
+        maturity, semaforo, action = classify_bot_risk(n, inflation)
+
+        # Prioriza por inflación ponderada por madurez de muestra (evita sobrecastigar n muy chico)
+        weight = min(1.0, n / 30)
+        priority_score = inflation * weight
+
+        out.append({
+            'bot': bot,
+            'n': n,
+            'hits': hits,
+            'hit_rate': avg_real,
+            'avg_pred': avg_pred,
+            'inflation': inflation,
+            'wilson_low': lo,
+            'wilson_high': hi,
+            'beta_bot': beta_bot,
+            'maturity': maturity,
+            'semaforo': semaforo,
+            'action': action,
+            'priority_score': priority_score,
+        })
+
+    return sorted(out, key=lambda x: x['priority_score'], reverse=True)
+
+
+def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signal_rows, model_meta):
     recs = []
 
-    # 1) Gap principal
     if real_rate < TARGET:
         recs.append(
             f"Brecha principal: estás en {real_rate:.2%} global vs objetivo {TARGET:.0%}. "
             "En corto plazo, prioriza reducir exposición REAL y subir filtro de calidad antes de aumentar volumen."
         )
 
-    # 2) Muestra estadística
     n70 = ia_summary['signals_ge70']
     if n70 < 200:
         recs.append(
@@ -195,7 +256,6 @@ def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, model_met
             "No tomes decisiones estructurales hasta llegar al menos a n>=200 cierres IA >=70%."
         )
 
-    # 3) Threshold recomendado por límite inferior Wilson
     viable = [r for r in thr_rows if r['n'] >= 30]
     if viable:
         best = max(viable, key=lambda x: x['wilson_low'])
@@ -204,7 +264,6 @@ def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, model_met
             f"(hit={best['hit_rate']:.2%}, IC95%=[{best['wilson_low']:.2%},{best['wilson_high']:.2%}], n={best['n']})."
         )
 
-    # 4) Inflación de probabilidad
     inflation_bins = [b for b in calib_rows if b['n'] >= 5 and b['gap'] > 0.10]
     if inflation_bins:
         recs.append(
@@ -212,7 +271,17 @@ def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, model_met
             "Aplicar shrinkage recomendado: p_ajustada = 0.6*p_calibrada + 0.4*tasa_base_rolling."
         )
 
-    # 5) Confiabilidad meta actual
+    if bot_signal_rows:
+        top2 = bot_signal_rows[:2]
+        bots_txt = ', '.join(
+            f"{r['bot']}({r['inflation']:+.1%}, n={r['n']}, prioridad={r['priority_score']:.2f})"
+            for r in top2
+        )
+        recs.append(
+            f"Bots a intervenir primero (impacto ponderado): {bots_txt}. "
+            "Aplicar beta_bot y reducción de stake según semáforo."
+        )
+
     if isinstance(model_meta, dict):
         reliable = model_meta.get('reliable')
         auc = model_meta.get('auc')
@@ -231,13 +300,13 @@ def main():
     ia_summary, ia_closed_rows = summarize_ia(ia_rows)
     thr_rows = threshold_table(ia_closed_rows)
     calib_rows = calibration_bins(ia_closed_rows)
+    bot_signal_rows = per_bot_signal_table(ia_closed_rows)
     model_meta = read_model_meta()
 
     closed_total = sum(r['closed'] for r in bot_stats)
     wins_total = sum(r['wins'] for r in bot_stats)
     real_rate = (wins_total / closed_total) if closed_total else 0.0
 
-    # CSV por bot
     with (ROOT / 'status_objetivo_ia.csv').open('w', encoding='utf-8', newline='') as f:
         fieldnames = ['bot', 'rows_total', 'closed', 'wins', 'losses', 'pending', 'win_rate_closed', 'last_ts']
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -245,7 +314,6 @@ def main():
         for row in bot_stats:
             w.writerow(row)
 
-    # CSV thresholds
     with (ROOT / 'status_objetivo_ia_thresholds.csv').open('w', encoding='utf-8', newline='') as f:
         fieldnames = ['threshold', 'n', 'hits', 'hit_rate', 'wilson_low', 'wilson_high', 'enough_sample']
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -253,7 +321,6 @@ def main():
         for row in thr_rows:
             w.writerow(row)
 
-    # CSV calibración por bins
     with (ROOT / 'status_objetivo_ia_bins.csv').open('w', encoding='utf-8', newline='') as f:
         fieldnames = ['bin', 'n', 'avg_pred', 'avg_real', 'gap']
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -261,7 +328,14 @@ def main():
         for row in calib_rows:
             w.writerow(row)
 
-    recs = build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, model_meta)
+    with (ROOT / 'status_objetivo_ia_por_bot.csv').open('w', encoding='utf-8', newline='') as f:
+        fieldnames = ['bot', 'n', 'hits', 'hit_rate', 'avg_pred', 'inflation', 'wilson_low', 'wilson_high', 'beta_bot', 'maturity', 'semaforo', 'action', 'priority_score']
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in bot_signal_rows:
+            w.writerow(row)
+
+    recs = build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signal_rows, model_meta)
 
     md = []
     md.append('# Estado IA y avance al objetivo\n')
@@ -288,6 +362,15 @@ def main():
         md.append(f'{i}. {rec}')
     md.append('')
 
+    md.append('## Riesgo de calibración por bot (log IA)')
+    md.append('| Bot | n | Madurez | %Real | %Pred media | Inflación | beta_bot | Prioridad | Semáforo | Acción sugerida |')
+    md.append('|---|---:|:---:|---:|---:|---:|---:|---:|:---:|---|')
+    for r in bot_signal_rows:
+        md.append(
+            f"| {r['bot']} | {r['n']} | {r['maturity']} | {r['hit_rate']:.2%} | {r['avg_pred']:.2%} | {r['inflation']:+.2%} | {r['beta_bot']:.2%} | {r['priority_score']:.2f} | {r['semaforo']} | {r['action']} |"
+        )
+    md.append('')
+
     md.append('## Resumen por bot (cierres)')
     md.append('| Bot | Cerrados | Ganancias | Pérdidas | % Éxito |')
     md.append('|---|---:|---:|---:|---:|')
@@ -305,7 +388,7 @@ def main():
         )
 
     (ROOT / 'status_objetivo_ia.md').write_text('\n'.join(md) + '\n', encoding='utf-8')
-    print('Archivos actualizados: status_objetivo_ia.csv, status_objetivo_ia_thresholds.csv, status_objetivo_ia_bins.csv, status_objetivo_ia.md')
+    print('Archivos actualizados: status_objetivo_ia.csv, status_objetivo_ia_thresholds.csv, status_objetivo_ia_bins.csv, status_objetivo_ia_por_bot.csv, status_objetivo_ia.md')
 
 
 if __name__ == '__main__':
