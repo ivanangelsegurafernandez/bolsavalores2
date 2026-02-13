@@ -54,7 +54,7 @@ import math
 import hashlib
 from sklearn.model_selection import train_test_split, TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import roc_auc_score, f1_score, brier_score_loss
+from sklearn.metrics import roc_auc_score, f1_score, fbeta_score, brier_score_loss
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.isotonic import IsotonicRegression
@@ -154,6 +154,8 @@ IA_CALIB_MIN_CLOSED = 200  # mínimo recomendado para considerar estable la audi
 IA_TEMP_THR_HIGH = 0.80              # umbral temporal sugerido cuando la muestra fuerte es baja
 IA_MIN_CLOSED_70_FOR_STRUCT = 200    # mínimo de cierres IA>=70% para cambios estructurales
 IA_SHRINK_ALPHA = 0.60               # p_ajustada = alpha*p + (1-alpha)*tasa_base
+IA_SHRINK_ALPHA_MIN = 0.45           # piso de mezcla (más conservador en descalibración fuerte)
+IA_SHRINK_ALPHA_MAX = 0.85           # techo de mezcla (más sensible cuando la calibración mejora)
 IA_BASE_RATE_WINDOW = 300            # cierres recientes para tasa base rolling
 
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
@@ -2747,7 +2749,32 @@ def _ajustar_prob_operativa(prob: float | None) -> float | None:
             return prob
         p = max(0.0, min(1.0, float(prob)))
         base_rate, _ = _leer_base_rate_y_n70(ttl_s=30.0)
-        a = max(0.0, min(1.0, float(IA_SHRINK_ALPHA)))
+
+        # Alpha adaptativo por calibración reciente:
+        # - sube un poco cuando el modelo está estable y bien calibrado
+        # - baja cuando hay inflación fuerte (PredMedia >> Real)
+        a = float(IA_SHRINK_ALPHA)
+        try:
+            rep = auditar_calibracion_seniales_reales(min_prob=float(IA_CALIB_THRESHOLD)) or {}
+            n = int(rep.get("n", 0) or 0)
+            infl_pp = float(rep.get("inflacion_pp", 0.0) or 0.0)
+            pred_mean = float(rep.get("avg_pred", 0.0) or 0.0)
+            win_rate = float(rep.get("win_rate", 0.0) or 0.0)
+
+            # Señal todavía inmadura: no confiar demasiado en p puntual
+            if n < int(MIN_IA_SENIALES_CONF):
+                a -= 0.10
+            else:
+                # Sobreestimación fuerte: más shrink para estabilizar
+                if infl_pp > float(SEM_CAL_INFL_WARN_PP) and pred_mean > win_rate:
+                    a -= 0.12
+                # Buena calibración y muestra suficiente: permitir más sensibilidad
+                elif (abs(infl_pp) <= float(SEM_CAL_INFL_OK_PP)) and (n >= int(max(50, IA_CALIB_MIN_CLOSED // 2))):
+                    a += 0.08
+        except Exception:
+            pass
+
+        a = max(float(IA_SHRINK_ALPHA_MIN), min(float(IA_SHRINK_ALPHA_MAX), float(a)))
         p_adj = (a * p) + ((1.0 - a) * float(base_rate))
         return max(0.0, min(1.0, float(p_adj)))
     except Exception:
@@ -6053,17 +6080,18 @@ def maybe_retrain(force: bool = False):
                 calib_kind = "none"
                 modelo_final = modelo_base
 
-        # 12) Threshold sugerido: optimiza F1 sobre CALIB si existe, si no 0.5
+        # 12) Threshold sugerido: optimiza F-beta (beta=0.5) sobre CALIB.
+        # Priorizamos precisión para reducir falsas señales “altas” que luego no cierran bien.
         thr = float(THR_DEFAULT)
         try:
             if Xcal_s is not None and y_calib is not None and len(y_calib) >= 20 and len(np.unique(y_calib)) == 2:
                 p = modelo_final.predict_proba(Xcal_s)[:, 1]
-                best_thr, best_f1 = thr, -1.0
+                best_thr, best_fb = thr, -1.0
                 for t in np.linspace(0.10, 0.90, 81):
                     yp = (p >= t).astype(int)
-                    f1v = f1_score(y_calib, yp, zero_division=0)
-                    if f1v > best_f1:
-                        best_f1 = f1v
+                    fb = fbeta_score(y_calib, yp, beta=0.5, zero_division=0)
+                    if fb > best_fb:
+                        best_fb = fb
                         best_thr = float(t)
                 thr = float(best_thr)
         except Exception:
