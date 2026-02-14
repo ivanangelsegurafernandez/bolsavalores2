@@ -82,22 +82,55 @@ def derive_feature(row: dict[str, str], feature: str) -> float:
         return abs(sma_5 - sma_20) / max(abs(sma_20), 1e-9)
 
     if feature == "hora_bucket":
-        # fallback neutro si no existe en los logs
+        # Preferencia: columna explícita si existe.
+        raw = row.get("hora_bucket")
+        if raw not in ("", None):
+            return float(raw)
+
+        # Fallback 1: timestamp ISO en ts.
+        ts_raw = (row.get("ts") or "").strip()
+        if ts_raw:
+            try:
+                dt = datetime.fromisoformat(ts_raw)
+                return dt.hour / 23.0
+            except ValueError:
+                pass
+
+        # Fallback 2: fecha local en formato "%Y-%m-%d %H:%M:%S".
+        fecha_raw = (row.get("fecha") or "").strip()
+        if fecha_raw:
+            try:
+                dt = datetime.strptime(fecha_raw, "%Y-%m-%d %H:%M:%S")
+                return dt.hour / 23.0
+            except ValueError:
+                pass
+
+        # Fallback final neutro.
         return 0.5
 
     raise KeyError(feature)
 
 
-def load_closed_rows() -> list[dict[str, float]]:
+def load_closed_rows() -> tuple[list[dict[str, float]], dict[str, int]]:
     rows = []
+    invariant_stats = {
+        "rows_closed": 0,
+        "rows_invalid_result_bin": 0,
+        "rows_skipped_feature_error": 0,
+        "rows_hora_bucket_neutral_fallback": 0,
+    }
+
     for path in sorted(glob.glob("registro_enriquecido_fulll*.csv")):
         with open(path, encoding="utf-8", newline="") as f:
             rd = csv.DictReader(f)
             for row in rd:
                 if (row.get("trade_status") or "").upper() != "CERRADO":
                     continue
+                invariant_stats["rows_closed"] += 1
+
                 y_raw = (row.get("result_bin") or "").strip()
                 if y_raw == "":
+                    invariant_stats["rows_invalid_result_bin"] += 1
                     continue
 
                 item = {"y": int(float(y_raw))}
@@ -107,10 +140,18 @@ def load_closed_rows() -> list[dict[str, float]]:
                         item[feat] = derive_feature(row, feat)
                     except Exception:
                         ok = False
+                        invariant_stats["rows_skipped_feature_error"] += 1
                         break
+
+                if ok and item["hora_bucket"] == 0.5 and not (row.get("hora_bucket") or "").strip():
+                    ts_raw = (row.get("ts") or "").strip()
+                    fecha_raw = (row.get("fecha") or "").strip()
+                    if not ts_raw and not fecha_raw:
+                        invariant_stats["rows_hora_bucket_neutral_fallback"] += 1
+
                 if ok:
                     rows.append(item)
-    return rows
+    return rows, invariant_stats
 
 
 def classify_signal(auc: float, dominant_ratio: float, uniq_count: int) -> str:
@@ -125,7 +166,7 @@ def classify_signal(auc: float, dominant_ratio: float, uniq_count: int) -> str:
     return "BAJA"
 
 
-def build_report(rows: list[dict[str, float]]) -> str:
+def build_report(rows: list[dict[str, float]], invariant_stats: dict[str, int]) -> str:
     labels = [r["y"] for r in rows]
     n = len(rows)
     winrate = sum(labels) / n if n else 0.0
@@ -135,6 +176,20 @@ def build_report(rows: list[dict[str, float]]) -> str:
     lines.append("")
     lines.append(f"Generado: {datetime.now(timezone.utc).isoformat()}")
     lines.append(f"Muestra cerrada analizada: **{n}** trades (winrate base **{winrate:.2%}**).")
+    lines.append("")
+    lines.append("## Invariantes / sanidad del dataset")
+    lines.append("")
+    lines.append(f"- Filas cerradas detectadas: **{invariant_stats['rows_closed']}**.")
+    lines.append(
+        f"- Filas cerradas sin `result_bin` válido descartadas: **{invariant_stats['rows_invalid_result_bin']}**."
+    )
+    lines.append(
+        f"- Filas descartadas por error al derivar features: **{invariant_stats['rows_skipped_feature_error']}**."
+    )
+    lines.append(
+        "- Filas con `hora_bucket` en fallback neutro (0.5) por falta total de timestamp: "
+        f"**{invariant_stats['rows_hora_bucket_neutral_fallback']}**."
+    )
     lines.append("")
     lines.append("## Señal por variable")
     lines.append("")
@@ -185,8 +240,8 @@ def build_report(rows: list[dict[str, float]]) -> str:
 
 
 def main() -> None:
-    rows = load_closed_rows()
-    report = build_report(rows)
+    rows, invariant_stats = load_closed_rows()
+    report = build_report(rows, invariant_stats)
     out_path = "veredicto_variables_core13.md"
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(report)
