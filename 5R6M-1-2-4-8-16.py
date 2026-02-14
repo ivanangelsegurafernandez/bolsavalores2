@@ -271,6 +271,21 @@ FEATURE_NAMES_INTERACCIONES = [
     "racha_x_rebote",
     "rev_x_breakout",
 ]
+
+# Gobernanza calidad>cantidad: entrenar solo con features que realmente aporten.
+FEATURE_ALWAYS_KEEP = ["racha_actual"]
+FEATURE_MAX_PROD = 4
+FEATURE_MIN_AUC_DELTA = 0.015      # aporte mínimo (|AUC_uni - 0.5|)
+FEATURE_MAX_DOMINANCE_GATE = 0.965 # evita casi-constantes
+FEATURE_DYNAMIC_SELECTION = True
+
+# Meta objetivo (calidad real en señales fuertes)
+IA_TARGET_PRECISION = 0.70
+IA_TARGET_PRECISION_FLOOR = 0.65   # piso mínimo para declarar confiable
+IA_TARGET_MIN_SIGNALS = 30         # mínimo de señales en zona alta para validar
+
+FEATURE_NAMES_PROD = list(FEATURE_ALWAYS_KEEP)
+FEATURE_NAMES_SHADOW = [f for f in FEATURE_NAMES_CORE_13 if f not in FEATURE_NAMES_PROD]
 FEATURE_NAMES_DEFAULT = list(FEATURE_NAMES_CORE_13)
 
 class ModeloXGBCalibrado:
@@ -6322,6 +6337,99 @@ def _seleccionar_features_utiles_train(X_df: pd.DataFrame, feats: list[str]):
         return X_df, list(feats), []
 
 
+def _seleccionar_features_calidad(X_df: pd.DataFrame, y_arr: np.ndarray, feats: list[str]):
+    """
+    Selección calidad-first (sin fuga temporal):
+    - Conserva siempre FEATURE_ALWAYS_KEEP si existen.
+    - Evalúa dominancia + AUC univariado SOLO en la ventana de entrenamiento.
+    - Exige estabilidad temporal básica (mitad temprana vs mitad reciente del train).
+    - Limita el set productivo para reducir ruido y sobreajuste.
+    """
+    try:
+        if X_df is None or X_df.empty:
+            return list(feats), []
+
+        y = np.asarray(y_arr).astype(int)
+        selected = []
+        report = []
+        scored = []
+
+        n_all = len(X_df)
+        cut = max(1, n_all // 2)
+
+        for c in feats:
+            if c not in X_df.columns:
+                report.append((c, "missing"))
+                continue
+
+            s = pd.to_numeric(X_df[c], errors="coerce").fillna(0.0)
+            nun = int(s.nunique(dropna=False))
+            vc = s.value_counts(dropna=False)
+            dom = float(vc.iloc[0]) / float(max(1, len(s))) if len(vc) else 1.0
+
+            auc_uni = 0.5
+            auc_delta = 0.0
+            auc_early = 0.5
+            auc_late = 0.5
+            stable = False
+            ok_auc = False
+            try:
+                if nun > 1 and len(np.unique(y)) == 2:
+                    auc_uni = float(roc_auc_score(y, s.values))
+                    auc_uni = max(min(auc_uni, 1.0), 0.0)
+                    auc_delta = abs(auc_uni - 0.5)
+                    ok_auc = True
+
+                    y_early = y[:cut]
+                    x_early = s.values[:cut]
+                    y_late = y[cut:]
+                    x_late = s.values[cut:]
+
+                    if len(y_early) >= 20 and len(np.unique(y_early)) == 2:
+                        auc_early = float(roc_auc_score(y_early, x_early))
+                    if len(y_late) >= 20 and len(np.unique(y_late)) == 2:
+                        auc_late = float(roc_auc_score(y_late, x_late))
+
+                    d1 = abs(auc_early - 0.5)
+                    d2 = abs(auc_late - 0.5)
+                    stable = (d1 >= float(FEATURE_MIN_AUC_DELTA) * 0.60 and d2 >= float(FEATURE_MIN_AUC_DELTA) * 0.60)
+            except Exception:
+                pass
+
+            if c in FEATURE_ALWAYS_KEEP:
+                selected.append(c)
+                report.append((c, f"KEEP_CORE dom={dom:.3f} auc={auc_uni:.4f}"))
+                continue
+
+            if nun <= 1:
+                report.append((c, f"DROP nunique={nun}"))
+                continue
+            if dom > float(FEATURE_MAX_DOMINANCE_GATE):
+                report.append((c, f"DROP dom={dom:.3f}"))
+                continue
+
+            if ok_auc and auc_delta >= float(FEATURE_MIN_AUC_DELTA) and stable:
+                scored.append((auc_delta, c, dom, auc_uni, auc_early, auc_late))
+            else:
+                report.append((c, f"SHADOW auc_delta={auc_delta:.4f} early={auc_early:.4f} late={auc_late:.4f} dom={dom:.3f}"))
+
+        scored.sort(reverse=True, key=lambda t: t[0])
+        max_extra = max(0, int(FEATURE_MAX_PROD) - len(selected))
+        for auc_delta, c, dom, auc_uni, auc_early, auc_late in scored[:max_extra]:
+            selected.append(c)
+            report.append((c, f"KEEP auc_delta={auc_delta:.4f} early={auc_early:.4f} late={auc_late:.4f} dom={dom:.3f} auc={auc_uni:.4f}"))
+
+        if not selected:
+            fallback = [f for f in FEATURE_ALWAYS_KEEP if f in X_df.columns]
+            if not fallback and feats:
+                fallback = [feats[0]]
+            selected = fallback
+
+        return selected, report
+    except Exception:
+        return list(feats), []
+
+
 def _auditar_salud_features(X_df: pd.DataFrame, feats: list[str]):
     """Audita variación/dominancia por feature para decidir si entrena o se congela."""
     out = {}
@@ -6391,6 +6499,12 @@ def maybe_retrain(force: bool = False):
 
         # 3) Reparar incremental si quedó “mutante” + leer incremental (con LOCK)
         ruta_inc = "dataset_incremental.csv"
+        if not os.path.exists(ruta_inc):
+            try:
+                agregar_evento("⚠️ IA: dataset_incremental.csv no existe aún. Esperando backfill incremental.")
+            except Exception:
+                pass
+            return False
         try:
             with file_lock("inc.lock"):
                 try:
@@ -6437,6 +6551,8 @@ def maybe_retrain(force: bool = False):
         if ("racha_actual" in X.columns) and (len(feats_used) <= 2):
             X = X[["racha_actual"]].copy()
             feats_used = ["racha_actual"]
+            globals()["FEATURE_NAMES_PROD"] = ["racha_actual"]
+            globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f != "racha_actual"]
             try:
                 agregar_evento("🧩 IA: modo simplificado activo (solo racha_actual) hasta reparar pipeline.")
             except Exception:
@@ -6532,6 +6648,27 @@ def maybe_retrain(force: bool = False):
         X_test  = X.iloc[i2:i3].copy()
         y_test  = np.asarray(y)[i2:i3]
 
+        # 8.1) Selección dinámica de calidad (SIN fuga: solo con TRAIN_BASE)
+        if FEATURE_DYNAMIC_SELECTION:
+            try:
+                feats_quality, quality_report = _seleccionar_features_calidad(X_train, y_train, feats_used)
+                feats_quality = [c for c in feats_quality if c in X_train.columns]
+                if feats_quality:
+                    X_train = X_train[feats_quality].copy()
+                    if X_calib is not None and len(X_calib) > 0:
+                        X_calib = X_calib[feats_quality].copy()
+                    X_test = X_test[feats_quality].copy()
+                    feats_used = list(feats_quality)
+
+                    globals()["FEATURE_NAMES_PROD"] = list(feats_used)
+                    globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f not in feats_used]
+
+                    if quality_report:
+                        txt = ", ".join([f"{k}:{r}" for k, r in quality_report[:8]])
+                        agregar_evento(f"🎯 IA quality-gate(train): prod={feats_used} | {txt}")
+            except Exception:
+                pass
+
         # 9) Escalado SOLO con TRAIN_BASE
         scaler = StandardScaler()
         Xtr_s = scaler.fit_transform(X_train)
@@ -6577,20 +6714,52 @@ def maybe_retrain(force: bool = False):
                 calib_kind = "none"
                 modelo_final = modelo_base
 
-        # 12) Threshold sugerido: optimiza F-beta (beta=0.5) sobre CALIB.
-        # Priorizamos precisión para reducir falsas señales “altas” que luego no cierran bien.
+        # 12) Threshold sugerido en CALIB (calidad > cantidad).
+        # 1) Intentar cumplir precisión objetivo en zona alta (>=70%).
+        # 2) Si no alcanza muestra mínima, fallback a F-beta (beta=0.5).
         thr = float(THR_DEFAULT)
+        calib_prec_at_thr = None
+        calib_n_at_thr = 0
         try:
             if Xcal_s is not None and y_calib is not None and len(y_calib) >= 20 and len(np.unique(y_calib)) == 2:
                 p = modelo_final.predict_proba(Xcal_s)[:, 1]
-                best_thr, best_fb = thr, -1.0
-                for t in np.linspace(0.10, 0.90, 81):
+
+                best_target_thr = None
+                best_target_n = -1
+                best_target_prec = 0.0
+
+                best_fb_thr, best_fb = thr, -1.0
+                for t in np.linspace(0.50, 0.90, 81):
                     yp = (p >= t).astype(int)
+                    mask = (yp == 1)
+                    n_sig = int(np.sum(mask))
+                    if n_sig > 0:
+                        prec = float(np.mean(np.asarray(y_calib)[mask] == 1))
+                    else:
+                        prec = 0.0
+
+                    # Candidato por objetivo de precisión
+                    if n_sig >= int(IA_TARGET_MIN_SIGNALS) and prec >= float(IA_TARGET_PRECISION):
+                        if n_sig > best_target_n:
+                            best_target_thr = float(t)
+                            best_target_n = int(n_sig)
+                            best_target_prec = float(prec)
+
                     fb = fbeta_score(y_calib, yp, beta=0.5, zero_division=0)
                     if fb > best_fb:
                         best_fb = fb
-                        best_thr = float(t)
-                thr = float(best_thr)
+                        best_fb_thr = float(t)
+
+                if best_target_thr is not None:
+                    thr = float(best_target_thr)
+                    calib_prec_at_thr = float(best_target_prec)
+                    calib_n_at_thr = int(best_target_n)
+                else:
+                    thr = float(best_fb_thr)
+                    mask_fb = (p >= thr)
+                    calib_n_at_thr = int(np.sum(mask_fb))
+                    if calib_n_at_thr > 0:
+                        calib_prec_at_thr = float(np.mean(np.asarray(y_calib)[mask_fb] == 1))
         except Exception:
             thr = float(THR_DEFAULT)
 
@@ -6663,14 +6832,32 @@ def maybe_retrain(force: bool = False):
             cv_auc = None
 
         # 15) Reliable (criterio “producción”)
+        # Además de AUC/base, exigimos que la zona de alta probabilidad no esté inflada.
+        test_prec_at_thr = 0.0
+        test_n_at_thr = 0
+        try:
+            if p_test is not None:
+                mask_t = (p_test >= float(thr))
+                test_n_at_thr = int(np.sum(mask_t))
+                if test_n_at_thr > 0:
+                    test_prec_at_thr = float(np.mean(np.asarray(y_test)[mask_t] == 1))
+        except Exception:
+            test_prec_at_thr = 0.0
+            test_n_at_thr = 0
+
         try:
             pos_all = int(np.sum(y == 1))
             neg_all = int(np.sum(y == 0))
+            precision_gate_ok = (
+                (test_n_at_thr < int(IA_TARGET_MIN_SIGNALS)) or
+                (test_prec_at_thr >= float(IA_TARGET_PRECISION_FLOOR))
+            )
             reliable = (
                 (n_total >= int(MIN_FIT_ROWS_PROD)) and
                 (pos_all >= int(RELIABLE_POS_MIN)) and
                 (neg_all >= int(RELIABLE_NEG_MIN)) and
-                (auc >= float(MIN_AUC_CONF))
+                (auc >= float(MIN_AUC_CONF)) and
+                precision_gate_ok
             )
         except Exception:
             reliable = False
@@ -6711,6 +6898,10 @@ def maybe_retrain(force: bool = False):
             "threshold": float(thr),
             "reliable": bool(reliable),
             "calibration": str(calib_kind),
+            "calib_precision_at_thr": float(calib_prec_at_thr) if isinstance(calib_prec_at_thr, (int, float)) else None,
+            "calib_n_at_thr": int(calib_n_at_thr),
+            "test_precision_at_thr": float(test_prec_at_thr),
+            "test_n_at_thr": int(test_n_at_thr),
             "feature_names": list(feats_used),
             "label_col": str(label_col),
             "feature_health": health_before,

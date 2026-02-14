@@ -120,3 +120,52 @@ Puedes validar calidad del CSV (NaN, duplicados, balance de clases y conflictos 
 python analizar_13_variables.py registro_enriquecido_fulll49.csv
 ```
 
+## Plan de cambio: priorizar calidad de información (ya no cantidad)
+
+Sí, **se puede** pasar del enfoque de 13 variables al enfoque de calidad. Con la evidencia actual, el plan base es operar con un núcleo mínimo y exigir que toda variable adicional demuestre aporte real fuera de muestra.
+
+### Objetivo operativo
+- Reducir ruido y sobreajuste.
+- Subir estabilidad temporal de la `Prob IA`.
+- Permitir que solo entren al modelo variables con impacto medible en walk-forward.
+
+### Cambios concretos a implementar
+
+1. **Congelar baseline en variable núcleo**
+   - Baseline inicial: `racha_actual` como señal principal.
+   - Las otras 12 pasan a estado `shadow` (se calculan solo para análisis, no para decidir).
+
+2. **Crear “Feature Gate” (puerta de calidad)**
+   - Cada variable candidata deberá cumplir criterios mínimos para entrar al modelo:
+     - Delta AUC walk-forward positivo y estable.
+     - Mejora en Brier/ECE (no solo AUC).
+     - Consistencia por segmentos (activo/hora/payout/volatilidad).
+   - Si no cumple, queda fuera automáticamente.
+
+3. **Separar variables de producción vs investigación**
+   - `features_prod`: solo variables aprobadas por gate.
+   - `features_shadow`: variables en evaluación.
+   - El modelo de ejecución usa únicamente `features_prod`.
+
+4. **Agregar control de drift por variable**
+   - Monitorear PSI/KS por feature y alertar cuando cambie régimen.
+   - Si una feature aprobada pierde estabilidad, vuelve a `shadow`.
+
+5. **Ajustar reportes para decisiones de calidad**
+   - Reporte semanal por feature con:
+     - AUC/Brier/ECE walk-forward.
+     - Delta contra baseline (`solo racha_actual`).
+     - Recomendación automática: `aprobar`, `mantener en shadow`, `retirar`.
+
+### Criterio de éxito
+- Menor inflación (`Pred - Real`) en bins altos.
+- Brier/ECE mejores o iguales con menos variables.
+- Menor variabilidad de métricas entre folds temporales.
+
+### Implementación por fases
+- **Fase 1 (rápida):** ejecución solo con `racha_actual` + calibración estricta.
+- **Fase 2:** incorporar feature gate y listas `prod/shadow`.
+- **Fase 3:** reingreso progresivo de variables rediseñadas que sí pasen el gate.
+
+### Regla de gobierno (simple)
+Una variable nueva **no entra** por intuición; entra únicamente si gana al baseline en walk-forward y mejora calibración real.
