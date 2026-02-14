@@ -1,7 +1,14 @@
 # Veredicto CORE-13 (actualizado)
 
-Generado: 2026-02-14T03:20:38.523168+00:00
+Generado: 2026-02-14T04:40:19.864129+00:00
 Muestra cerrada analizada: **30698** trades (winrate base **49.55%**).
+
+## Invariantes / sanidad del dataset
+
+- Filas cerradas detectadas: **30698**.
+- Filas cerradas sin `result_bin` válido descartadas: **0**.
+- Filas descartadas por error al derivar features: **0**.
+- Filas con `hora_bucket` en fallback neutro (0.5) por falta total de timestamp: **0**.
 
 ## Señal por variable
 
@@ -19,7 +26,7 @@ Muestra cerrada analizada: **30698** trades (winrate base **49.55%**).
 | puntaje_estrategia | +0.0138 | 0.5024 | 2 | 0.969 | CASI_CONSTANTE |
 | volatilidad | +0.0031 | 0.5012 | 28699 | 0.000 | BAJA |
 | es_rebote | +0.0187 | 0.5045 | 2 | 0.938 | CASI_CONSTANTE |
-| hora_bucket | +0.0000 | 0.5000 | 1 | 1.000 | NULA |
+| hora_bucket | -0.0021 | 0.4991 | 24 | 0.075 | BAJA |
 
 ## Veredicto
 
