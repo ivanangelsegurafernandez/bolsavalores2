@@ -2078,8 +2078,10 @@ def clip_feature_values(fila_dict, feature_names):
     
 def calcular_volatilidad_simple(row_dict: dict) -> float:
     """
-    Volatilidad 0–1 aproximada usando la separación relativa entre sma_5 y sma_20.
-    Si no hay datos válidos, devuelve 0.0.
+    Proxy de volatilidad 0–1 menos saturante que el clip lineal.
+
+    Usa spread relativo SMA5/SMA20 y lo comprime con curva exponencial para
+    evitar que termine en 1.0 constante cuando el spread bruto se dispara.
     """
     try:
         sma5 = float(row_dict.get("sma_5", 0.0) or 0.0)
@@ -2087,17 +2089,14 @@ def calcular_volatilidad_simple(row_dict: dict) -> float:
     except Exception:
         return 0.0
 
-    # Evitamos división por cero
-    base = abs(sma20) if abs(sma20) > 1e-6 else 1.0
+    base = abs(sma20) if abs(sma20) > 1e-9 else 1.0
     spread_pct = abs(sma5 - sma20) / base
+    if not math.isfinite(spread_pct) or spread_pct <= 0.0:
+        return 0.0
 
-    # Forzamos a rango [0, 1]
-    if spread_pct < 0.0:
-        spread_pct = 0.0
-    if spread_pct > 1.0:
-        spread_pct = 1.0
-
-    return spread_pct
+    # Compresión suave: 0 -> 0, crece rápido al inicio y evita techo constante.
+    vol = 1.0 - math.exp(-40.0 * min(spread_pct, 0.25))
+    return float(max(0.0, min(vol, 1.0)))
     
 # --- Helper: detectar rebote tras racha larga negativa --- 
 def calcular_es_rebote(row_dict):
@@ -2253,10 +2252,7 @@ def calcular_hora_features(row_dict: dict) -> tuple[float, float]:
 
 
 def enriquecer_features_evento(row_dict: dict):
-    """
-    Descongela features evento (booleanas raras) en escala 0..1.
-    Mantiene compatibilidad: reusa columnas existentes con intensidad.
-    """
+    """Convierte señales binarias en intensidades continuas para reducir dominancia."""
     d = dict(row_dict or {})
 
     def _f(key, default=0.0):
@@ -2273,29 +2269,39 @@ def enriquecer_features_evento(row_dict: dict):
     base = max(abs(sma20), 1e-9)
     spread = abs(sma5 - sma20) / base
 
-    # cruce_sma: intensidad de separación entre medias (no solo 0/1)
-    cruce_raw = _f("cruce_sma", 0.0)
-    cruce_int = min(1.0, spread / 0.0025)  # ~0.25% de separación -> 1.0
-    d["cruce_sma"] = float(max(0.0, min(1.0, 0.65 * cruce_int + 0.35 * (1.0 if cruce_raw >= 0.5 else 0.0))))
+    vol_raw = d.get("volatilidad", None)
+    if vol_raw in (None, ""):
+        vol = calcular_volatilidad_simple(d)
+    else:
+        try:
+            vol = float(vol_raw)
+        except Exception:
+            vol = calcular_volatilidad_simple(d)
+    vol = max(0.0, min(1.0, float(vol)))
+    d["volatilidad"] = float(vol)
 
-    # breakout: intensidad apoyada por spread/volatilidad para evitar “siempre 1”
-    breakout_raw = _f("breakout", 0.0)
-    vol = _f("volatilidad", spread)
-    breakout_int = min(1.0, max(0.0, 0.55 * min(1.0, vol / 0.0025) + 0.45 * min(1.0, spread / 0.0030)))
-    d["breakout"] = float(max(0.0, min(1.0, 0.70 * (1.0 if breakout_raw >= 0.5 else 0.0) + 0.30 * breakout_int)))
-
-    # rsi_reversion: intensidad de extremo RSI (cercanía a <30 o >70)
     rsi9 = _f("rsi_9", 50.0)
     rsi14 = _f("rsi_14", 50.0)
-    low_ext = max(0.0, (30.0 - min(rsi9, rsi14)) / 30.0)
-    high_ext = max(0.0, (max(rsi9, rsi14) - 70.0) / 30.0)
-    rsi_rev_int = min(1.0, max(low_ext, high_ext))
+    rsi_center_dist = min(1.0, (abs(rsi9 - 50.0) + abs(rsi14 - 50.0)) / 70.0)
+
+    cruce_raw = _f("cruce_sma", 0.0)
+    cruce_int = spread / (spread + 0.0015) if spread > 0 else 0.0
+    d["cruce_sma"] = float(max(0.0, min(1.0, 0.75 * cruce_int + 0.25 * (1.0 if cruce_raw >= 0.5 else 0.0))))
+
+    breakout_raw = _f("breakout", 0.0)
+    breakout_int = max(0.0, min(1.0, 0.45 * (spread / (spread + 0.0020) if spread > 0 else 0.0) + 0.35 * vol + 0.20 * rsi_center_dist))
+    d["breakout"] = float(max(0.0, min(1.0, 0.55 * breakout_int + 0.45 * (1.0 if breakout_raw >= 0.5 else 0.0))))
+
+    low_ext = max(0.0, (35.0 - min(rsi9, rsi14)) / 35.0)
+    high_ext = max(0.0, (max(rsi9, rsi14) - 65.0) / 35.0)
+    rsi_rev_int = max(low_ext, high_ext, 0.35 * rsi_center_dist)
     d["rsi_reversion"] = float(max(0.0, min(1.0, rsi_rev_int)))
 
-    # es_rebote como intensidad (helper ya devuelve 0..1)
-    d["es_rebote"] = float(max(0.0, min(1.0, calcular_es_rebote(d))))
+    reb_base = float(max(0.0, min(1.0, calcular_es_rebote(d))))
+    racha = abs(_f("racha_actual", 0.0))
+    racha_term = max(0.0, min(1.0, racha / 10.0))
+    d["es_rebote"] = float(max(0.0, min(1.0, 0.60 * reb_base + 0.25 * d["rsi_reversion"] + 0.15 * racha_term)))
 
-    # puntaje_estrategia re-normalizado con señales enriquecidas
     try:
         pe = calcular_puntaje_estrategia_normalizado(d)
         if pe is not None:
@@ -2334,10 +2340,10 @@ def calcular_puntaje_estrategia_normalizado(fila: dict) -> float:
     rsi_reversion = as_cont01(fila.get("rsi_reversion", 0))
     es_rebote     = as_cont01(fila.get("es_rebote", 0))
 
-    score += breakout * 0.30
-    score += cruce_sma * 0.25
-    score += rsi_reversion * 0.20
-    score += es_rebote * 0.15
+    score += breakout * 0.24
+    score += cruce_sma * 0.20
+    score += rsi_reversion * 0.18
+    score += es_rebote * 0.14
 
     # RSI zona caliente (bonus pequeño)
     try:
@@ -2371,6 +2377,20 @@ def calcular_puntaje_estrategia_normalizado(fila: dict) -> float:
         roi01 = 0.0
 
     score += roi01 * 0.05
+
+    try:
+        vol = float(fila.get("volatilidad", 0.0) or 0.0)
+    except Exception:
+        vol = 0.0
+    vol = max(0.0, min(1.0, vol))
+    score += 0.08 * vol
+
+    try:
+        hb = float(fila.get("hora_bucket", 0.5) or 0.5)
+    except Exception:
+        hb = 0.5
+    hb = max(0.0, min(1.0, hb))
+    score += 0.03 * (1.0 - abs((hb * 2.0) - 1.0))
 
     if not math.isfinite(score):
         score = 0.0
