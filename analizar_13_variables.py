@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 from collections import Counter, defaultdict
 from math import sqrt
 from pathlib import Path
@@ -23,7 +24,7 @@ def fmt_pct(v: float) -> str:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Analiza dataset de 13 variables + result_bin")
-    p.add_argument("csv", type=Path, help="Ruta al CSV")
+    p.add_argument("csv", nargs="?", type=Path, help="Ruta al CSV. Si se omite, lee desde STDIN")
     return p.parse_args()
 
 
@@ -46,51 +47,92 @@ def percentile(sorted_values: List[float], q: float) -> float:
     return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
 
 
+def _read_text(args: argparse.Namespace) -> str:
+    if args.csv is None:
+        text = io.TextIOWrapper(getattr(__import__("sys"), "stdin").buffer, encoding="utf-8").read()
+        if not text.strip():
+            raise ValueError("Entrada STDIN vacía")
+        return text
+
+    if not args.csv.exists():
+        raise FileNotFoundError(f"No existe el archivo: {args.csv}")
+    return args.csv.read_text(encoding="utf-8", errors="replace")
+
+
+def _normalizar_csv_escapado(text: str) -> str:
+    """Corrige casos donde el CSV llega con saltos escapados como \"\\n\" literal."""
+    stripped = text.strip()
+    if "\\n" in stripped and "\n" not in stripped:
+        return stripped.replace("\\n", "\n")
+
+    first_line = stripped.splitlines()[0] if stripped else ""
+    if "\\n" in first_line and first_line.count(",") >= 5:
+        return stripped.replace("\\n", "\n")
+    return text
+
+
+def _crear_dict_reader(text: str) -> csv.DictReader:
+    sample = text[:4096]
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+    except Exception:
+        dialect = csv.get_dialect("excel")
+    return csv.DictReader(io.StringIO(text), dialect=dialect)
+
+
 def main() -> int:
     args = parse_args()
-    if not args.csv.exists():
-        print(f"❌ No existe el archivo: {args.csv}")
+    try:
+        raw_text = _read_text(args)
+    except Exception as exc:
+        print(f"❌ {exc}")
         return 1
 
-    with args.csv.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        cols = reader.fieldnames or []
+    text = _normalizar_csv_escapado(raw_text)
 
-        missing_expected = [c for c in EXPECTED_COLUMNS if c not in cols]
-        extras = [c for c in cols if c not in EXPECTED_COLUMNS]
+    reader = _crear_dict_reader(text)
+    cols = reader.fieldnames or []
 
-        numeric = {c: [] for c in EXPECTED_COLUMNS if c in cols and c != "result_bin"}
-        null_count = Counter()
-        exact_dup_counter = Counter()
-        signature_labels: Dict[str, set] = defaultdict(set)
-        label_counter = Counter()
-        invalid_label = 0
-        rows = 0
+    if not cols:
+        print("❌ No se detectó cabecera CSV válida.")
+        return 1
 
-        for row in reader:
-            rows += 1
-            exact_dup_counter[tuple((c, row.get(c, "")) for c in cols)] += 1
+    missing_expected = [c for c in EXPECTED_COLUMNS if c not in cols]
+    extras = [c for c in cols if c not in EXPECTED_COLUMNS]
 
-            for c in numeric:
-                val = try_float(row.get(c, ""))
-                if val is None:
-                    null_count[c] += 1
-                else:
-                    numeric[c].append(val)
+    numeric = {c: [] for c in EXPECTED_COLUMNS if c in cols and c != "result_bin"}
+    null_count = Counter()
+    exact_dup_counter = Counter()
+    signature_labels: Dict[str, set] = defaultdict(set)
+    label_counter = Counter()
+    invalid_label = 0
+    rows = 0
 
-            if "result_bin" in cols:
-                raw = (row.get("result_bin") or "").strip()
-                label = try_float(raw)
-                if label in (0.0, 1.0):
-                    label_int = int(label)
-                    label_counter[label_int] += 1
-                    feat_sig = "|".join(str(row.get(c, "")).strip() for c in EXPECTED_COLUMNS if c not in {"result_bin"} and c in cols)
-                    signature_labels[feat_sig].add(label_int)
-                elif raw != "":
-                    invalid_label += 1
+    for row in reader:
+        rows += 1
+        exact_dup_counter[tuple((c, row.get(c, "")) for c in cols)] += 1
+
+        for c in numeric:
+            val = try_float(row.get(c, ""))
+            if val is None:
+                null_count[c] += 1
+            else:
+                numeric[c].append(val)
+
+        if "result_bin" in cols:
+            raw = (row.get("result_bin") or "").strip()
+            label = try_float(raw)
+            if label in (0.0, 1.0):
+                label_int = int(label)
+                label_counter[label_int] += 1
+                feat_sig = "|".join(str(row.get(c, "")).strip() for c in EXPECTED_COLUMNS if c not in {"result_bin"} and c in cols)
+                signature_labels[feat_sig].add(label_int)
+            elif raw != "":
+                invalid_label += 1
 
     print("=" * 80)
-    print(f"📄 Archivo: {args.csv}")
+    origen = str(args.csv) if args.csv is not None else "STDIN"
+    print(f"📄 Archivo: {origen}")
     print(f"📦 Filas: {rows:,}")
     print(f"🧱 Columnas: {len(cols)}")
     print("=" * 80)
