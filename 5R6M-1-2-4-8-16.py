@@ -2155,7 +2155,8 @@ def calcular_hora_bucket(row_dict):
     Devuelve un valor 0–1 según la franja de 30 minutos del día
     (48 buckets => más granular y evita columna constante).
 
-    Si no se puede parsear la hora, devuelve 0.5 (neutral).
+    Si no se puede parsear la hora, devuelve 0.0 y se debe acompañar
+    con `hora_missing=1.0` (ver helper `calcular_hora_features`).
 
     Claves soportadas (prioridad):
       - ts (ISO con TZ, ej: "2025-12-05T09:24:04.531328+00:00")  -> se convierte a America/Lima
@@ -2243,7 +2244,28 @@ def calcular_hora_bucket(row_dict):
         except Exception:
             pass
 
-    return 0.5
+    return 0.0
+
+
+def calcular_hora_features(row_dict: dict) -> tuple[float, float]:
+    """
+    Contrato horario explícito para evitar fallback ambiguo:
+      - hora_bucket: 0..1 SOLO cuando hay timestamp/hora parseable.
+      - hora_missing: 1.0 cuando falta hora parseable, 0.0 en caso contrario.
+    """
+    hb = calcular_hora_bucket(row_dict)
+    try:
+        hb = float(hb)
+    except Exception:
+        hb = 0.0
+    hb = float(max(0.0, min(1.0, hb)))
+    # Si no hay claves temporales útiles y hb está en fallback -> missing
+    has_any_time = any(
+        str((row_dict or {}).get(k, "") or "").strip() != ""
+        for k in ("ts", "epoch", "timestamp", "fecha", "hora")
+    )
+    hm = 0.0 if has_any_time else 1.0
+    return hb, hm
 
 
 def enriquecer_features_evento(row_dict: dict):
@@ -2305,7 +2327,7 @@ def calcular_puntaje_estrategia_normalizado(fila: dict) -> float:
     Puntaje 0..1 usando señales + RSI + ROI (payout como ROI [0..1.5]).
     Robusto a valores 1.0/0.0 y strings.
     """
-    def as01(x):
+    def as_cont01(x):
         try:
             if isinstance(x, str):
                 x = x.strip().lower()
@@ -2314,16 +2336,19 @@ def calcular_puntaje_estrategia_normalizado(fila: dict) -> float:
                 if x in ("0", "false", "no", "n", ""):
                     return 0.0
             v = float(x)
-            return 1.0 if v >= 0.5 else 0.0
+            if not math.isfinite(v):
+                return 0.0
+            return max(0.0, min(1.0, v))
         except Exception:
             return 0.0
 
     score = 0.0
 
-    breakout      = as01(fila.get("breakout", 0))
-    cruce_sma     = as01(fila.get("cruce_sma", 0))
-    rsi_reversion = as01(fila.get("rsi_reversion", 0))
-    es_rebote     = as01(fila.get("es_rebote", 0))
+    # IMPORTANTE: score continuo (NO binarizar señales continuas por umbral >=0.5)
+    breakout      = as_cont01(fila.get("breakout", 0))
+    cruce_sma     = as_cont01(fila.get("cruce_sma", 0))
+    rsi_reversion = as_cont01(fila.get("rsi_reversion", 0))
+    es_rebote     = as_cont01(fila.get("es_rebote", 0))
 
     score += breakout * 0.30
     score += cruce_sma * 0.25
@@ -2678,7 +2703,8 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
 
         hb = _safe_float_local(row_dict_full.get("hora_bucket"))
         if hb is None:
-            hb = calcular_hora_bucket(row_dict_full)
+            hb, hm = calcular_hora_features(row_dict_full)
+            row_dict_full["hora_missing"] = float(hm)
         if hb is None or not math.isfinite(float(hb)):
             return None, None
         row_dict_full["hora_bucket"] = float(hb)
@@ -2816,7 +2842,7 @@ def _segmento_key_from_df(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     d["payout"] = pd.to_numeric(d.get("payout", 0.0), errors="coerce").fillna(0.0)
     d["volatilidad"] = pd.to_numeric(d.get("volatilidad", 0.0), errors="coerce").fillna(0.0)
-    d["hora_bucket"] = pd.to_numeric(d.get("hora_bucket", 0.5), errors="coerce").fillna(0.5)
+    d["hora_bucket"] = pd.to_numeric(d.get("hora_bucket", 0.0), errors="coerce").fillna(0.0)
 
     p_q1 = float(d["payout"].quantile(1/3)) if len(d) else 0.0
     p_q2 = float(d["payout"].quantile(2/3)) if len(d) else 0.0
@@ -2910,7 +2936,7 @@ def _ultimo_contexto_operativo_bot(bot: str) -> dict:
             try:
                 out["seg_payout"] = _bucket_tercil(float(row.get("payout", 0.0) or 0.0), 0.70, 0.82)
                 out["seg_vol"] = _bucket_tercil(float(row.get("volatilidad", 0.0) or 0.0), 0.0008, 0.0018)
-                out["seg_hora"] = _inferir_segmento_hora(float(row.get("hora_bucket", 0.5) or 0.5))
+                out["seg_hora"] = _inferir_segmento_hora(float(row.get("hora_bucket", 0.0) or 0.0))
             except Exception:
                 pass
             return out
@@ -2934,7 +2960,7 @@ def _ultimo_contexto_operativo_bot(bot: str) -> dict:
                 try:
                     out["seg_payout"] = _bucket_tercil(float(last.get("payout", 0.0) or 0.0), 0.70, 0.82)
                     out["seg_vol"] = _bucket_tercil(float(last.get("volatilidad", 0.0) or 0.0), 0.0008, 0.0018)
-                    out["seg_hora"] = _inferir_segmento_hora(float(last.get("hora_bucket", 0.5) or 0.5))
+                    out["seg_hora"] = _inferir_segmento_hora(float(last.get("hora_bucket", 0.0) or 0.0))
                 except Exception:
                     pass
                 break
@@ -3868,9 +3894,9 @@ def _add_derived_for_model(d: dict):
     except Exception:
         brk = 0.0
     try:
-        hb = float(d.get("hora_bucket", 0.5) or 0.5)
+        hb = float(d.get("hora_bucket", 0.0) or 0.0)
     except Exception:
-        hb = 0.5
+        hb = 0.0
     try:
         er = float(d.get("es_rebote", 0.0) or 0.0)
     except Exception:
@@ -3990,7 +4016,8 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
     try:
         hb = _safe_float(row.get("hora_bucket"))
         if hb is None:
-            hb = calcular_hora_bucket(row)
+            hb, hm = calcular_hora_features(row)
+            row["hora_missing"] = float(hm)
         row["hora_bucket"] = float(max(0.0, min(float(hb), 1.0)))
     except Exception:
         return None
@@ -5644,9 +5671,12 @@ def oraculo_predict(fila_dict, modelo, scaler, meta, bot_name=""):
             fila_dict["volatilidad"] = 0.0
 
         try:
-            fila_dict["hora_bucket"] = float(calcular_hora_bucket(fila_dict))
+            hb, hm = calcular_hora_features(fila_dict)
+            fila_dict["hora_bucket"] = float(hb)
+            fila_dict["hora_missing"] = float(hm)
         except Exception:
-            fila_dict["hora_bucket"] = 0.5
+            fila_dict["hora_bucket"] = 0.0
+            fila_dict["hora_missing"] = 1.0
 
         # Armar X en orden del modelo
         X = []
@@ -5703,14 +5733,24 @@ def prob_exploratoria(fila):
             pay = 0.0
         pay = max(0.0, min(pay, 1.5))
 
-        # score básico (conservar simple)
+        def _as01_cont(v):
+            try:
+                x = float(v)
+            except Exception:
+                s = str(v).strip().lower()
+                if s in ("1", "true", "yes", "y"):
+                    x = 1.0
+                else:
+                    x = 0.0
+            if not math.isfinite(x):
+                x = 0.0
+            return max(0.0, min(1.0, x))
+
+        # score básico (conservar simple pero continuo)
         score = 0.50
-        if str(fila.get("breakout", 0)).strip() in ("1", "True", "true"):
-            score += 0.05
-        if str(fila.get("cruce_sma", 0)).strip() in ("1", "True", "true"):
-            score += 0.05
-        if str(fila.get("rsi_reversion", 0)).strip() in ("1", "True", "true"):
-            score += 0.04
+        score += 0.05 * _as01_cont(fila.get("breakout", 0.0))
+        score += 0.05 * _as01_cont(fila.get("cruce_sma", 0.0))
+        score += 0.04 * _as01_cont(fila.get("rsi_reversion", 0.0))
 
         # ROI alto ayuda un poco (sin convertir a %)
         score += (pay / 1.5) * 0.10
@@ -6118,9 +6158,12 @@ def anexar_incremental_desde_bot(bot: str):
         except Exception:
             row_dict_full["volatilidad"] = 0.0
         try:
-            row_dict_full["hora_bucket"] = float(calcular_hora_bucket(row_dict_full))
+            hb, hm = calcular_hora_features(row_dict_full)
+            row_dict_full["hora_bucket"] = float(hb)
+            row_dict_full["hora_missing"] = float(hm)
         except Exception:
             row_dict_full["hora_bucket"] = 0.0
+            row_dict_full["hora_missing"] = 1.0
 
         # Clip + validar
         row_dict_full = clip_feature_values(row_dict_full, feature_names)
