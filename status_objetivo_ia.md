@@ -1,9 +1,9 @@
 # Estado IA y avance al objetivo
 
-- Actualizado (UTC): 2026-02-14T02:36:10.623222+00:00
+- Actualizado (UTC): 2026-02-14T04:31:38.295700+00:00
 - Objetivo principal (Prob IA real): 70%
-- Efectividad real global de cierres (bots 45-50): 49.70% (18266/36749)
-- Brecha vs objetivo: -20.30%
+- Efectividad real global de cierres (bots 45-50): 49.66% (18362/36973)
+- Brecha vs objetivo: -20.34%
 
 ## Señales IA cerradas (log)
 - Total señales registradas: 117
@@ -13,12 +13,12 @@
 - Estado semáforo objetivo 70%: 🔴 Aún no
 
 ## Recomendaciones priorizadas para subir Prob IA real
-1. Brecha principal: estás en 49.70% global vs objetivo 70%. En corto plazo, prioriza reducir exposición REAL y subir filtro de calidad antes de aumentar volumen.
+1. Brecha principal: estás en 49.66% global vs objetivo 70%. En corto plazo, prioriza reducir exposición REAL y subir filtro de calidad antes de aumentar volumen.
 2. Muestra IA >=70% insuficiente (n=117). No tomes decisiones estructurales hasta llegar al menos a n>=200 cierres IA >=70%.
 3. Umbral operativo sugerido temporal: >= 80% (hit=50.00%, IC95%=[36.64%,63.36%], n=50).
 4. Hay sobreconfianza en bins de probabilidad (gap pred-real >10 pts). Aplicar shrinkage recomendado: p_ajustada = 0.6*p_calibrada + 0.4*tasa_base_rolling.
 5. Bots a intervenir primero (impacto ponderado): fulll49(+51.2%, n=24, prioridad=0.41), fulll46(+54.4%, n=18, prioridad=0.33). Aplicar beta_bot y reducción de stake según semáforo.
-6. Meta de modelo actual: reliable=True, auc=0.7388275922180112, brier=0.21055855573895496. Monitorear semanalmente ECE/Brier y recalibrar más frecuente que reentrenar base.
+6. Meta de modelo actual: reliable=False, auc=0.65, brier=0.2878518440395761. Monitorear semanalmente ECE/Brier y recalibrar más frecuente que reentrenar base.
 
 ## Riesgo de calibración por bot (log IA)
 | Bot | n | Madurez | %Real | %Pred media | Inflación | beta_bot | Prioridad | Semáforo | Acción sugerida |
@@ -33,12 +33,12 @@
 ## Resumen por bot (cierres)
 | Bot | Cerrados | Ganancias | Pérdidas | % Éxito |
 |---|---:|---:|---:|---:|
-| fulll45 | 5461 | 2688 | 2773 | 49.22% |
-| fulll46 | 6258 | 3140 | 3118 | 50.18% |
-| fulll47 | 6257 | 3118 | 3139 | 49.83% |
-| fulll48 | 6241 | 3102 | 3139 | 49.70% |
-| fulll49 | 6259 | 3147 | 3112 | 50.28% |
-| fulll50 | 6273 | 3071 | 3202 | 48.96% |
+| fulll45 | 5497 | 2705 | 2792 | 49.21% |
+| fulll46 | 6296 | 3153 | 3143 | 50.08% |
+| fulll47 | 6294 | 3135 | 3159 | 49.81% |
+| fulll48 | 6279 | 3117 | 3162 | 49.64% |
+| fulll49 | 6296 | 3163 | 3133 | 50.24% |
+| fulll50 | 6311 | 3089 | 3222 | 48.95% |
 
 ## Sensibilidad por umbral (señales IA cerradas)
 | Umbral | n | hit rate | IC95% | Muestra suficiente |
