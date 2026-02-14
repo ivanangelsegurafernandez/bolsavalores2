@@ -6334,9 +6334,10 @@ def _seleccionar_features_utiles_train(X_df: pd.DataFrame, feats: list[str]):
 
 def _seleccionar_features_calidad(X_df: pd.DataFrame, y_arr: np.ndarray, feats: list[str]):
     """
-    Selección calidad-first:
+    Selección calidad-first (sin fuga temporal):
     - Conserva siempre FEATURE_ALWAYS_KEEP si existen.
-    - Evalúa cada feature por dominancia + AUC univariado (ranking robusto).
+    - Evalúa dominancia + AUC univariado SOLO en la ventana de entrenamiento.
+    - Exige estabilidad temporal básica (mitad temprana vs mitad reciente del train).
     - Limita el set productivo para reducir ruido y sobreajuste.
     """
     try:
@@ -6347,6 +6348,9 @@ def _seleccionar_features_calidad(X_df: pd.DataFrame, y_arr: np.ndarray, feats: 
         selected = []
         report = []
         scored = []
+
+        n_all = len(X_df)
+        cut = max(1, n_all // 2)
 
         for c in feats:
             if c not in X_df.columns:
@@ -6360,6 +6364,9 @@ def _seleccionar_features_calidad(X_df: pd.DataFrame, y_arr: np.ndarray, feats: 
 
             auc_uni = 0.5
             auc_delta = 0.0
+            auc_early = 0.5
+            auc_late = 0.5
+            stable = False
             ok_auc = False
             try:
                 if nun > 1 and len(np.unique(y)) == 2:
@@ -6367,6 +6374,20 @@ def _seleccionar_features_calidad(X_df: pd.DataFrame, y_arr: np.ndarray, feats: 
                     auc_uni = max(min(auc_uni, 1.0), 0.0)
                     auc_delta = abs(auc_uni - 0.5)
                     ok_auc = True
+
+                    y_early = y[:cut]
+                    x_early = s.values[:cut]
+                    y_late = y[cut:]
+                    x_late = s.values[cut:]
+
+                    if len(y_early) >= 20 and len(np.unique(y_early)) == 2:
+                        auc_early = float(roc_auc_score(y_early, x_early))
+                    if len(y_late) >= 20 and len(np.unique(y_late)) == 2:
+                        auc_late = float(roc_auc_score(y_late, x_late))
+
+                    d1 = abs(auc_early - 0.5)
+                    d2 = abs(auc_late - 0.5)
+                    stable = (d1 >= float(FEATURE_MIN_AUC_DELTA) * 0.60 and d2 >= float(FEATURE_MIN_AUC_DELTA) * 0.60)
             except Exception:
                 pass
 
@@ -6382,16 +6403,16 @@ def _seleccionar_features_calidad(X_df: pd.DataFrame, y_arr: np.ndarray, feats: 
                 report.append((c, f"DROP dom={dom:.3f}"))
                 continue
 
-            if ok_auc and auc_delta >= float(FEATURE_MIN_AUC_DELTA):
-                scored.append((auc_delta, c, dom, auc_uni))
+            if ok_auc and auc_delta >= float(FEATURE_MIN_AUC_DELTA) and stable:
+                scored.append((auc_delta, c, dom, auc_uni, auc_early, auc_late))
             else:
-                report.append((c, f"SHADOW auc_delta={auc_delta:.4f} dom={dom:.3f}"))
+                report.append((c, f"SHADOW auc_delta={auc_delta:.4f} early={auc_early:.4f} late={auc_late:.4f} dom={dom:.3f}"))
 
         scored.sort(reverse=True, key=lambda t: t[0])
         max_extra = max(0, int(FEATURE_MAX_PROD) - len(selected))
-        for auc_delta, c, dom, auc_uni in scored[:max_extra]:
+        for auc_delta, c, dom, auc_uni, auc_early, auc_late in scored[:max_extra]:
             selected.append(c)
-            report.append((c, f"KEEP auc_delta={auc_delta:.4f} dom={dom:.3f} auc={auc_uni:.4f}"))
+            report.append((c, f"KEEP auc_delta={auc_delta:.4f} early={auc_early:.4f} late={auc_late:.4f} dom={dom:.3f} auc={auc_uni:.4f}"))
 
         if not selected:
             fallback = [f for f in FEATURE_ALWAYS_KEEP if f in X_df.columns]
@@ -6473,6 +6494,12 @@ def maybe_retrain(force: bool = False):
 
         # 3) Reparar incremental si quedó “mutante” + leer incremental (con LOCK)
         ruta_inc = "dataset_incremental.csv"
+        if not os.path.exists(ruta_inc):
+            try:
+                agregar_evento("⚠️ IA: dataset_incremental.csv no existe aún. Esperando backfill incremental.")
+            except Exception:
+                pass
+            return False
         try:
             with file_lock("inc.lock"):
                 try:
@@ -6633,6 +6660,27 @@ def maybe_retrain(force: bool = False):
 
         X_test  = X.iloc[i2:i3].copy()
         y_test  = np.asarray(y)[i2:i3]
+
+        # 8.1) Selección dinámica de calidad (SIN fuga: solo con TRAIN_BASE)
+        if FEATURE_DYNAMIC_SELECTION:
+            try:
+                feats_quality, quality_report = _seleccionar_features_calidad(X_train, y_train, feats_used)
+                feats_quality = [c for c in feats_quality if c in X_train.columns]
+                if feats_quality:
+                    X_train = X_train[feats_quality].copy()
+                    if X_calib is not None and len(X_calib) > 0:
+                        X_calib = X_calib[feats_quality].copy()
+                    X_test = X_test[feats_quality].copy()
+                    feats_used = list(feats_quality)
+
+                    globals()["FEATURE_NAMES_PROD"] = list(feats_used)
+                    globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f not in feats_used]
+
+                    if quality_report:
+                        txt = ", ".join([f"{k}:{r}" for k, r in quality_report[:8]])
+                        agregar_evento(f"🎯 IA quality-gate(train): prod={feats_used} | {txt}")
+            except Exception:
+                pass
 
         # 9) Escalado SOLO con TRAIN_BASE
         scaler = StandardScaler()
