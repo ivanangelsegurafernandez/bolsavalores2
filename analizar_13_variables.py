@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List
 
 EXPECTED_COLUMNS = [
-    "rsi_9", "rsi_14", "sma_5", "sma_20", "cruce_sma", "breakout",
+    "rsi_9", "rsi_14", "sma_5", "sma_spread", "cruce_sma", "breakout",
     "rsi_reversion", "racha_actual", "payout", "puntaje_estrategia",
     "volatilidad", "es_rebote", "hora_bucket", "result_bin",
 ]
@@ -25,6 +25,8 @@ def fmt_pct(v: float) -> str:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Analiza dataset de 13 variables + result_bin")
     p.add_argument("csv", nargs="?", type=Path, help="Ruta al CSV. Si se omite, lee desde STDIN")
+    p.add_argument("--closed-only", action="store_true", help="Analiza solo filas con result_bin válido (0/1)")
+    p.add_argument("--max-dominance", type=float, default=0.90, help="Umbral de dominancia máxima aceptable")
     return p.parse_args()
 
 
@@ -80,6 +82,56 @@ def _crear_dict_reader(text: str) -> csv.DictReader:
     return csv.DictReader(io.StringIO(text), dialect=dialect)
 
 
+
+
+def _derive_feature(row: dict, col: str):
+    """Deriva columnas del core13 cuando vienen en formato legacy."""
+    if col == "sma_spread":
+        try:
+            s5 = float((row.get("sma_5") or 0.0))
+            s20 = float((row.get("sma_20") or 0.0))
+            base = abs(s20) if abs(s20) > 1e-9 else 1e-9
+            return abs(s5 - s20) / base
+        except Exception:
+            return None
+
+    if col == "payout":
+        raw = row.get("payout", "")
+        if str(raw).strip() == "":
+            raw = row.get("payout_multiplier", "")
+        return try_float(str(raw))
+
+    if col == "volatilidad":
+        v = try_float(str(row.get("volatilidad", "")))
+        if v is not None:
+            return v
+        try:
+            s5 = float((row.get("sma_5") or 0.0))
+            s20 = float((row.get("sma_20") or 0.0))
+            base = abs(s20) if abs(s20) > 1e-9 else 1.0
+            sp = abs(s5 - s20) / base
+            return min(1.0, max(0.0, 1.0 - __import__('math').exp(-40.0 * min(sp, 0.25))))
+        except Exception:
+            return None
+
+    if col == "hora_bucket":
+        v = try_float(str(row.get("hora_bucket", "")))
+        if v is not None:
+            return v
+        fecha = str(row.get("fecha", "") or "").strip()
+        if " " in fecha and ":" in fecha:
+            try:
+                hhmm = fecha.split(" ", 1)[1]
+                hh = int(hhmm.split(":")[0]); mm = int(hhmm.split(":")[1])
+                idx = hh * 2 + (1 if mm >= 30 else 0)
+                return idx / 47.0
+            except Exception:
+                return None
+        return None
+
+    return try_float(str(row.get(col, "")))
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -97,10 +149,11 @@ def main() -> int:
         print("❌ No se detectó cabecera CSV válida.")
         return 1
 
-    missing_expected = [c for c in EXPECTED_COLUMNS if c not in cols]
+    derivables = {"sma_spread", "payout", "volatilidad", "hora_bucket"}
+    missing_expected = [c for c in EXPECTED_COLUMNS if (c not in cols and c not in derivables)]
     extras = [c for c in cols if c not in EXPECTED_COLUMNS]
 
-    numeric = {c: [] for c in EXPECTED_COLUMNS if c in cols and c != "result_bin"}
+    numeric = {c: [] for c in EXPECTED_COLUMNS if c != "result_bin" and (c in cols or c in derivables)}
     null_count = Counter()
     exact_dup_counter = Counter()
     signature_labels: Dict[str, set] = defaultdict(set)
@@ -109,11 +162,16 @@ def main() -> int:
     rows = 0
 
     for row in reader:
+        raw = (row.get("result_bin") or "").strip() if "result_bin" in cols else ""
+        label = try_float(raw) if "result_bin" in cols else None
+        if args.closed_only and label not in (0.0, 1.0):
+            continue
+
         rows += 1
         exact_dup_counter[tuple((c, row.get(c, "")) for c in cols)] += 1
 
         for c in numeric:
-            val = try_float(row.get(c, ""))
+            val = _derive_feature(row, c)
             if val is None:
                 null_count[c] += 1
             else:
@@ -184,6 +242,30 @@ def main() -> int:
             f"{c} | {mean:.6f} | {std:.6f} | {vals_sorted[0]:.6f} | "
             f"{p1:.6f} | {p50:.6f} | {p99:.6f} | {vals_sorted[-1]:.6f}"
         )
+
+
+    print("\n--- Salud de variables (dominancia/nunique) ---")
+    dom_warn = []
+    for c in numeric:
+        vals = numeric[c]
+        if not vals:
+            print(f"  - {c}: sin datos numéricos")
+            continue
+        cnt = Counter(vals)
+        top_ratio = cnt.most_common(1)[0][1] / max(1, len(vals))
+        nun = len(cnt)
+        status = "OK"
+        if nun <= 1:
+            status = "ROTA"
+        elif top_ratio > float(args.max_dominance):
+            status = "CASI_CONSTANTE"
+            dom_warn.append(c)
+        print(f"  - {c}: nunique={nun}, dominancia={fmt_pct(top_ratio)} -> {status}")
+
+    if dom_warn:
+        print(f"⚠️ Variables con dominancia > {fmt_pct(args.max_dominance)}: {dom_warn}")
+    else:
+        print("✅ Ninguna variable supera el umbral de dominancia configurado.")
 
     print("\n✅ Análisis completado.")
     return 0
