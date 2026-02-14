@@ -279,6 +279,11 @@ FEATURE_MIN_AUC_DELTA = 0.015      # aporte mínimo (|AUC_uni - 0.5|)
 FEATURE_MAX_DOMINANCE_GATE = 0.965 # evita casi-constantes
 FEATURE_DYNAMIC_SELECTION = True
 
+# Meta objetivo (calidad real en señales fuertes)
+IA_TARGET_PRECISION = 0.70
+IA_TARGET_PRECISION_FLOOR = 0.65   # piso mínimo para declarar confiable
+IA_TARGET_MIN_SIGNALS = 30         # mínimo de señales en zona alta para validar
+
 FEATURE_NAMES_PROD = list(FEATURE_ALWAYS_KEEP)
 FEATURE_NAMES_SHADOW = [f for f in FEATURE_NAMES_CORE_13 if f not in FEATURE_NAMES_PROD]
 FEATURE_NAMES_DEFAULT = list(FEATURE_NAMES_CORE_13)
@@ -6727,20 +6732,52 @@ def maybe_retrain(force: bool = False):
                 calib_kind = "none"
                 modelo_final = modelo_base
 
-        # 12) Threshold sugerido: optimiza F-beta (beta=0.5) sobre CALIB.
-        # Priorizamos precisión para reducir falsas señales “altas” que luego no cierran bien.
+        # 12) Threshold sugerido en CALIB (calidad > cantidad).
+        # 1) Intentar cumplir precisión objetivo en zona alta (>=70%).
+        # 2) Si no alcanza muestra mínima, fallback a F-beta (beta=0.5).
         thr = float(THR_DEFAULT)
+        calib_prec_at_thr = None
+        calib_n_at_thr = 0
         try:
             if Xcal_s is not None and y_calib is not None and len(y_calib) >= 20 and len(np.unique(y_calib)) == 2:
                 p = modelo_final.predict_proba(Xcal_s)[:, 1]
-                best_thr, best_fb = thr, -1.0
-                for t in np.linspace(0.10, 0.90, 81):
+
+                best_target_thr = None
+                best_target_n = -1
+                best_target_prec = 0.0
+
+                best_fb_thr, best_fb = thr, -1.0
+                for t in np.linspace(0.50, 0.90, 81):
                     yp = (p >= t).astype(int)
+                    mask = (yp == 1)
+                    n_sig = int(np.sum(mask))
+                    if n_sig > 0:
+                        prec = float(np.mean(np.asarray(y_calib)[mask] == 1))
+                    else:
+                        prec = 0.0
+
+                    # Candidato por objetivo de precisión
+                    if n_sig >= int(IA_TARGET_MIN_SIGNALS) and prec >= float(IA_TARGET_PRECISION):
+                        if n_sig > best_target_n:
+                            best_target_thr = float(t)
+                            best_target_n = int(n_sig)
+                            best_target_prec = float(prec)
+
                     fb = fbeta_score(y_calib, yp, beta=0.5, zero_division=0)
                     if fb > best_fb:
                         best_fb = fb
-                        best_thr = float(t)
-                thr = float(best_thr)
+                        best_fb_thr = float(t)
+
+                if best_target_thr is not None:
+                    thr = float(best_target_thr)
+                    calib_prec_at_thr = float(best_target_prec)
+                    calib_n_at_thr = int(best_target_n)
+                else:
+                    thr = float(best_fb_thr)
+                    mask_fb = (p >= thr)
+                    calib_n_at_thr = int(np.sum(mask_fb))
+                    if calib_n_at_thr > 0:
+                        calib_prec_at_thr = float(np.mean(np.asarray(y_calib)[mask_fb] == 1))
         except Exception:
             thr = float(THR_DEFAULT)
 
@@ -6813,14 +6850,32 @@ def maybe_retrain(force: bool = False):
             cv_auc = None
 
         # 15) Reliable (criterio “producción”)
+        # Además de AUC/base, exigimos que la zona de alta probabilidad no esté inflada.
+        test_prec_at_thr = 0.0
+        test_n_at_thr = 0
+        try:
+            if p_test is not None:
+                mask_t = (p_test >= float(thr))
+                test_n_at_thr = int(np.sum(mask_t))
+                if test_n_at_thr > 0:
+                    test_prec_at_thr = float(np.mean(np.asarray(y_test)[mask_t] == 1))
+        except Exception:
+            test_prec_at_thr = 0.0
+            test_n_at_thr = 0
+
         try:
             pos_all = int(np.sum(y == 1))
             neg_all = int(np.sum(y == 0))
+            precision_gate_ok = (
+                (test_n_at_thr < int(IA_TARGET_MIN_SIGNALS)) or
+                (test_prec_at_thr >= float(IA_TARGET_PRECISION_FLOOR))
+            )
             reliable = (
                 (n_total >= int(MIN_FIT_ROWS_PROD)) and
                 (pos_all >= int(RELIABLE_POS_MIN)) and
                 (neg_all >= int(RELIABLE_NEG_MIN)) and
-                (auc >= float(MIN_AUC_CONF))
+                (auc >= float(MIN_AUC_CONF)) and
+                precision_gate_ok
             )
         except Exception:
             reliable = False
@@ -6861,6 +6916,10 @@ def maybe_retrain(force: bool = False):
             "threshold": float(thr),
             "reliable": bool(reliable),
             "calibration": str(calib_kind),
+            "calib_precision_at_thr": float(calib_prec_at_thr) if isinstance(calib_prec_at_thr, (int, float)) else None,
+            "calib_n_at_thr": int(calib_n_at_thr),
+            "test_precision_at_thr": float(test_prec_at_thr),
+            "test_n_at_thr": int(test_n_at_thr),
             "feature_names": list(feats_used),
             "label_col": str(label_col),
             "feature_health": health_before,
