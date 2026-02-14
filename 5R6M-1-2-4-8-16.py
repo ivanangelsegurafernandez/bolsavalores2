@@ -6547,7 +6547,25 @@ def maybe_retrain(force: bool = False):
             except Exception:
                 pass
 
-        # 4.3) Modo temporal de simplificación: si casi todo está roto, entrenar solo con racha_actual
+        # 4.3) Selección dinámica de calidad (features_prod vs shadow)
+        if FEATURE_DYNAMIC_SELECTION:
+            try:
+                feats_quality, quality_report = _seleccionar_features_calidad(X, y, feats_used)
+                feats_quality = [c for c in feats_quality if c in X.columns]
+                if feats_quality:
+                    X = X[feats_quality].copy()
+                    feats_used = list(feats_quality)
+
+                    globals()["FEATURE_NAMES_PROD"] = list(feats_used)
+                    globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f not in feats_used]
+
+                    if quality_report:
+                        txt = ", ".join([f"{k}:{r}" for k, r in quality_report[:8]])
+                        agregar_evento(f"🎯 IA quality-gate: prod={feats_used} | {txt}")
+            except Exception:
+                pass
+
+        # 4.4) Modo temporal de simplificación: si casi todo está roto, entrenar solo con racha_actual
         if ("racha_actual" in X.columns) and (len(feats_used) <= 2):
             X = X[["racha_actual"]].copy()
             feats_used = ["racha_actual"]
