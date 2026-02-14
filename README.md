@@ -111,3 +111,12 @@ Si ves varios bots con `Prob IA` alta pero `Real` bajo (inflación grande), no s
 - Si la calibración está en crítico y hay pocos cierres por bot, **síguelo entrenando**, pero en modo prudente.
 - Reduce exposición, sube umbral temporalmente y exige más muestra antes de declarar “IA confiable”.
 - Prioriza estabilidad de calibración (Brier/ECE) sobre ganar “ticks” aislados.
+
+## Script rápido para revisar las 13 variables + result_bin
+
+Puedes validar calidad del CSV (NaN, duplicados, balance de clases y conflictos de etiqueta) con:
+
+```bash
+python analizar_13_variables.py registro_enriquecido_fulll49.csv
+```
+
