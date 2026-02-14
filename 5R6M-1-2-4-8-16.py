@@ -164,6 +164,11 @@ GATE_PERMITE_REBOTE_EN_NEG = True    # permitir excepción si hay rebote confirm
 GATE_ACTIVO_MIN_MUESTRA = 40         # mínimo de cierres por activo para evaluar régimen
 GATE_ACTIVO_MIN_WR = 0.48            # si WR reciente por activo cae debajo, bloquear temporalmente
 GATE_ACTIVO_LOOKBACK = 180           # cierres recientes por bot para estimar régimen
+# Gate por segmentos (payout/vol/hora): prioriza zonas con señal estable de racha_actual
+GATE_SEGMENTO_ENABLED = True
+GATE_SEGMENTO_MIN_MUESTRA = 35
+GATE_SEGMENTO_MIN_WR = 0.50
+GATE_SEGMENTO_LOOKBACK = 240
 
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
 AUDIO_IA53_THR = 0.75
@@ -2782,17 +2787,132 @@ def _safe_read_csv_any_encoding(path: str) -> pd.DataFrame | None:
 
 _IA_RUNTIME_CAL_CACHE = {"ts": 0.0, "base_rate": 0.5, "n70": 0}
 _GATE_ACTIVO_CACHE = {}
+_GATE_SEGMENTO_CACHE = {}
+
+
+def _bucket_tercil(v: float, q1: float, q2: float) -> str:
+    try:
+        x = float(v)
+    except Exception:
+        x = 0.0
+    if x <= q1:
+        return "bajo"
+    if x <= q2:
+        return "medio"
+    return "alto"
+
+
+def _inferir_segmento_hora(hb01: float) -> str:
+    try:
+        hb = int(round(max(0.0, min(1.0, float(hb01))) * 23.0))
+    except Exception:
+        hb = 12
+    h0 = (hb // 6) * 6
+    h1 = min(h0 + 5, 23)
+    return f"h{h0:02d}-{h1:02d}"
+
+
+def _segmento_key_from_df(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d["payout"] = pd.to_numeric(d.get("payout", 0.0), errors="coerce").fillna(0.0)
+    d["volatilidad"] = pd.to_numeric(d.get("volatilidad", 0.0), errors="coerce").fillna(0.0)
+    d["hora_bucket"] = pd.to_numeric(d.get("hora_bucket", 0.5), errors="coerce").fillna(0.5)
+
+    p_q1 = float(d["payout"].quantile(1/3)) if len(d) else 0.0
+    p_q2 = float(d["payout"].quantile(2/3)) if len(d) else 0.0
+    v_q1 = float(d["volatilidad"].quantile(1/3)) if len(d) else 0.0
+    v_q2 = float(d["volatilidad"].quantile(2/3)) if len(d) else 0.0
+
+    d["seg_payout"] = d["payout"].map(lambda x: _bucket_tercil(x, p_q1, p_q2))
+    d["seg_vol"] = d["volatilidad"].map(lambda x: _bucket_tercil(x, v_q1, v_q2))
+    d["seg_hora"] = d["hora_bucket"].map(_inferir_segmento_hora)
+    d["seg_key"] = d["seg_payout"].astype(str) + "|" + d["seg_vol"].astype(str) + "|" + d["seg_hora"].astype(str)
+    return d
+
+
+def _gate_segmento_ok(bot: str, ctx: dict, ttl_s: float = 45.0):
+    """Gate por segmento operativo (payout/vol/hora) para explotar zonas con señal y filtrar planas."""
+    try:
+        if not bool(globals().get("GATE_SEGMENTO_ENABLED", True)):
+            return True, 0.5, 0, "off"
+
+        seg_key = "NA|NA|NA"
+        try:
+            pb = str(ctx.get("seg_payout", "") or "").strip()
+            vb = str(ctx.get("seg_vol", "") or "").strip()
+            hs = str(ctx.get("seg_hora", "") or "").strip()
+            if pb and vb and hs:
+                seg_key = f"{pb}|{vb}|{hs}"
+        except Exception:
+            seg_key = "NA|NA|NA"
+
+        now = time.time()
+        key = f"{bot}|{seg_key}"
+        c = _GATE_SEGMENTO_CACHE.get(key)
+        if c and (now - float(c.get("ts", 0.0))) <= float(ttl_s):
+            return bool(c.get("ok", True)), float(c.get("wr", 0.5)), int(c.get("n", 0)), str(c.get("seg", seg_key))
+
+        ruta = f"registro_enriquecido_{bot}.csv"
+        if not os.path.exists(ruta):
+            return True, 0.5, 0, seg_key
+
+        df = None
+        for enc in ("utf-8", "latin-1", "windows-1252"):
+            try:
+                df = pd.read_csv(ruta, encoding=enc, on_bad_lines="skip")
+                break
+            except Exception:
+                continue
+
+        if df is None or df.empty:
+            return True, 0.5, 0, seg_key
+
+        if "trade_status" in df.columns:
+            d = df[df["trade_status"].astype(str).str.upper().eq("CERRADO")].copy()
+        else:
+            d = df.copy()
+
+        if "result_bin" not in d.columns:
+            return True, 0.5, 0, seg_key
+
+        d["result_bin"] = pd.to_numeric(d["result_bin"], errors="coerce")
+        d = d[d["result_bin"].isin([0, 1])].copy()
+        if d.empty:
+            return True, 0.5, 0, seg_key
+
+        d = _segmento_key_from_df(d)
+
+        if int(GATE_SEGMENTO_LOOKBACK) > 0 and len(d) > int(GATE_SEGMENTO_LOOKBACK):
+            d = d.tail(int(GATE_SEGMENTO_LOOKBACK)).copy()
+
+        seg = d[d["seg_key"].astype(str).eq(str(seg_key))]
+        n = int(len(seg))
+        wr = float(seg["result_bin"].mean()) if n > 0 else 0.5
+        ok = True
+        if n >= int(GATE_SEGMENTO_MIN_MUESTRA):
+            ok = bool(wr >= float(GATE_SEGMENTO_MIN_WR))
+
+        _GATE_SEGMENTO_CACHE[key] = {"ts": now, "ok": ok, "wr": wr, "n": n, "seg": seg_key}
+        return ok, wr, n, seg_key
+    except Exception:
+        return True, 0.5, 0, "NA|NA|NA"
 
 
 def _ultimo_contexto_operativo_bot(bot: str) -> dict:
     """Lee contexto reciente (racha/es_rebote/activo) para gate de calidad por señal."""
-    out = {"racha_actual": 0.0, "es_rebote": 0.0, "activo": ""}
+    out = {"racha_actual": 0.0, "es_rebote": 0.0, "activo": "", "seg_payout": "", "seg_vol": "", "seg_hora": ""}
     try:
         row = leer_ultima_fila_features_para_pred(bot)
         if isinstance(row, dict):
             out["racha_actual"] = float(row.get("racha_actual", 0.0) or 0.0)
             out["es_rebote"] = float(row.get("es_rebote", 0.0) or 0.0)
             out["activo"] = str(row.get("activo", "") or "").strip()
+            try:
+                out["seg_payout"] = _bucket_tercil(float(row.get("payout", 0.0) or 0.0), 0.70, 0.82)
+                out["seg_vol"] = _bucket_tercil(float(row.get("volatilidad", 0.0) or 0.0), 0.0008, 0.0018)
+                out["seg_hora"] = _inferir_segmento_hora(float(row.get("hora_bucket", 0.5) or 0.5))
+            except Exception:
+                pass
             return out
     except Exception:
         pass
@@ -2811,6 +2931,12 @@ def _ultimo_contexto_operativo_bot(bot: str) -> dict:
                 out["racha_actual"] = float(last.get("racha_actual", 0.0) or 0.0)
                 out["es_rebote"] = float(last.get("es_rebote", 0.0) or 0.0)
                 out["activo"] = str(last.get("activo", "") or "").strip()
+                try:
+                    out["seg_payout"] = _bucket_tercil(float(last.get("payout", 0.0) or 0.0), 0.70, 0.82)
+                    out["seg_vol"] = _bucket_tercil(float(last.get("volatilidad", 0.0) or 0.0), 0.0008, 0.0018)
+                    out["seg_hora"] = _inferir_segmento_hora(float(last.get("hora_bucket", 0.5) or 0.5))
+                except Exception:
+                    pass
                 break
             except Exception:
                 continue
@@ -8250,6 +8376,15 @@ async def main():
                                         agregar_evento(
                                             f"🧯 Gate régimen: {b}/{activo_now or 'NA'} bloqueado "
                                             f"(WR{n_reg}={wr_reg*100:.1f}% < {GATE_ACTIVO_MIN_WR*100:.1f}%)."
+                                        )
+                                        continue
+
+                                    # 3) Gate por segmento (payout/vol/hora) para ejecutar donde hay más señal estable
+                                    ok_seg, wr_seg, n_seg, seg_key = _gate_segmento_ok(b, ctx)
+                                    if not ok_seg:
+                                        agregar_evento(
+                                            f"🧱 Gate segmento: {b}/{seg_key} bloqueado "
+                                            f"(WR{n_seg}={wr_seg*100:.1f}% < {GATE_SEGMENTO_MIN_WR*100:.1f}%)."
                                         )
                                         continue
 
