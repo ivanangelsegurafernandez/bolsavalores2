@@ -2128,15 +2128,27 @@ def calcular_es_rebote(row_dict):
         (cruce > 0 and fuerza > 0)
     )
 
-    return 1.0 if giro_flag else 0.0
+    if not giro_flag:
+        return 0.0
+
+    # Intensidad de rebote (evita booleano congelado):
+    # combina longitud de racha + fuerza de señales de giro en [0,1].
+    intensidad_racha = min(1.0, max(0.0, (abs(racha) - 3.0) / 6.0))
+    intensidad_giro = min(
+        1.0,
+        max(
+            0.0,
+            0.45 * min(1.0, rsi_rev) +
+            0.35 * min(1.0, breakout) +
+            0.20 * (1.0 if (cruce > 0 and fuerza > 0) else 0.0)
+        )
+    )
+    return max(0.0, min(1.0, 0.60 * intensidad_racha + 0.40 * intensidad_giro))
 
 def calcular_hora_bucket(row_dict):
     """
-    Devuelve un valor 0–1 según la hora del día:
-      0:  0–6   (madrugada)
-      1:  6–12  (mañana)
-      2:  12–18 (tarde)
-      3:  18–24 (noche)
+    Devuelve un valor 0–1 según la franja de 30 minutos del día
+    (48 buckets => más granular y evita columna constante).
 
     Si no se puede parsear la hora, devuelve 0.5 (neutral).
 
@@ -2156,16 +2168,11 @@ def calcular_hora_bucket(row_dict):
             pass
         return isinstance(v, str) and v.strip() == ""
 
-    def _bucket(hour: int):
-        if 0 <= hour < 6:
-            b = 0
-        elif 6 <= hour < 12:
-            b = 1
-        elif 12 <= hour < 18:
-            b = 2
-        else:
-            b = 3
-        return b / 3.0
+    def _bucket(hour: int, minute: int = 0):
+        h = int(max(0, min(23, hour)))
+        m = int(max(0, min(59, minute)))
+        idx_48 = (h * 2) + (1 if m >= 30 else 0)
+        return float(idx_48) / 47.0
 
     # 1) ts ISO con zona (mejor fuente)
     v = row_dict.get("ts", None)
@@ -2177,7 +2184,7 @@ def calcular_hora_bucket(row_dict):
                     dt = dt.tz_convert("America/Lima")
                 except Exception:
                     pass
-                return _bucket(int(dt.hour))
+                return _bucket(int(dt.hour), int(dt.minute))
         except Exception:
             pass
 
@@ -2198,7 +2205,7 @@ def calcular_hora_bucket(row_dict):
                         dt = dt.tz_convert("America/Lima")
                     except Exception:
                         pass
-                    return _bucket(int(dt.hour))
+                    return _bucket(int(dt.hour), int(dt.minute))
         except Exception:
             pass
 
@@ -2209,7 +2216,7 @@ def calcular_hora_bucket(row_dict):
             dt = pd.to_datetime(v, errors="coerce")  # naive
             if dt is not None and pd.notna(dt):
                 # asumimos que 'fecha' ya está en hora local Lima
-                return _bucket(int(dt.hour))
+                return _bucket(int(dt.hour), int(dt.minute))
         except Exception:
             pass
 
@@ -2221,11 +2228,71 @@ def calcular_hora_bucket(row_dict):
             if ":" in s:
                 h = int(s.split(":")[0])
                 if 0 <= h <= 23:
-                    return _bucket(h)
+                    mm = 0
+                    if len(s.split(":")) >= 2:
+                        try:
+                            mm = int(s.split(":")[1])
+                        except Exception:
+                            mm = 0
+                    return _bucket(h, mm)
         except Exception:
             pass
 
     return 0.5
+
+
+def enriquecer_features_evento(row_dict: dict):
+    """
+    Descongela features evento (booleanas raras) en escala 0..1.
+    Mantiene compatibilidad: reusa columnas existentes con intensidad.
+    """
+    d = dict(row_dict or {})
+
+    def _f(key, default=0.0):
+        try:
+            v = d.get(key, default)
+            if v in (None, ""):
+                return float(default)
+            return float(v)
+        except Exception:
+            return float(default)
+
+    sma5 = _f("sma_5", 0.0)
+    sma20 = _f("sma_20", 0.0)
+    base = max(abs(sma20), 1e-9)
+    spread = abs(sma5 - sma20) / base
+
+    # cruce_sma: intensidad de separación entre medias (no solo 0/1)
+    cruce_raw = _f("cruce_sma", 0.0)
+    cruce_int = min(1.0, spread / 0.0025)  # ~0.25% de separación -> 1.0
+    d["cruce_sma"] = float(max(0.0, min(1.0, 0.65 * cruce_int + 0.35 * (1.0 if cruce_raw >= 0.5 else 0.0))))
+
+    # breakout: intensidad apoyada por spread/volatilidad para evitar “siempre 1”
+    breakout_raw = _f("breakout", 0.0)
+    vol = _f("volatilidad", spread)
+    breakout_int = min(1.0, max(0.0, 0.55 * min(1.0, vol / 0.0025) + 0.45 * min(1.0, spread / 0.0030)))
+    d["breakout"] = float(max(0.0, min(1.0, 0.70 * (1.0 if breakout_raw >= 0.5 else 0.0) + 0.30 * breakout_int)))
+
+    # rsi_reversion: intensidad de extremo RSI (cercanía a <30 o >70)
+    rsi9 = _f("rsi_9", 50.0)
+    rsi14 = _f("rsi_14", 50.0)
+    low_ext = max(0.0, (30.0 - min(rsi9, rsi14)) / 30.0)
+    high_ext = max(0.0, (max(rsi9, rsi14) - 70.0) / 30.0)
+    rsi_rev_int = min(1.0, max(low_ext, high_ext))
+    d["rsi_reversion"] = float(max(0.0, min(1.0, rsi_rev_int)))
+
+    # es_rebote como intensidad (helper ya devuelve 0..1)
+    d["es_rebote"] = float(max(0.0, min(1.0, calcular_es_rebote(d))))
+
+    # puntaje_estrategia re-normalizado con señales enriquecidas
+    try:
+        pe = calcular_puntaje_estrategia_normalizado(d)
+        if pe is not None:
+            d["puntaje_estrategia"] = float(max(0.0, min(1.0, float(pe))))
+    except Exception:
+        pass
+
+    return d
 
 # === Nuevo: cálculo enriquecido de puntaje_estrategia normalizado (0–1) ===
 def calcular_puntaje_estrategia_normalizado(fila: dict) -> float:
@@ -2610,6 +2677,9 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
         if hb is None or not math.isfinite(float(hb)):
             return None, None
         row_dict_full["hora_bucket"] = float(hb)
+
+        # Enriquecer señales evento para evitar columnas booleanas congeladas
+        row_dict_full = enriquecer_features_evento(row_dict_full)
 
         er = _safe_float_local(row_dict_full.get("es_rebote"))
         if er is None:
@@ -3798,6 +3868,12 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
         row["hora_bucket"] = float(max(0.0, min(float(hb), 1.0)))
     except Exception:
         return None
+
+    # enriquecer señales evento (incluye es_rebote / cruce / breakout / rsi_reversion / puntaje)
+    try:
+        row = enriquecer_features_evento(row)
+    except Exception:
+        pass
 
     try:
         er = _safe_float(row.get("es_rebote"))
@@ -6022,8 +6098,10 @@ def _seleccionar_features_utiles_train(X_df: pd.DataFrame, feats: list[str]):
             vc = s.value_counts(dropna=False)
             top_ratio = (float(vc.iloc[0]) / float(n)) if len(vc) else 1.0
             nun = int(s.nunique(dropna=False))
-            if nun <= 1 or ((nun <= 2) and top_ratio >= 0.985):
-                dropped.append((c, f"quasi_constant({top_ratio:.3f})"))
+            if nun <= 1:
+                dropped.append((c, f"ROTA:nunique={nun}"))
+            elif top_ratio > 0.97:
+                dropped.append((c, f"CASI_CONSTANTE:dom={top_ratio:.3f}"))
             else:
                 keep.append(c)
 
@@ -6039,13 +6117,38 @@ def _seleccionar_features_utiles_train(X_df: pd.DataFrame, feats: list[str]):
             except Exception:
                 pass
 
-        if len(keep) < 6:
+        if len(keep) < 1:
             keep = list(feats)
             dropped = []
 
         return X[keep].copy(), list(keep), dropped
     except Exception:
         return X_df, list(feats), []
+
+
+def _auditar_salud_features(X_df: pd.DataFrame, feats: list[str]):
+    """Audita variación/dominancia por feature para decidir si entrena o se congela."""
+    out = {}
+    try:
+        n = max(1, len(X_df))
+        for c in feats:
+            if c not in X_df.columns:
+                out[c] = {"nunique": 0, "dominance": 1.0, "status": "MISSING"}
+                continue
+            s = pd.to_numeric(X_df[c], errors="coerce").fillna(0.0)
+            nun = int(s.nunique(dropna=False))
+            vc = s.value_counts(dropna=False)
+            dom = (float(vc.iloc[0]) / float(n)) if len(vc) else 1.0
+            if nun <= 1:
+                status = "ROTA"
+            elif dom > 0.97:
+                status = "CASI_CONSTANTE"
+            else:
+                status = "OK"
+            out[c] = {"nunique": nun, "dominance": float(dom), "status": status}
+    except Exception:
+        return {}
+    return out
 
 
 def maybe_retrain(force: bool = False):
@@ -6126,12 +6229,24 @@ def maybe_retrain(force: bool = False):
         if X is None or y is None or feats_used is None:
             return False
 
-        # 4.1) Reducir features casi constantes/redundantes para subir eficiencia real
+        # 4.1) Auditoría de salud (variación + dominancia) y descarte temporal
+        health_before = _auditar_salud_features(X, feats_used)
+
+        # 4.2) Reducir features casi constantes/redundantes para subir eficiencia real
         X, feats_used, dropped_feats = _seleccionar_features_utiles_train(X, feats_used)
         if dropped_feats:
             try:
                 txt = ", ".join([f"{k}:{r}" for k, r in dropped_feats[:8]])
                 agregar_evento(f"🧪 IA: features filtradas pre-fit ({len(dropped_feats)}): {txt}")
+            except Exception:
+                pass
+
+        # 4.3) Modo temporal de simplificación: si casi todo está roto, entrenar solo con racha_actual
+        if ("racha_actual" in X.columns) and (len(feats_used) <= 2):
+            X = X[["racha_actual"]].copy()
+            feats_used = ["racha_actual"]
+            try:
+                agregar_evento("🧩 IA: modo simplificado activo (solo racha_actual) hasta reparar pipeline.")
             except Exception:
                 pass
 
@@ -6406,6 +6521,8 @@ def maybe_retrain(force: bool = False):
             "calibration": str(calib_kind),
             "feature_names": list(feats_used),
             "label_col": str(label_col),
+            "feature_health": health_before,
+            "dropped_features": [{"feature": k, "reason": r} for k, r in dropped_feats],
         }
 
         ok_save = False
@@ -7497,6 +7614,9 @@ def backfill_incremental(ultimas=500):
                 fila["payout"] = float(pay)
                 row_dict_full["payout"] = float(pay)
 
+                # Enriquecer señales evento antes de extraer features finales
+                row_dict_full = enriquecer_features_evento(row_dict_full)
+
                 # ==========================
                 # puntaje_estrategia normalizado 0–1
                 # ==========================
@@ -7524,7 +7644,7 @@ def backfill_incremental(ultimas=500):
                 # ==========================
                 # nuevas features: rebote y hora (0–1)
                 # ==========================
-                fila["es_rebote"]   = calcular_es_rebote(row_dict_full)
+                fila["es_rebote"]   = float(max(0.0, min(1.0, _safe_float_local(row_dict_full.get("es_rebote")) or calcular_es_rebote(row_dict_full))))
                 fila["hora_bucket"] = calcular_hora_bucket(row_dict_full)
 
                 # ==========================
