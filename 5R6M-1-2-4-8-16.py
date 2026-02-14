@@ -271,6 +271,16 @@ FEATURE_NAMES_INTERACCIONES = [
     "racha_x_rebote",
     "rev_x_breakout",
 ]
+
+# Gobernanza calidad>cantidad: entrenar solo con features que realmente aporten.
+FEATURE_ALWAYS_KEEP = ["racha_actual"]
+FEATURE_MAX_PROD = 4
+FEATURE_MIN_AUC_DELTA = 0.015      # aporte mínimo (|AUC_uni - 0.5|)
+FEATURE_MAX_DOMINANCE_GATE = 0.965 # evita casi-constantes
+FEATURE_DYNAMIC_SELECTION = True
+
+FEATURE_NAMES_PROD = list(FEATURE_ALWAYS_KEEP)
+FEATURE_NAMES_SHADOW = [f for f in FEATURE_NAMES_CORE_13 if f not in FEATURE_NAMES_PROD]
 FEATURE_NAMES_DEFAULT = list(FEATURE_NAMES_CORE_13)
 
 class ModeloXGBCalibrado:
@@ -6322,6 +6332,78 @@ def _seleccionar_features_utiles_train(X_df: pd.DataFrame, feats: list[str]):
         return X_df, list(feats), []
 
 
+def _seleccionar_features_calidad(X_df: pd.DataFrame, y_arr: np.ndarray, feats: list[str]):
+    """
+    Selección calidad-first:
+    - Conserva siempre FEATURE_ALWAYS_KEEP si existen.
+    - Evalúa cada feature por dominancia + AUC univariado (ranking robusto).
+    - Limita el set productivo para reducir ruido y sobreajuste.
+    """
+    try:
+        if X_df is None or X_df.empty:
+            return list(feats), []
+
+        y = np.asarray(y_arr).astype(int)
+        selected = []
+        report = []
+        scored = []
+
+        for c in feats:
+            if c not in X_df.columns:
+                report.append((c, "missing"))
+                continue
+
+            s = pd.to_numeric(X_df[c], errors="coerce").fillna(0.0)
+            nun = int(s.nunique(dropna=False))
+            vc = s.value_counts(dropna=False)
+            dom = float(vc.iloc[0]) / float(max(1, len(s))) if len(vc) else 1.0
+
+            auc_uni = 0.5
+            auc_delta = 0.0
+            ok_auc = False
+            try:
+                if nun > 1 and len(np.unique(y)) == 2:
+                    auc_uni = float(roc_auc_score(y, s.values))
+                    auc_uni = max(min(auc_uni, 1.0), 0.0)
+                    auc_delta = abs(auc_uni - 0.5)
+                    ok_auc = True
+            except Exception:
+                pass
+
+            if c in FEATURE_ALWAYS_KEEP:
+                selected.append(c)
+                report.append((c, f"KEEP_CORE dom={dom:.3f} auc={auc_uni:.4f}"))
+                continue
+
+            if nun <= 1:
+                report.append((c, f"DROP nunique={nun}"))
+                continue
+            if dom > float(FEATURE_MAX_DOMINANCE_GATE):
+                report.append((c, f"DROP dom={dom:.3f}"))
+                continue
+
+            if ok_auc and auc_delta >= float(FEATURE_MIN_AUC_DELTA):
+                scored.append((auc_delta, c, dom, auc_uni))
+            else:
+                report.append((c, f"SHADOW auc_delta={auc_delta:.4f} dom={dom:.3f}"))
+
+        scored.sort(reverse=True, key=lambda t: t[0])
+        max_extra = max(0, int(FEATURE_MAX_PROD) - len(selected))
+        for auc_delta, c, dom, auc_uni in scored[:max_extra]:
+            selected.append(c)
+            report.append((c, f"KEEP auc_delta={auc_delta:.4f} dom={dom:.3f} auc={auc_uni:.4f}"))
+
+        if not selected:
+            fallback = [f for f in FEATURE_ALWAYS_KEEP if f in X_df.columns]
+            if not fallback and feats:
+                fallback = [feats[0]]
+            selected = fallback
+
+        return selected, report
+    except Exception:
+        return list(feats), []
+
+
 def _auditar_salud_features(X_df: pd.DataFrame, feats: list[str]):
     """Audita variación/dominancia por feature para decidir si entrena o se congela."""
     out = {}
@@ -6433,10 +6515,30 @@ def maybe_retrain(force: bool = False):
             except Exception:
                 pass
 
-        # 4.3) Modo temporal de simplificación: si casi todo está roto, entrenar solo con racha_actual
+        # 4.3) Selección dinámica de calidad (features_prod vs shadow)
+        if FEATURE_DYNAMIC_SELECTION:
+            try:
+                feats_quality, quality_report = _seleccionar_features_calidad(X, y, feats_used)
+                feats_quality = [c for c in feats_quality if c in X.columns]
+                if feats_quality:
+                    X = X[feats_quality].copy()
+                    feats_used = list(feats_quality)
+
+                    globals()["FEATURE_NAMES_PROD"] = list(feats_used)
+                    globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f not in feats_used]
+
+                    if quality_report:
+                        txt = ", ".join([f"{k}:{r}" for k, r in quality_report[:8]])
+                        agregar_evento(f"🎯 IA quality-gate: prod={feats_used} | {txt}")
+            except Exception:
+                pass
+
+        # 4.4) Modo temporal de simplificación: si casi todo está roto, entrenar solo con racha_actual
         if ("racha_actual" in X.columns) and (len(feats_used) <= 2):
             X = X[["racha_actual"]].copy()
             feats_used = ["racha_actual"]
+            globals()["FEATURE_NAMES_PROD"] = ["racha_actual"]
+            globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f != "racha_actual"]
             try:
                 agregar_evento("🧩 IA: modo simplificado activo (solo racha_actual) hasta reparar pipeline.")
             except Exception:
