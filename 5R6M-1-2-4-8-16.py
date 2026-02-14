@@ -236,6 +236,7 @@ MIN_IA_SENIALES_CONF = 10  # Mínimo señales cerradas para confiar en prob_hist
 MIN_AUC_CONF = 0.65        # AUC mínimo para audios/colores verdes
 MAX_CLASS_IMBALANCE = 0.8  # Máx proporción pos/neg para entrenar (evita 99% wins)
 AUC_DROP_TOL = 0.05        # Tolerancia para no machacar modelo si AUC baja
+FEATURE_MAX_DOMINANCE = 0.90  # Si una feature repite >90%, se considera casi constante
 
 # Semáforo de calibración (lectura rápida PredMedia/Real/Inflación/n)
 SEM_CAL_N_ROJO = 30
@@ -270,7 +271,7 @@ FEATURE_NAMES_INTERACCIONES = [
     "racha_x_rebote",
     "rev_x_breakout",
 ]
-FEATURE_NAMES_DEFAULT = list(FEATURE_NAMES_CORE_13) + list(FEATURE_NAMES_INTERACCIONES)
+FEATURE_NAMES_DEFAULT = list(FEATURE_NAMES_CORE_13)
 
 class ModeloXGBCalibrado:
     """
@@ -2150,20 +2151,8 @@ def calcular_es_rebote(row_dict):
     )
     return max(0.0, min(1.0, 0.60 * intensidad_racha + 0.40 * intensidad_giro))
 
-def calcular_hora_bucket(row_dict):
-    """
-    Devuelve un valor 0–1 según la franja de 30 minutos del día
-    (48 buckets => más granular y evita columna constante).
-
-    Si no se puede parsear la hora, devuelve 0.0 y se debe acompañar
-    con `hora_missing=1.0` (ver helper `calcular_hora_features`).
-
-    Claves soportadas (prioridad):
-      - ts (ISO con TZ, ej: "2025-12-05T09:24:04.531328+00:00")  -> se convierte a America/Lima
-      - epoch / timestamp (segundos o ms)                         -> se convierte a America/Lima
-      - fecha (local, ej: "2025-12-05 04:24:04")                  -> se asume America/Lima (sin utc=True)
-      - hora  (ej: "14:58" / "14:58:25")
-    """
+def _parse_hora_bucket(row_dict) -> tuple[float, bool]:
+    """Parsea hora y devuelve (bucket_0_1, parseado_ok)."""
     def _missing(v):
         if v is None:
             return True
@@ -2180,8 +2169,7 @@ def calcular_hora_bucket(row_dict):
         idx_48 = (h * 2) + (1 if m >= 30 else 0)
         return float(idx_48) / 47.0
 
-    # 1) ts ISO con zona (mejor fuente)
-    v = row_dict.get("ts", None)
+    v = (row_dict or {}).get("ts", None)
     if not _missing(v) and isinstance(v, str):
         try:
             dt = pd.to_datetime(v, utc=True, errors="coerce")
@@ -2190,17 +2178,15 @@ def calcular_hora_bucket(row_dict):
                     dt = dt.tz_convert("America/Lima")
                 except Exception:
                     pass
-                return _bucket(int(dt.hour), int(dt.minute))
+                return _bucket(int(dt.hour), int(dt.minute)), True
         except Exception:
             pass
 
-    # 2) epoch/timestamp numérico o string numérico
     for k in ("epoch", "timestamp"):
-        v = row_dict.get(k, None)
+        v = (row_dict or {}).get(k, None)
         if _missing(v):
             continue
         try:
-            # aceptar "1764926644" (string)
             val = float(v)
             if val > 1e12:
                 val = val / 1000.0
@@ -2211,23 +2197,20 @@ def calcular_hora_bucket(row_dict):
                         dt = dt.tz_convert("America/Lima")
                     except Exception:
                         pass
-                    return _bucket(int(dt.hour), int(dt.minute))
+                    return _bucket(int(dt.hour), int(dt.minute)), True
         except Exception:
             pass
 
-    # 3) fecha local (NO utc=True)
-    v = row_dict.get("fecha", None)
+    v = (row_dict or {}).get("fecha", None)
     if not _missing(v) and isinstance(v, str):
         try:
-            dt = pd.to_datetime(v, errors="coerce")  # naive
+            dt = pd.to_datetime(v, errors="coerce")
             if dt is not None and pd.notna(dt):
-                # asumimos que 'fecha' ya está en hora local Lima
-                return _bucket(int(dt.hour), int(dt.minute))
+                return _bucket(int(dt.hour), int(dt.minute)), True
         except Exception:
             pass
 
-    # 4) hora "HH:MM[:SS]"
-    v = row_dict.get("hora", None)
+    v = (row_dict or {}).get("hora", None)
     if not _missing(v) and isinstance(v, str):
         try:
             s = v.strip()
@@ -2240,11 +2223,17 @@ def calcular_hora_bucket(row_dict):
                             mm = int(s.split(":")[1])
                         except Exception:
                             mm = 0
-                    return _bucket(h, mm)
+                    return _bucket(h, mm), True
         except Exception:
             pass
 
-    return 0.0
+    return 0.0, False
+
+
+def calcular_hora_bucket(row_dict):
+    """Devuelve bucket horario normalizado 0..1 (fallback 0.0)."""
+    hb, _ok = _parse_hora_bucket(row_dict)
+    return float(hb)
 
 
 def calcular_hora_features(row_dict: dict) -> tuple[float, float]:
@@ -2253,18 +2242,13 @@ def calcular_hora_features(row_dict: dict) -> tuple[float, float]:
       - hora_bucket: 0..1 SOLO cuando hay timestamp/hora parseable.
       - hora_missing: 1.0 cuando falta hora parseable, 0.0 en caso contrario.
     """
-    hb = calcular_hora_bucket(row_dict)
+    hb, parsed_ok = _parse_hora_bucket(row_dict)
     try:
         hb = float(hb)
     except Exception:
         hb = 0.0
     hb = float(max(0.0, min(1.0, hb)))
-    # Si no hay claves temporales útiles y hb está en fallback -> missing
-    has_any_time = any(
-        str((row_dict or {}).get(k, "") or "").strip() != ""
-        for k in ("ts", "epoch", "timestamp", "fecha", "hora")
-    )
-    hm = 0.0 if has_any_time else 1.0
+    hm = 0.0 if bool(parsed_ok) else 1.0
     return hb, hm
 
 
@@ -6292,7 +6276,7 @@ def _seleccionar_features_utiles_train(X_df: pd.DataFrame, feats: list[str]):
             nun = int(s.nunique(dropna=False))
             if nun <= 1:
                 dropped.append((c, f"ROTA:nunique={nun}"))
-            elif top_ratio > 0.97:
+            elif top_ratio > float(FEATURE_MAX_DOMINANCE):
                 dropped.append((c, f"CASI_CONSTANTE:dom={top_ratio:.3f}"))
             else:
                 keep.append(c)
@@ -6333,7 +6317,7 @@ def _auditar_salud_features(X_df: pd.DataFrame, feats: list[str]):
             dom = (float(vc.iloc[0]) / float(n)) if len(vc) else 1.0
             if nun <= 1:
                 status = "ROTA"
-            elif dom > 0.97:
+            elif dom > float(FEATURE_MAX_DOMINANCE):
                 status = "CASI_CONSTANTE"
             else:
                 status = "OK"
@@ -6411,11 +6395,7 @@ def maybe_retrain(force: bool = False):
             return False
 
         # 4) Construir X/y robusto (usa tus builders)
-        feats_pref = None
-        try:
-            feats_pref = list(FEATURES) if FEATURES else None
-        except Exception:
-            feats_pref = None
+        feats_pref = list(INCREMENTAL_FEATURES_V2)
 
         X, y, feats_used, label_col = _build_Xy_incremental(df, feature_names=feats_pref)
         if X is None or y is None or feats_used is None:
