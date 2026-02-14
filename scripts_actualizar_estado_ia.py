@@ -2,7 +2,8 @@
 import csv
 import json
 import math
-from collections import defaultdict
+import glob
+from collections import defaultdict, Counter
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -240,7 +241,182 @@ def per_bot_signal_table(closed_rows):
     return sorted(out, key=lambda x: x['priority_score'], reverse=True)
 
 
-def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signal_rows, model_meta):
+
+
+def _safe_float(v, default=0.0):
+    try:
+        if v is None:
+            return default
+        t = str(v).strip()
+        if t == '':
+            return default
+        return float(t)
+    except Exception:
+        return default
+
+
+def _auc_rank(scores, labels):
+    n = len(scores)
+    if n <= 1:
+        return 0.5
+    n1 = sum(1 for y in labels if y == 1)
+    n0 = n - n1
+    if n0 == 0 or n1 == 0:
+        return 0.5
+
+    order = sorted(range(n), key=lambda i: scores[i])
+    ranks = [0.0] * n
+    i = 0
+    rank = 1.0
+    while i < n:
+        j = i
+        while j + 1 < n and scores[order[j + 1]] == scores[order[i]]:
+            j += 1
+        avg = (rank + (rank + (j - i))) / 2.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        rank += (j - i + 1)
+        i = j + 1
+
+    s1 = sum(ranks[i] for i, y in enumerate(labels) if y == 1)
+    auc = (s1 - n1 * (n1 + 1) / 2.0) / (n0 * n1)
+    return max(auc, 1.0 - auc)
+
+
+def read_feature_diagnostics():
+    feats = [
+        'rsi_9','rsi_14','sma_5','sma_20','cruce_sma','breakout',
+        'rsi_reversion','racha_actual','payout','puntaje_estrategia',
+        'volatilidad','es_rebote','hora_bucket',
+    ]
+
+    rows = []
+    for path in sorted(glob.glob(str(ROOT / 'registro_enriquecido_fulll*.csv'))):
+        fh = None
+        reader = None
+        for enc in ('utf-8', 'latin-1', 'windows-1252'):
+            try:
+                fh = open(path, encoding=enc, newline='')
+                reader = csv.DictReader(fh)
+                break
+            except Exception:
+                reader = None
+                if fh is not None:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+                    fh = None
+                continue
+
+        if reader is None:
+            continue
+
+        try:
+            for row in reader:
+                y_raw = (row.get('result_bin') or '').strip()
+                if y_raw not in ('0', '1'):
+                    continue
+
+                payout = None
+                p_raw = row.get('payout')
+                if p_raw not in (None, ''):
+                    p = _safe_float(p_raw, None)
+                    if p is not None:
+                        if p <= 1.5:
+                            payout = max(0.0, min(1.5, p))
+                        elif p <= 3.5:
+                            payout = max(0.0, min(1.5, p - 1.0))
+                if payout is None:
+                    pm = _safe_float(row.get('payout_multiplier'), 0.0)
+                    payout = max(0.0, min(1.5, pm - 1.0)) if pm > 0 else 0.0
+
+                sma5 = _safe_float(row.get('sma_5'), 0.0)
+                sma20 = _safe_float(row.get('sma_20'), 0.0)
+
+                vol = _safe_float(row.get('volatilidad'), None)
+                if vol is None:
+                    base = abs(sma20) if abs(sma20) > 1e-9 else 1.0
+                    vol = abs(sma5 - sma20) / base
+                vol = max(0.0, min(1.0, float(vol)))
+
+                hb = _safe_float(row.get('hora_bucket'), None)
+                if hb is None:
+                    ts_raw = (row.get('ts') or '').strip()
+                    if ts_raw:
+                        try:
+                            dt = datetime.fromisoformat(ts_raw.replace('Z', '+00:00'))
+                            h = dt.hour
+                            b = 0 if h < 6 else (1 if h < 12 else (2 if h < 18 else 3))
+                            hb = b / 3.0
+                        except Exception:
+                            hb = 0.5
+                    else:
+                        hb = 0.5
+
+                vals = {
+                    'rsi_9': _safe_float(row.get('rsi_9'), 0.0),
+                    'rsi_14': _safe_float(row.get('rsi_14'), 0.0),
+                    'sma_5': sma5,
+                    'sma_20': sma20,
+                    'cruce_sma': _safe_float(row.get('cruce_sma'), 0.0),
+                    'breakout': _safe_float(row.get('breakout'), 0.0),
+                    'rsi_reversion': _safe_float(row.get('rsi_reversion'), 0.0),
+                    'racha_actual': _safe_float(row.get('racha_actual'), 0.0),
+                    'payout': payout,
+                    'puntaje_estrategia': _safe_float(row.get('puntaje_estrategia'), 0.0),
+                    'volatilidad': vol,
+                    'es_rebote': _safe_float(row.get('es_rebote'), 0.0),
+                    'hora_bucket': float(hb),
+                    'y': int(y_raw),
+                }
+                rows.append(vals)
+        except Exception:
+            continue
+        finally:
+            try:
+                if fh is not None:
+                    fh.close()
+            except Exception:
+                pass
+
+    if not rows:
+        return {'rows': 0, 'features': []}
+
+    ys = [r['y'] for r in rows]
+    y_mean = sum(ys) / len(ys)
+    y_var = sum((y - y_mean) ** 2 for y in ys)
+
+    out = []
+    for f in feats:
+        xs = [r[f] for r in rows]
+        x_mean = sum(xs) / len(xs)
+        x_var = sum((x - x_mean) ** 2 for x in xs)
+        num = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+        den = (x_var * y_var) ** 0.5
+        corr = (num / den) if den else 0.0
+
+        c = Counter(xs)
+        top_ratio = (c.most_common(1)[0][1] / len(xs)) if c else 1.0
+        auc = _auc_rank(xs, ys)
+        strength = 'fuerte' if auc >= 0.57 else ('media' if auc >= 0.53 else 'débil')
+
+        out.append({
+            'feature': f,
+            'auc': auc,
+            'corr': corr,
+            'top_ratio': top_ratio,
+            'unique_values': len(c),
+            'strength': strength,
+        })
+
+    out.sort(key=lambda r: r['auc'], reverse=True)
+    weak = [r for r in out if r['strength'] == 'débil' and r['top_ratio'] >= 0.90]
+
+    return {'rows': len(rows), 'features': out, 'weak_high_constant': weak}
+
+
+def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signal_rows, model_meta, feat_diag):
     recs = []
 
     if real_rate < TARGET:
@@ -291,6 +467,14 @@ def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signa
             "Monitorear semanalmente ECE/Brier y recalibrar más frecuente que reentrenar base."
         )
 
+    weak = (feat_diag or {}).get('weak_high_constant', [])
+    if weak:
+        names = ', '.join(r['feature'] for r in weak[:6])
+        recs.append(
+            f"Variables con señal débil + alta constancia detectadas: {names}. "
+            "Reingenierizar umbrales/estados para que no queden casi constantes."
+        )
+
     return recs
 
 
@@ -302,6 +486,7 @@ def main():
     calib_rows = calibration_bins(ia_closed_rows)
     bot_signal_rows = per_bot_signal_table(ia_closed_rows)
     model_meta = read_model_meta()
+    feat_diag = read_feature_diagnostics()
 
     closed_total = sum(r['closed'] for r in bot_stats)
     wins_total = sum(r['wins'] for r in bot_stats)
@@ -335,7 +520,7 @@ def main():
         for row in bot_signal_rows:
             w.writerow(row)
 
-    recs = build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signal_rows, model_meta)
+    recs = build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signal_rows, model_meta, feat_diag)
 
     md = []
     md.append('# Estado IA y avance al objetivo\n')
@@ -386,6 +571,23 @@ def main():
             f"| {r['threshold']:.0%} | {r['n']} | {r['hit_rate']:.2%} | "
             f"[{r['wilson_low']:.2%},{r['wilson_high']:.2%}] | {'✅' if r['enough_sample'] else '⚠️'} |"
         )
+
+
+    md.append('')
+    md.append('## Diagnóstico rápido de las 13 variables (cierres reales)')
+    rows_diag = int((feat_diag or {}).get('rows', 0) or 0)
+    md.append(f'- Muestra usada: {rows_diag} filas cerradas con `result_bin`.')
+    md.append('| Feature | AUC univariado | Corr(y) | % valor dominante | Únicos | Señal |')
+    md.append('|---|---:|---:|---:|---:|:---:|')
+    for r in (feat_diag or {}).get('features', []):
+        md.append(
+            f"| {r['feature']} | {r['auc']:.4f} | {r['corr']:+.4f} | {r['top_ratio']:.2%} | {r['unique_values']} | {r['strength']} |"
+        )
+
+    weak = (feat_diag or {}).get('weak_high_constant', [])
+    if weak:
+        md.append('')
+        md.append('**Variables candidatas a reingeniería (señal débil + constancia alta):** ' + ', '.join(w['feature'] for w in weak[:10]))
 
     (ROOT / 'status_objetivo_ia.md').write_text('\n'.join(md) + '\n', encoding='utf-8')
     print('Archivos actualizados: status_objetivo_ia.csv, status_objetivo_ia_thresholds.csv, status_objetivo_ia_bins.csv, status_objetivo_ia_por_bot.csv, status_objetivo_ia.md')
