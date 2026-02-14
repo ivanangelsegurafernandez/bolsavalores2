@@ -164,6 +164,9 @@ GATE_PERMITE_REBOTE_EN_NEG = True    # permitir excepción si hay rebote confirm
 GATE_ACTIVO_MIN_MUESTRA = 40         # mínimo de cierres por activo para evaluar régimen
 GATE_ACTIVO_MIN_WR = 0.48            # si WR reciente por activo cae debajo, bloquear temporalmente
 GATE_ACTIVO_LOOKBACK = 180           # cierres recientes por bot para estimar régimen
+GATE_RACHA_NEG_MIN_MUESTRA = 25      # muestra mínima para permitir contrarian en racha negativa
+GATE_RACHA_NEG_MIN_WR = 0.52         # si racha<=-2 tiene WR >= este nivel, se permite
+GATE_RSI_REV_MIN_NEG = 0.70          # si RSI reversión es fuerte, se permite excepción
 
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
 AUDIO_IA53_THR = 0.75
@@ -2716,13 +2719,15 @@ _GATE_ACTIVO_CACHE = {}
 
 def _ultimo_contexto_operativo_bot(bot: str) -> dict:
     """Lee contexto reciente (racha/es_rebote/activo) para gate de calidad por señal."""
-    out = {"racha_actual": 0.0, "es_rebote": 0.0, "activo": ""}
+    out = {"racha_actual": 0.0, "es_rebote": 0.0, "activo": "", "rsi_reversion": 0.0, "breakout": 0.0}
     try:
         row = leer_ultima_fila_features_para_pred(bot)
         if isinstance(row, dict):
             out["racha_actual"] = float(row.get("racha_actual", 0.0) or 0.0)
             out["es_rebote"] = float(row.get("es_rebote", 0.0) or 0.0)
             out["activo"] = str(row.get("activo", "") or "").strip()
+            out["rsi_reversion"] = float(row.get("rsi_reversion", 0.0) or 0.0)
+            out["breakout"] = float(row.get("breakout", 0.0) or 0.0)
             return out
     except Exception:
         pass
@@ -2741,6 +2746,8 @@ def _ultimo_contexto_operativo_bot(bot: str) -> dict:
                 out["racha_actual"] = float(last.get("racha_actual", 0.0) or 0.0)
                 out["es_rebote"] = float(last.get("es_rebote", 0.0) or 0.0)
                 out["activo"] = str(last.get("activo", "") or "").strip()
+                out["rsi_reversion"] = float(last.get("rsi_reversion", 0.0) or 0.0)
+                out["breakout"] = float(last.get("breakout", 0.0) or 0.0)
                 break
             except Exception:
                 continue
@@ -2799,6 +2806,71 @@ def _gate_regimen_activo_ok(bot: str, activo: str = "", ttl_s: float = 45.0):
         return ok, wr, n
     except Exception:
         return True, 0.5, 0
+
+
+def _gate_racha_contextual_ok(bot: str, activo: str, racha_now: float, rebote_now: float, rsi_rev_now: float, breakout_now: float, ttl_s: float = 45.0):
+    """
+    Gate de calidad por racha:
+    - si racha > umbral negativo: OK
+    - si hay rebote/reversión fuerte: excepción OK
+    - si no, valida si ese activo/bot en racha negativa reciente realmente gana (contrarian válido)
+    """
+    try:
+        if float(racha_now) > float(GATE_RACHA_NEG_BLOQUEO):
+            return True, "racha_ok"
+
+        if float(rebote_now) >= 0.5:
+            return True, "excepcion_rebote"
+
+        if float(rsi_rev_now) >= float(GATE_RSI_REV_MIN_NEG) and float(breakout_now) >= 0.5:
+            return True, "excepcion_rsi_rev"
+
+        now = time.time()
+        key = f"negctx|{bot}|{activo or '*'}"
+        c = _GATE_ACTIVO_CACHE.get(key)
+        if c and (now - float(c.get("ts", 0.0))) <= float(ttl_s):
+            ok = bool(c.get("ok", False))
+            wr = float(c.get("wr", 0.0))
+            n = int(c.get("n", 0))
+            return ok, f"hist_neg_wr={wr:.3f},n={n}"
+
+        ruta = f"registro_enriquecido_{bot}.csv"
+        if not os.path.exists(ruta):
+            return False, "sin_historial"
+
+        df = None
+        for enc in ("utf-8", "latin-1", "windows-1252"):
+            try:
+                df = pd.read_csv(ruta, encoding=enc, on_bad_lines="skip")
+                break
+            except Exception:
+                continue
+        if df is None or df.empty or ("result_bin" not in df.columns):
+            return False, "hist_invalido"
+
+        d = df.copy()
+        if "trade_status" in d.columns:
+            d = d[d["trade_status"].astype(str).str.upper().eq("CERRADO")]
+        d["result_bin"] = pd.to_numeric(d["result_bin"], errors="coerce")
+        d["racha_actual"] = pd.to_numeric(d.get("racha_actual"), errors="coerce")
+        d = d[d["result_bin"].isin([0, 1]) & d["racha_actual"].notna()]
+
+        if activo and "activo" in d.columns:
+            d = d[d["activo"].astype(str).eq(str(activo))]
+
+        if int(GATE_ACTIVO_LOOKBACK) > 0 and len(d) > int(GATE_ACTIVO_LOOKBACK):
+            d = d.tail(int(GATE_ACTIVO_LOOKBACK))
+
+        dneg = d[d["racha_actual"] <= float(GATE_RACHA_NEG_BLOQUEO)]
+        n = int(len(dneg))
+        wr = float(dneg["result_bin"].mean()) if n > 0 else 0.0
+
+        ok = (n >= int(GATE_RACHA_NEG_MIN_MUESTRA)) and (wr >= float(GATE_RACHA_NEG_MIN_WR))
+        _GATE_ACTIVO_CACHE[key] = {"ts": now, "ok": ok, "wr": wr, "n": n}
+
+        return ok, f"hist_neg_wr={wr:.3f},n={n}"
+    except Exception:
+        return False, "error_gate_racha"
 
 
 def _leer_base_rate_y_n70(ttl_s: float = 30.0):
@@ -6118,9 +6190,13 @@ def maybe_retrain(force: bool = False):
         # 4) Construir X/y robusto (usa tus builders)
         feats_pref = None
         try:
-            feats_pref = list(FEATURES) if FEATURES else None
+            base_feats = list(FEATURES) if FEATURES else []
+            # Corrección: forzar que el reentreno considere también interacciones dirigidas por defecto,
+            # aunque el incremental haya sido creado originalmente con solo 13 columnas.
+            merged = list(dict.fromkeys(base_feats + list(FEATURE_NAMES_DEFAULT)))
+            feats_pref = merged if merged else None
         except Exception:
-            feats_pref = None
+            feats_pref = list(FEATURE_NAMES_DEFAULT)
 
         X, y, feats_used, label_col = _build_Xy_incremental(df, feature_names=feats_pref)
         if X is None or y is None or feats_used is None:
@@ -8117,14 +8193,23 @@ async def main():
 
                                     # 1) Gate de calidad por racha/rebote (priorizar precisión real)
                                     ctx = _ultimo_contexto_operativo_bot(b)
+                                    activo_now = str(ctx.get("activo", "") or "").strip()
                                     racha_now = float(ctx.get("racha_actual", 0.0) or 0.0)
                                     rebote_now = float(ctx.get("es_rebote", 0.0) or 0.0)
-                                    if racha_now <= float(GATE_RACHA_NEG_BLOQUEO):
-                                        if not (bool(GATE_PERMITE_REBOTE_EN_NEG) and rebote_now >= 0.5):
-                                            continue
+                                    rsi_rev_now = float(ctx.get("rsi_reversion", 0.0) or 0.0)
+                                    breakout_now = float(ctx.get("breakout", 0.0) or 0.0)
+
+                                    ok_racha, motivo_racha = _gate_racha_contextual_ok(
+                                        b, activo_now, racha_now, rebote_now, rsi_rev_now, breakout_now
+                                    )
+                                    if not ok_racha:
+                                        agregar_evento(
+                                            f"⛔ Gate racha: {b}/{activo_now or 'NA'} bloqueado "
+                                            f"(racha={racha_now:.0f}, {motivo_racha})."
+                                        )
+                                        continue
 
                                     # 2) Validación por régimen/activo (evita mezclar HZ con mal tramo reciente)
-                                    activo_now = str(ctx.get("activo", "") or "").strip()
                                     ok_reg, wr_reg, n_reg = _gate_regimen_activo_ok(b, activo=activo_now)
                                     if not ok_reg:
                                         agregar_evento(
