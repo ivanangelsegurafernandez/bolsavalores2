@@ -260,7 +260,7 @@ MIN_CALIB_ROWS = 80
 # Feature set CORE (13) — estable y sin mutaciones
 # ============================================================
 FEATURE_NAMES_CORE_13 = [
-    "rsi_9","rsi_14","sma_5","sma_20","cruce_sma","breakout",
+    "rsi_9","rsi_14","sma_5","sma_spread","cruce_sma","breakout",
     "rsi_reversion","racha_actual","payout","puntaje_estrategia",
     "volatilidad","es_rebote","hora_bucket",
 ]
@@ -689,7 +689,7 @@ try:
     INCREMENTAL_FEATURES_V2 = list(FEATURE_NAMES_CORE_13)
 except Exception:
     INCREMENTAL_FEATURES_V2 = [
-        "rsi_9","rsi_14","sma_5","sma_20","cruce_sma","breakout",
+        "rsi_9","rsi_14","sma_5","sma_spread","cruce_sma","breakout",
         "rsi_reversion","racha_actual","payout","puntaje_estrategia",
         "volatilidad","es_rebote","hora_bucket",
     ]
@@ -2737,9 +2737,18 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
         pe = max(0.0, min(pe, 1.0))
         row_dict_full["puntaje_estrategia"] = pe
 
+        try:
+            sma5 = _safe_float_local(row_dict_full.get("sma_5"))
+            sma20 = _safe_float_local(row_dict_full.get("sma_20"))
+            if sma5 is not None and sma20 is not None:
+                base = max(abs(float(sma20)), 1e-9)
+                row_dict_full["sma_spread"] = float(max(0.0, min(abs(float(sma5) - float(sma20)) / base, 5.0)))
+        except Exception:
+            pass
+
         # 8) Features requeridas (13 core, estricto)
         required = [
-            "rsi_9","rsi_14","sma_5","sma_20","cruce_sma","breakout",
+            "rsi_9","rsi_14","sma_5","sma_spread","cruce_sma","breakout",
             "rsi_reversion","racha_actual","payout","puntaje_estrategia",
             "volatilidad","es_rebote","hora_bucket",
         ]
@@ -5195,6 +5204,12 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
         if "rev_x_breakout" in feats:
             out["rev_x_breakout"] = _col_num("rsi_reversion", 0.0) * _col_num("breakout", 0.0)
 
+        if "sma_spread" in feats:
+            sma5 = _col_num("sma_5", 0.0)
+            sma20 = _col_num("sma_20", 0.0)
+            base = sma20.abs().clip(lower=1e-9)
+            out["sma_spread"] = ((sma5 - sma20).abs() / base).clip(lower=0.0, upper=5.0)
+
         return out
     except Exception:
         return df
@@ -5640,6 +5655,14 @@ def oraculo_predict(fila_dict, modelo, scaler, meta, bot_name=""):
 
         if "hora_x_rebote" in feature_names and "hora_x_rebote" not in fila_dict:
             fila_dict["hora_x_rebote"] = float(fila_dict.get("hora_bucket", 0.0) or 0.0) * float(fila_dict.get("es_rebote", 0.0) or 0.0)
+        if "sma_spread" in feature_names and "sma_spread" not in fila_dict:
+            try:
+                sma5 = float(fila_dict.get("sma_5", 0.0) or 0.0)
+                sma20 = float(fila_dict.get("sma_20", 0.0) or 0.0)
+                base = max(abs(sma20), 1e-9)
+                fila_dict["sma_spread"] = float(max(0.0, min(abs(sma5 - sma20) / base, 5.0)))
+            except Exception:
+                fila_dict["sma_spread"] = 0.0
         if "racha_x_rebote" in feature_names and "racha_x_rebote" not in fila_dict:
             fila_dict["racha_x_rebote"] = float(fila_dict.get("racha_actual", 0.0) or 0.0) * float(fila_dict.get("es_rebote", 0.0) or 0.0)
         if "rev_x_breakout" in feature_names and "rev_x_breakout" not in fila_dict:
@@ -6275,14 +6298,14 @@ def _seleccionar_features_utiles_train(X_df: pd.DataFrame, feats: list[str]):
                 keep.append(c)
 
         # Evitar colinealidad extrema en SMA
-        if ("sma_5" in keep) and ("sma_20" in keep):
+        if ("sma_5" in keep) and ("sma_spread" in keep):
             try:
                 corr = abs(pd.to_numeric(X["sma_5"], errors="coerce").fillna(0.0).corr(
-                    pd.to_numeric(X["sma_20"], errors="coerce").fillna(0.0)
+                    pd.to_numeric(X["sma_spread"], errors="coerce").fillna(0.0)
                 ))
                 if pd.notna(corr) and float(corr) >= 0.9999:
-                    keep.remove("sma_20")
-                    dropped.append(("sma_20", f"collinear({corr:.5f})"))
+                    keep.remove("sma_spread")
+                    dropped.append(("sma_spread", f"collinear({corr:.5f})"))
             except Exception:
                 pass
 
@@ -7702,7 +7725,7 @@ def backfill_incremental(ultimas=500):
             feature_names = [c for c in feature_names if c != "result_bin"]
         except Exception:
             feature_names = [
-                "rsi_9","rsi_14","sma_5","sma_20","cruce_sma","breakout",
+                "rsi_9","rsi_14","sma_5","sma_spread","cruce_sma","breakout",
                 "rsi_reversion","racha_actual","payout","puntaje_estrategia",
                 "volatilidad","es_rebote","hora_bucket",
             ]
@@ -7765,6 +7788,8 @@ def backfill_incremental(ultimas=500):
             for _, r in sub.iterrows():
                 # base mínima
                 fila = {k: float(r[k]) for k in req}
+                base = max(abs(float(r.get("sma_20", 0.0) or 0.0)), 1e-9)
+                fila["sma_spread"] = float(max(0.0, min(abs(float(r.get("sma_5", 0.0) or 0.0) - float(r.get("sma_20", 0.0) or 0.0)) / base, 5.0)))
 
                 # Diccionario completo para helpers enriquecidos
                 row_dict_full = r.to_dict()
