@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List
 
 EXPECTED_COLUMNS = [
-    "rsi_9", "rsi_14", "sma_5", "sma_20", "cruce_sma", "breakout",
+    "rsi_9", "rsi_14", "sma_5", "sma_spread", "cruce_sma", "breakout",
     "rsi_reversion", "racha_actual", "payout", "puntaje_estrategia",
     "volatilidad", "es_rebote", "hora_bucket", "result_bin",
 ]
@@ -25,6 +25,8 @@ def fmt_pct(v: float) -> str:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Analiza dataset de 13 variables + result_bin")
     p.add_argument("csv", nargs="?", type=Path, help="Ruta al CSV. Si se omite, lee desde STDIN")
+    p.add_argument("--closed-only", action="store_true", help="Analiza solo filas con result_bin válido (0/1)")
+    p.add_argument("--max-dominance", type=float, default=0.90, help="Umbral de dominancia máxima aceptable")
     return p.parse_args()
 
 
@@ -109,6 +111,11 @@ def main() -> int:
     rows = 0
 
     for row in reader:
+        raw = (row.get("result_bin") or "").strip() if "result_bin" in cols else ""
+        label = try_float(raw) if "result_bin" in cols else None
+        if args.closed_only and label not in (0.0, 1.0):
+            continue
+
         rows += 1
         exact_dup_counter[tuple((c, row.get(c, "")) for c in cols)] += 1
 
@@ -184,6 +191,30 @@ def main() -> int:
             f"{c} | {mean:.6f} | {std:.6f} | {vals_sorted[0]:.6f} | "
             f"{p1:.6f} | {p50:.6f} | {p99:.6f} | {vals_sorted[-1]:.6f}"
         )
+
+
+    print("\n--- Salud de variables (dominancia/nunique) ---")
+    dom_warn = []
+    for c in numeric:
+        vals = numeric[c]
+        if not vals:
+            print(f"  - {c}: sin datos numéricos")
+            continue
+        cnt = Counter(vals)
+        top_ratio = cnt.most_common(1)[0][1] / max(1, len(vals))
+        nun = len(cnt)
+        status = "OK"
+        if nun <= 1:
+            status = "ROTA"
+        elif top_ratio > float(args.max_dominance):
+            status = "CASI_CONSTANTE"
+            dom_warn.append(c)
+        print(f"  - {c}: nunique={nun}, dominancia={fmt_pct(top_ratio)} -> {status}")
+
+    if dom_warn:
+        print(f"⚠️ Variables con dominancia > {fmt_pct(args.max_dominance)}: {dom_warn}")
+    else:
+        print("✅ Ninguna variable supera el umbral de dominancia configurado.")
 
     print("\n✅ Análisis completado.")
     return 0

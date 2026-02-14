@@ -236,6 +236,7 @@ MIN_IA_SENIALES_CONF = 10  # Mínimo señales cerradas para confiar en prob_hist
 MIN_AUC_CONF = 0.65        # AUC mínimo para audios/colores verdes
 MAX_CLASS_IMBALANCE = 0.8  # Máx proporción pos/neg para entrenar (evita 99% wins)
 AUC_DROP_TOL = 0.05        # Tolerancia para no machacar modelo si AUC baja
+FEATURE_MAX_DOMINANCE = 0.90  # Si una feature repite >90%, se considera casi constante
 
 # Semáforo de calibración (lectura rápida PredMedia/Real/Inflación/n)
 SEM_CAL_N_ROJO = 30
@@ -260,7 +261,7 @@ MIN_CALIB_ROWS = 80
 # Feature set CORE (13) — estable y sin mutaciones
 # ============================================================
 FEATURE_NAMES_CORE_13 = [
-    "rsi_9","rsi_14","sma_5","sma_20","cruce_sma","breakout",
+    "rsi_9","rsi_14","sma_5","sma_spread","cruce_sma","breakout",
     "rsi_reversion","racha_actual","payout","puntaje_estrategia",
     "volatilidad","es_rebote","hora_bucket",
 ]
@@ -270,7 +271,7 @@ FEATURE_NAMES_INTERACCIONES = [
     "racha_x_rebote",
     "rev_x_breakout",
 ]
-FEATURE_NAMES_DEFAULT = list(FEATURE_NAMES_CORE_13) + list(FEATURE_NAMES_INTERACCIONES)
+FEATURE_NAMES_DEFAULT = list(FEATURE_NAMES_CORE_13)
 
 class ModeloXGBCalibrado:
     """
@@ -689,7 +690,7 @@ try:
     INCREMENTAL_FEATURES_V2 = list(FEATURE_NAMES_CORE_13)
 except Exception:
     INCREMENTAL_FEATURES_V2 = [
-        "rsi_9","rsi_14","sma_5","sma_20","cruce_sma","breakout",
+        "rsi_9","rsi_14","sma_5","sma_spread","cruce_sma","breakout",
         "rsi_reversion","racha_actual","payout","puntaje_estrategia",
         "volatilidad","es_rebote","hora_bucket",
     ]
@@ -2150,20 +2151,8 @@ def calcular_es_rebote(row_dict):
     )
     return max(0.0, min(1.0, 0.60 * intensidad_racha + 0.40 * intensidad_giro))
 
-def calcular_hora_bucket(row_dict):
-    """
-    Devuelve un valor 0–1 según la franja de 30 minutos del día
-    (48 buckets => más granular y evita columna constante).
-
-    Si no se puede parsear la hora, devuelve 0.0 y se debe acompañar
-    con `hora_missing=1.0` (ver helper `calcular_hora_features`).
-
-    Claves soportadas (prioridad):
-      - ts (ISO con TZ, ej: "2025-12-05T09:24:04.531328+00:00")  -> se convierte a America/Lima
-      - epoch / timestamp (segundos o ms)                         -> se convierte a America/Lima
-      - fecha (local, ej: "2025-12-05 04:24:04")                  -> se asume America/Lima (sin utc=True)
-      - hora  (ej: "14:58" / "14:58:25")
-    """
+def _parse_hora_bucket(row_dict) -> tuple[float, bool]:
+    """Parsea hora y devuelve (bucket_0_1, parseado_ok)."""
     def _missing(v):
         if v is None:
             return True
@@ -2180,8 +2169,7 @@ def calcular_hora_bucket(row_dict):
         idx_48 = (h * 2) + (1 if m >= 30 else 0)
         return float(idx_48) / 47.0
 
-    # 1) ts ISO con zona (mejor fuente)
-    v = row_dict.get("ts", None)
+    v = (row_dict or {}).get("ts", None)
     if not _missing(v) and isinstance(v, str):
         try:
             dt = pd.to_datetime(v, utc=True, errors="coerce")
@@ -2190,17 +2178,15 @@ def calcular_hora_bucket(row_dict):
                     dt = dt.tz_convert("America/Lima")
                 except Exception:
                     pass
-                return _bucket(int(dt.hour), int(dt.minute))
+                return _bucket(int(dt.hour), int(dt.minute)), True
         except Exception:
             pass
 
-    # 2) epoch/timestamp numérico o string numérico
     for k in ("epoch", "timestamp"):
-        v = row_dict.get(k, None)
+        v = (row_dict or {}).get(k, None)
         if _missing(v):
             continue
         try:
-            # aceptar "1764926644" (string)
             val = float(v)
             if val > 1e12:
                 val = val / 1000.0
@@ -2211,23 +2197,20 @@ def calcular_hora_bucket(row_dict):
                         dt = dt.tz_convert("America/Lima")
                     except Exception:
                         pass
-                    return _bucket(int(dt.hour), int(dt.minute))
+                    return _bucket(int(dt.hour), int(dt.minute)), True
         except Exception:
             pass
 
-    # 3) fecha local (NO utc=True)
-    v = row_dict.get("fecha", None)
+    v = (row_dict or {}).get("fecha", None)
     if not _missing(v) and isinstance(v, str):
         try:
-            dt = pd.to_datetime(v, errors="coerce")  # naive
+            dt = pd.to_datetime(v, errors="coerce")
             if dt is not None and pd.notna(dt):
-                # asumimos que 'fecha' ya está en hora local Lima
-                return _bucket(int(dt.hour), int(dt.minute))
+                return _bucket(int(dt.hour), int(dt.minute)), True
         except Exception:
             pass
 
-    # 4) hora "HH:MM[:SS]"
-    v = row_dict.get("hora", None)
+    v = (row_dict or {}).get("hora", None)
     if not _missing(v) and isinstance(v, str):
         try:
             s = v.strip()
@@ -2240,11 +2223,17 @@ def calcular_hora_bucket(row_dict):
                             mm = int(s.split(":")[1])
                         except Exception:
                             mm = 0
-                    return _bucket(h, mm)
+                    return _bucket(h, mm), True
         except Exception:
             pass
 
-    return 0.0
+    return 0.0, False
+
+
+def calcular_hora_bucket(row_dict):
+    """Devuelve bucket horario normalizado 0..1 (fallback 0.0)."""
+    hb, _ok = _parse_hora_bucket(row_dict)
+    return float(hb)
 
 
 def calcular_hora_features(row_dict: dict) -> tuple[float, float]:
@@ -2253,18 +2242,13 @@ def calcular_hora_features(row_dict: dict) -> tuple[float, float]:
       - hora_bucket: 0..1 SOLO cuando hay timestamp/hora parseable.
       - hora_missing: 1.0 cuando falta hora parseable, 0.0 en caso contrario.
     """
-    hb = calcular_hora_bucket(row_dict)
+    hb, parsed_ok = _parse_hora_bucket(row_dict)
     try:
         hb = float(hb)
     except Exception:
         hb = 0.0
     hb = float(max(0.0, min(1.0, hb)))
-    # Si no hay claves temporales útiles y hb está en fallback -> missing
-    has_any_time = any(
-        str((row_dict or {}).get(k, "") or "").strip() != ""
-        for k in ("ts", "epoch", "timestamp", "fecha", "hora")
-    )
-    hm = 0.0 if has_any_time else 1.0
+    hm = 0.0 if bool(parsed_ok) else 1.0
     return hb, hm
 
 
@@ -2737,9 +2721,18 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
         pe = max(0.0, min(pe, 1.0))
         row_dict_full["puntaje_estrategia"] = pe
 
+        try:
+            sma5 = _safe_float_local(row_dict_full.get("sma_5"))
+            sma20 = _safe_float_local(row_dict_full.get("sma_20"))
+            if sma5 is not None and sma20 is not None:
+                base = max(abs(float(sma20)), 1e-9)
+                row_dict_full["sma_spread"] = float(max(0.0, min(abs(float(sma5) - float(sma20)) / base, 5.0)))
+        except Exception:
+            pass
+
         # 8) Features requeridas (13 core, estricto)
         required = [
-            "rsi_9","rsi_14","sma_5","sma_20","cruce_sma","breakout",
+            "rsi_9","rsi_14","sma_5","sma_spread","cruce_sma","breakout",
             "rsi_reversion","racha_actual","payout","puntaje_estrategia",
             "volatilidad","es_rebote","hora_bucket",
         ]
@@ -5195,6 +5188,12 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
         if "rev_x_breakout" in feats:
             out["rev_x_breakout"] = _col_num("rsi_reversion", 0.0) * _col_num("breakout", 0.0)
 
+        if "sma_spread" in feats:
+            sma5 = _col_num("sma_5", 0.0)
+            sma20 = _col_num("sma_20", 0.0)
+            base = sma20.abs().clip(lower=1e-9)
+            out["sma_spread"] = ((sma5 - sma20).abs() / base).clip(lower=0.0, upper=5.0)
+
         return out
     except Exception:
         return df
@@ -5640,6 +5639,14 @@ def oraculo_predict(fila_dict, modelo, scaler, meta, bot_name=""):
 
         if "hora_x_rebote" in feature_names and "hora_x_rebote" not in fila_dict:
             fila_dict["hora_x_rebote"] = float(fila_dict.get("hora_bucket", 0.0) or 0.0) * float(fila_dict.get("es_rebote", 0.0) or 0.0)
+        if "sma_spread" in feature_names and "sma_spread" not in fila_dict:
+            try:
+                sma5 = float(fila_dict.get("sma_5", 0.0) or 0.0)
+                sma20 = float(fila_dict.get("sma_20", 0.0) or 0.0)
+                base = max(abs(sma20), 1e-9)
+                fila_dict["sma_spread"] = float(max(0.0, min(abs(sma5 - sma20) / base, 5.0)))
+            except Exception:
+                fila_dict["sma_spread"] = 0.0
         if "racha_x_rebote" in feature_names and "racha_x_rebote" not in fila_dict:
             fila_dict["racha_x_rebote"] = float(fila_dict.get("racha_actual", 0.0) or 0.0) * float(fila_dict.get("es_rebote", 0.0) or 0.0)
         if "rev_x_breakout" in feature_names and "rev_x_breakout" not in fila_dict:
@@ -6269,20 +6276,20 @@ def _seleccionar_features_utiles_train(X_df: pd.DataFrame, feats: list[str]):
             nun = int(s.nunique(dropna=False))
             if nun <= 1:
                 dropped.append((c, f"ROTA:nunique={nun}"))
-            elif top_ratio > 0.97:
+            elif top_ratio > float(FEATURE_MAX_DOMINANCE):
                 dropped.append((c, f"CASI_CONSTANTE:dom={top_ratio:.3f}"))
             else:
                 keep.append(c)
 
         # Evitar colinealidad extrema en SMA
-        if ("sma_5" in keep) and ("sma_20" in keep):
+        if ("sma_5" in keep) and ("sma_spread" in keep):
             try:
                 corr = abs(pd.to_numeric(X["sma_5"], errors="coerce").fillna(0.0).corr(
-                    pd.to_numeric(X["sma_20"], errors="coerce").fillna(0.0)
+                    pd.to_numeric(X["sma_spread"], errors="coerce").fillna(0.0)
                 ))
                 if pd.notna(corr) and float(corr) >= 0.9999:
-                    keep.remove("sma_20")
-                    dropped.append(("sma_20", f"collinear({corr:.5f})"))
+                    keep.remove("sma_spread")
+                    dropped.append(("sma_spread", f"collinear({corr:.5f})"))
             except Exception:
                 pass
 
@@ -6310,7 +6317,7 @@ def _auditar_salud_features(X_df: pd.DataFrame, feats: list[str]):
             dom = (float(vc.iloc[0]) / float(n)) if len(vc) else 1.0
             if nun <= 1:
                 status = "ROTA"
-            elif dom > 0.97:
+            elif dom > float(FEATURE_MAX_DOMINANCE):
                 status = "CASI_CONSTANTE"
             else:
                 status = "OK"
@@ -6388,11 +6395,7 @@ def maybe_retrain(force: bool = False):
             return False
 
         # 4) Construir X/y robusto (usa tus builders)
-        feats_pref = None
-        try:
-            feats_pref = list(FEATURES) if FEATURES else None
-        except Exception:
-            feats_pref = None
+        feats_pref = list(INCREMENTAL_FEATURES_V2)
 
         X, y, feats_used, label_col = _build_Xy_incremental(df, feature_names=feats_pref)
         if X is None or y is None or feats_used is None:
@@ -7702,7 +7705,7 @@ def backfill_incremental(ultimas=500):
             feature_names = [c for c in feature_names if c != "result_bin"]
         except Exception:
             feature_names = [
-                "rsi_9","rsi_14","sma_5","sma_20","cruce_sma","breakout",
+                "rsi_9","rsi_14","sma_5","sma_spread","cruce_sma","breakout",
                 "rsi_reversion","racha_actual","payout","puntaje_estrategia",
                 "volatilidad","es_rebote","hora_bucket",
             ]
@@ -7765,6 +7768,8 @@ def backfill_incremental(ultimas=500):
             for _, r in sub.iterrows():
                 # base mínima
                 fila = {k: float(r[k]) for k in req}
+                base = max(abs(float(r.get("sma_20", 0.0) or 0.0)), 1e-9)
+                fila["sma_spread"] = float(max(0.0, min(abs(float(r.get("sma_5", 0.0) or 0.0) - float(r.get("sma_20", 0.0) or 0.0)) / base, 5.0)))
 
                 # Diccionario completo para helpers enriquecidos
                 row_dict_full = r.to_dict()
