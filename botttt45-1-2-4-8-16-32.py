@@ -1028,7 +1028,7 @@ def puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, c
 def setup_pasa_filtro(score: float, condiciones: int) -> bool:
     """Gate de calidad: mantiene >=2/3 y exige score mínimo."""
     try:
-        return (int(condiciones) >= 2) and (float(score) >= float(SCORE_MIN))
+        return (int(condiciones) >= 3) and (float(score) >= float(SCORE_MIN))
     except Exception:
         return False
 # ==================== WS HELPERS ====================
