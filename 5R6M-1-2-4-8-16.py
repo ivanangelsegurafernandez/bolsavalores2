@@ -126,28 +126,31 @@ REMATE_SIN_TOPE = False      # Limitado por MAX_CICLOS
 HUD_LAYOUT = "bottom_center"  # Fijado en centro inferior
 HUD_VISIBLE = True       # Para ocultarlo con tecla
 
+# --- Objetivos / umbrales globales de IA ---
+IA_OBJETIVO_REAL_THR = 0.75   # objetivo de calidad REAL (meta)
+IA_ACTIVACION_REAL_THR = 0.65 # mínimo operativo para activar señal REAL
+
 # --- Oráculo visual ---
-ORACULO_THR_MIN   = 0.75
+ORACULO_THR_MIN   = IA_ACTIVACION_REAL_THR
 ORACULO_N_MIN     = 40
 ORACULO_DELTA_PRE = 0.05
 
-# Umbral único (verde + aviso IA)  -> esto NO lo tocamos
-IA_VERDE_THR = 0.75
-AUTO_REAL_THR = 0.75  # umbral techo para auto-promoción a REAL
-AUTO_REAL_THR_MIN = 0.75  # piso rígido: no activar REAL por debajo de 75%
+# Umbral visual/alerta: alineado al mínimo operativo REAL
+IA_VERDE_THR = IA_ACTIVACION_REAL_THR
+AUTO_REAL_THR = IA_OBJETIVO_REAL_THR      # techo: mantener foco en acercarse al 75%
+AUTO_REAL_THR_MIN = IA_ACTIVACION_REAL_THR  # piso: permitir activación REAL desde 65%
 AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
 AUTO_REAL_MARGIN = 0.01   # pequeño margen para evitar quedar fuera por décimas
 AUTO_REAL_LOG_MAX_ROWS = 300  # máximo de señales históricas usadas en la calibración
 AUTO_REAL_LIVE_MIN_BOTS = 3   # mínimos bots con prob viva para calibración por tick
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
-# OJO: también se usa como piso en get_umbral_operativo(), así que NO lo bajamos para no cambiar conducta del bot.
-IA_METRIC_THRESHOLD = IA_VERDE_THR
+IA_METRIC_THRESHOLD = IA_ACTIVACION_REAL_THR
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
 IA_CALIB_THRESHOLD = 0.60
-IA_CALIB_GOAL_THRESHOLD = 0.70  # objetivo: medir cierres fuertes (≥70%)
+IA_CALIB_GOAL_THRESHOLD = IA_OBJETIVO_REAL_THR  # objetivo real: medir cierres fuertes cerca de 75%
 IA_CALIB_MIN_CLOSED = 200  # mínimo recomendado para considerar estable la auditoría
 
 # Recomendaciones operativas conservadoras (anti-sobreconfianza)
@@ -171,7 +174,7 @@ GATE_SEGMENTO_MIN_WR = 0.50
 GATE_SEGMENTO_LOOKBACK = 240
 
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
-AUDIO_IA53_THR = 0.75
+AUDIO_IA53_THR = IA_ACTIVACION_REAL_THR
 
 # Anti-spam + rearme
 AUDIO_IA53_COOLDOWN_S = 20     # no repetir más de 1 vez cada X segundos por bot
@@ -4420,7 +4423,7 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
     now = time.time()
     try:
         if (not force) and ((now - float(_AUTO_REAL_CACHE.get("ts", 0.0) or 0.0)) < 8.0):
-            return float(_AUTO_REAL_CACHE.get("thr", AUTO_REAL_THR))
+            return float(_AUTO_REAL_CACHE.get("thr", AUTO_REAL_THR_MIN))
 
         # 1) Histórico
         probs = _leer_probs_historicas_ia(AUTO_REAL_LOG_MAX_ROWS)
@@ -4429,7 +4432,7 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
             thr_hist = q_hist - float(AUTO_REAL_MARGIN)
             pmax_hist = float(max(probs))
         else:
-            thr_hist = float(AUTO_REAL_THR)
+            thr_hist = float(AUTO_REAL_THR_MIN)
             pmax_hist = float(max(probs)) if probs else 0.0
 
         # 2) Vivo (último tick): si el mercado/modelo se aplana, el gate también baja
@@ -4449,7 +4452,7 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
             thr_live = pmax_live - float(AUTO_REAL_MARGIN)
         else:
             pmax_live = 0.0
-            thr_live = float(AUTO_REAL_THR)
+            thr_live = float(AUTO_REAL_THR_MIN)
 
         thr_raw = min(float(thr_hist), float(thr_live))
         thr = max(float(AUTO_REAL_THR_MIN), min(float(AUTO_REAL_THR), float(thr_raw)))
@@ -4460,7 +4463,7 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
         _AUTO_REAL_CACHE["max"] = float(max(pmax_hist, pmax_live))
         return float(thr)
     except Exception:
-        return float(AUTO_REAL_THR)
+        return float(AUTO_REAL_THR_MIN)
 
 
 def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_real_token=False, expected_ciclo=None):
@@ -6038,7 +6041,7 @@ def get_umbral_operativo(meta: dict | None = None) -> float:
 # =========================================================
 # DISPARADOR ÚNICO DE ALERTA IA (AUDIO + FLAG)
 # Regla dura pedida:
-#   - SOLO dispara si prob >= 70% (o el umbral operativo si es más alto)
+#   - SOLO dispara si prob >= umbral operativo (65% mínimo)
 #   - Blindado contra prob en % (53) vs fracción (0.53)
 #   - Cooldown + rearme por histéresis
 # =========================================================
@@ -6050,7 +6053,7 @@ def _umbral_alerta_ia(meta: dict | None = None) -> float:
     try:
         thr = float(AUDIO_IA53_THR)
     except Exception:
-        thr = 0.75
+        thr = IA_ACTIVACION_REAL_THR
     if thr < 0.0:
         thr = 0.0
     if thr > 1.0:
@@ -6087,7 +6090,7 @@ def evaluar_alerta_ia_y_disparar(bot: str, prob_ia: float, meta: dict | None = N
     except Exception:
         pass
 # =========================================================
-# UMBRAL VISUAL (HUD) — 70% = VERDE SIEMPRE
+# UMBRAL VISUAL (HUD) — usa umbral operativo (65% por configuración)
 # No depende de AUC/reliable/n_samples (eso solo bloquea "operar", no pintar).
 # Evita fallos por redondeo: 0.699999 -> lo tratamos como 0.70.
 # =========================================================
@@ -6095,14 +6098,14 @@ def _thr_visual_verde() -> float:
     try:
         return float(IA_VERDE_THR)
     except Exception:
-        return 0.75
+        return IA_ACTIVACION_REAL_THR
 
 def _thr_visual_amarillo() -> float:
-    # Amarillo: zona previa (por defecto 65% si verde es 70%)
+    # Amarillo: zona previa (verde - 5pp)
     try:
         return max(0.0, float(_thr_visual_verde()) - 0.05)
     except Exception:
-        return 0.75
+        return IA_ACTIVACION_REAL_THR
 
 # =========================================================
 # NORMALIZADOR ÚNICO DE PROBABILIDAD
@@ -7315,7 +7318,7 @@ def mostrar_panel():
             modo_str = (modo.upper() if modo != "off" else "OFF")
 
             if modo != "off":
-                if confianza >= 0.75:
+                if confianza >= IA_ACTIVACION_REAL_THR:
                     modo_color = Fore.GREEN
                 elif confianza >= 0.55:
                     modo_color = Fore.YELLOW
@@ -7419,7 +7422,7 @@ def mostrar_panel():
 
     # Contadores IA ≥70% por bot
         # HISTÓRICO: señales IA (>=70%) que llegaron a ejecutarse y cerraron con resultado
-    print(Fore.YELLOW + " IA HISTÓRICO (señales cerradas, ≥70%):")
+    print(Fore.YELLOW + f" IA HISTÓRICO (señales cerradas, ≥{IA_METRIC_THRESHOLD*100:.0f}%):")
     has_hist = False
     for bot in BOT_NAMES:
         stats = IA90_stats.get(bot)
@@ -7427,9 +7430,9 @@ def mostrar_panel():
             has_hist = True
             print(Fore.YELLOW + f"   {bot}: {stats['ok']}/{stats['n']} ({stats['pct']:.1f}%)")
     if not has_hist:
-        print(Fore.YELLOW + "   (Aún no hay operaciones cerradas con señal IA ≥70%.)")
+        print(Fore.YELLOW + f"   (Aún no hay operaciones cerradas con señal IA ≥{IA_METRIC_THRESHOLD*100:.0f}%.)")
 
-    # ACTUAL: quién está >=70% ahora mismo (tick actual)
+    # ACTUAL: quién está >= umbral operativo ahora mismo (tick actual)
     print(Fore.YELLOW + f"\nIA SEÑALES ACTUALES (≥{IA_METRIC_THRESHOLD*100:.0f}% ahora):")
     now = []
     for bot in BOT_NAMES:
@@ -7477,9 +7480,9 @@ def mostrar_panel():
         n_goal = int(rep_goal.get("n", 0) or 0)
         wr_goal = rep_goal.get("win_rate", None)
         if n_goal > 0 and isinstance(wr_goal, (int, float)):
-            print(Fore.MAGENTA + f"   Meta 70%: n={n_goal} cierres con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}% | Real={float(wr_goal)*100:.1f}%")
+            print(Fore.MAGENTA + f"   Meta {IA_CALIB_GOAL_THRESHOLD*100:.0f}%: n={n_goal} cierres con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}% | Real={float(wr_goal)*100:.1f}%")
         else:
-            print(Fore.MAGENTA + f"   Meta 70%: aún sin cierres suficientes con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}%.")
+            print(Fore.MAGENTA + f"   Meta {IA_CALIB_GOAL_THRESHOLD*100:.0f}%: aún sin cierres suficientes con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}%.")
         if n <= 0:
             print(Fore.MAGENTA + "   (Aún no hay cierres suficientes para medir calibración.)")
         else:
@@ -8128,7 +8131,7 @@ def set_etapa(codigo, detalle_extra=None, anunciar=False):
 # Nueva constante para watchdog de REAL - Bajado para más reactividad
 REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme
 REAL_STUCK_FORCE_RELEASE_S = 90  # segundos extra tras aviso para liberar REAL si no hay cierre
-REAL_TRIGGER_MIN = 0.75  # regla operativa: entrada REAL desde 75% o mayor
+REAL_TRIGGER_MIN = IA_ACTIVACION_REAL_THR  # regla operativa: entrada REAL desde 65% o mayor
 
 # Cargar datos bot
 # Cargar datos bot
@@ -8671,7 +8674,7 @@ async def main():
 
                             candidatos.sort(key=lambda x: x[0], reverse=True)
 
-                            # Selección automática: tomar la mejor señal elegible >= 75%.
+                            # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
 
                         # Si hay señal pero saldo insuficiente -> avisar y NO abrir ventana
                         if candidatos and saldo_val < costo_ciclo1:
