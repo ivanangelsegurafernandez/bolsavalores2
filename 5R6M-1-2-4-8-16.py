@@ -180,6 +180,9 @@ REGIME_GATE_WEIGHT_REGIME = 0.20      # peso de la calidad de régimen
 REGIME_GATE_WEIGHT_EVIDENCE = 0.10    # peso de evidencia histórica real (N + WR)
 EVIDENCE_MIN_N_HARD = 60              # si hay >=N evidencia fuerte, exigir WR mínimo
 EVIDENCE_MIN_WR_HARD = 0.70           # objetivo de calidad real por bot para habilitar auto-REAL
+EVIDENCE_MIN_LB_HARD = 0.65           # candado conservador: límite inferior mínimo con evidencia
+POSTERIOR_EVIDENCE_K = 80             # inercia: más alto = más peso al histórico para p_real
+POSTERIOR_REGIME_BLEND = 0.35         # mezcla del score de régimen dentro de p_real
 EVIDENCE_CACHE_TTL_S = 20.0
 
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
@@ -3042,6 +3045,50 @@ def _score_regimen_contexto(ctx: dict) -> float:
         return 0.5
 
 
+def _wilson_lower_bound(successes: int, n: int, z: float = 1.96) -> float:
+    """Límite inferior Wilson (conservador) para probabilidad real."""
+    try:
+        n = int(n or 0)
+        successes = int(successes or 0)
+        if n <= 0:
+            return 0.0
+        p = float(successes) / float(n)
+        den = 1.0 + (z * z / n)
+        cen = (p + (z * z / (2.0 * n))) / den
+        mar = (z * math.sqrt((p * (1.0 - p) / n) + (z * z / (4.0 * n * n)))) / den
+        return float(max(0.0, min(1.0, cen - mar)))
+    except Exception:
+        return 0.0
+
+
+def _prob_real_posterior(prob_model: float, regime_score: float, ev_n: int, ev_wr: float, ev_lb: float) -> float:
+    """Posterior operativa: modelo + evidencia + régimen + bound conservador."""
+    try:
+        p = float(max(0.0, min(1.0, prob_model)))
+        reg = float(max(0.0, min(1.0, regime_score)))
+        n = int(max(0, ev_n or 0))
+        wr = float(max(0.0, min(1.0, ev_wr or 0.0)))
+        lb = float(max(0.0, min(1.0, ev_lb or 0.0)))
+
+        # Peso de evidencia por tamaño muestral (N/(N+K))
+        w = float(n) / float(n + int(POSTERIOR_EVIDENCE_K)) if n >= 0 else 0.0
+
+        # 1) Mezcla modelo-histórico real
+        p_mix = ((1.0 - w) * p) + (w * wr)
+
+        # 2) Ajuste por régimen (score centrado en 0.5)
+        reg_adj = 0.5 + ((reg - 0.5) * 0.8)
+        p_reg = ((1.0 - float(POSTERIOR_REGIME_BLEND)) * p_mix) + (float(POSTERIOR_REGIME_BLEND) * reg_adj)
+
+        # 3) Candado conservador: acercar a límite inferior cuando ya hay evidencia
+        w_lb = min(0.45, w)
+        p_post = ((1.0 - w_lb) * p_reg) + (w_lb * lb)
+
+        return float(max(0.0, min(1.0, p_post)))
+    except Exception:
+        return float(max(0.0, min(1.0, prob_model or 0.0)))
+
+
 def _evidencia_bot_umbral_objetivo(bot: str, force: bool = False) -> dict:
     """Resumen por bot en umbral objetivo (N, WR, Brier/ECE) para no inflar señales."""
     try:
@@ -3058,14 +3105,18 @@ def _evidencia_bot_umbral_objetivo(bot: str, force: bool = False) -> dict:
 
         n = int(b.get("n", 0) or 0)
         wr = float(b.get("win_rate", 0.0) or 0.0) if n > 0 else 0.0
+        hits = int(round(wr * n)) if n > 0 else 0
+        lb = _wilson_lower_bound(hits, n) if n > 0 else 0.0
         brier = b.get("brier", None)
         ece = b.get("ece", None)
-        ok_hard = (n < int(EVIDENCE_MIN_N_HARD)) or (wr >= float(EVIDENCE_MIN_WR_HARD))
+        ok_hard = (n < int(EVIDENCE_MIN_N_HARD)) or ((wr >= float(EVIDENCE_MIN_WR_HARD)) and (lb >= float(EVIDENCE_MIN_LB_HARD)))
 
         out = {
             "ts": now,
             "n": n,
             "wr": wr,
+            "hits": int(hits),
+            "lb": float(lb),
             "brier": brier,
             "ece": ece,
             "ok_hard": bool(ok_hard),
@@ -3074,7 +3125,7 @@ def _evidencia_bot_umbral_objetivo(bot: str, force: bool = False) -> dict:
         cache[key] = out
         return out
     except Exception:
-        return {"ts": time.time(), "n": 0, "wr": 0.0, "brier": None, "ece": None, "ok_hard": True, "goal": float(IA_CALIB_GOAL_THRESHOLD)}
+        return {"ts": time.time(), "n": 0, "hits": 0, "wr": 0.0, "lb": 0.0, "brier": None, "ece": None, "ok_hard": True, "goal": float(IA_CALIB_GOAL_THRESHOLD)}
 
 
 def _gate_regimen_activo_ok(bot: str, activo: str = "", ttl_s: float = 45.0):
@@ -7556,8 +7607,10 @@ def mostrar_panel():
         wr_goal = rep_goal.get("win_rate", None)
         if n_goal > 0 and isinstance(wr_goal, (int, float)):
             print(Fore.MAGENTA + f"   Meta {IA_CALIB_GOAL_THRESHOLD*100:.0f}%: n={n_goal} cierres con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}% | Real={float(wr_goal)*100:.1f}%")
-            estado_ev = "🟢" if (n_goal >= EVIDENCE_MIN_N_HARD and float(wr_goal) >= IA_CALIB_GOAL_THRESHOLD) else ("🟡" if n_goal >= max(20, EVIDENCE_MIN_N_HARD//2) else "🔴")
-            print(Fore.MAGENTA + f"   Índice evidencia: {estado_ev} N={n_goal} | WR_real={float(wr_goal)*100:.1f}% | Gate duro={IA_CALIB_GOAL_THRESHOLD*100:.0f}%")
+            hits_goal = int(round(float(wr_goal) * n_goal)) if n_goal > 0 else 0
+            lb_goal = _wilson_lower_bound(hits_goal, n_goal) if n_goal > 0 else 0.0
+            estado_ev = "🟢" if (n_goal >= EVIDENCE_MIN_N_HARD and lb_goal >= EVIDENCE_MIN_LB_HARD) else ("🟡" if n_goal >= max(20, EVIDENCE_MIN_N_HARD//2) else "🔴")
+            print(Fore.MAGENTA + f"   Índice evidencia: {estado_ev} N={n_goal} | WR_real={float(wr_goal)*100:.1f}% | LB={lb_goal*100:.1f}% | Gate LB={EVIDENCE_MIN_LB_HARD*100:.0f}%")
         else:
             print(Fore.MAGENTA + f"   Meta {IA_CALIB_GOAL_THRESHOLD*100:.0f}%: aún sin cierres suficientes con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}%.")
         if n <= 0:
@@ -8754,16 +8807,20 @@ async def main():
                                     ev = _evidencia_bot_umbral_objetivo(b)
                                     ev_n = int(ev.get("n", 0) or 0)
                                     ev_wr = float(ev.get("wr", 0.0) or 0.0)
+                                    ev_lb = float(ev.get("lb", 0.0) or 0.0)
                                     if (ev_n >= int(EVIDENCE_MIN_N_HARD)) and (not bool(ev.get("ok_hard", True))):
                                         agregar_evento(
-                                            f"🧪 Evidencia: {b} bloqueado (n={ev_n}, WR={ev_wr*100:.1f}% < {EVIDENCE_MIN_WR_HARD*100:.1f}% @≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}%)."
+                                            f"🧪 Evidencia: {b} bloqueado (n={ev_n}, WR={ev_wr*100:.1f}%, LB={ev_lb*100:.1f}% < LB_min {EVIDENCE_MIN_LB_HARD*100:.1f}%)."
                                         )
                                         continue
 
-                                    # 6) Ranking final (Capa B + régimen + evidencia)
-                                    evidence_score = min(1.0, ev_wr + min(0.20, ev_n / 300.0))
+                                    # 6) Prob REAL posterior (modelo + régimen + evidencia + bound)
+                                    p_post = _prob_real_posterior(float(p), float(regime_score), int(ev_n), float(ev_wr), float(ev_lb))
+
+                                    # 7) Ranking final (Capa B + régimen + evidencia)
+                                    evidence_score = min(1.0, p_post + min(0.15, ev_n / 400.0))
                                     score_final = (
-                                        float(REGIME_GATE_WEIGHT_PROB) * float(p)
+                                        float(REGIME_GATE_WEIGHT_PROB) * float(p_post)
                                         + float(REGIME_GATE_WEIGHT_REGIME) * float(regime_score)
                                         + float(REGIME_GATE_WEIGHT_EVIDENCE) * float(evidence_score)
                                     )
@@ -8772,7 +8829,7 @@ async def main():
                                     estado_bots[b]["ia_evidence_n"] = int(ev_n)
                                     estado_bots[b]["ia_evidence_wr"] = float(ev_wr)
 
-                                    candidatos.append((float(score_final), b, float(p), float(regime_score), int(ev_n), float(ev_wr)))
+                                    candidatos.append((float(score_final), b, float(p), float(p_post), float(regime_score), int(ev_n), float(ev_wr), float(ev_lb)))
                                 except Exception:
                                     continue
 
@@ -8802,8 +8859,8 @@ async def main():
                             owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
                             if candidatos and (PENDIENTE_FORZAR_BOT is None) and (owner in (None, "none")):
                                 candidatos.sort(reverse=True)
-                                score_top, mejor_bot, prob, reg_score, ev_n, ev_wr = candidatos[0]
-                                agregar_evento(f"🧠 Embudo IA: {mejor_bot} score={score_top*100:.1f}% | p={prob*100:.1f}% | reg={reg_score*100:.1f}% | ev={ev_wr*100:.1f}% (n={ev_n})")
+                                score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = candidatos[0]
+                                agregar_evento(f"🧠 Embudo IA: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
                                 PENDIENTE_FORZAR_BOT = mejor_bot
                                 PENDIENTE_FORZAR_INICIO = ahora
                                 PENDIENTE_FORZAR_EXPIRA = ahora + VENTANA_DECISION_IA_S
@@ -8820,8 +8877,8 @@ async def main():
 
                         if candidatos and not MODO_REAL_MANUAL:
                             candidatos.sort(reverse=True)
-                            score_top, mejor_bot, prob, reg_score, ev_n, ev_wr = candidatos[0]
-                            agregar_evento(f"⚙️ IA AUTO: {mejor_bot} score={score_top*100:.1f}% | p={prob*100:.1f}% | reg={reg_score*100:.1f}% | ev={ev_wr*100:.1f}% (n={ev_n})")
+                            score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = candidatos[0]
+                            agregar_evento(f"⚙️ IA AUTO: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
                             ciclo_auto = ciclo_martingala_siguiente()
                             monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
                             val = obtener_valor_saldo()
