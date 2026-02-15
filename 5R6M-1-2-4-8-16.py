@@ -127,7 +127,7 @@ HUD_LAYOUT = "bottom_center"  # Fijado en centro inferior
 HUD_VISIBLE = True       # Para ocultarlo con tecla
 
 # --- Objetivos / umbrales globales de IA ---
-IA_OBJETIVO_REAL_THR = 0.75   # objetivo de calidad REAL (meta)
+IA_OBJETIVO_REAL_THR = 0.70   # objetivo de calidad REAL (meta: 70% aprox)
 IA_ACTIVACION_REAL_THR = 0.65 # mínimo operativo para activar señal REAL
 
 # --- Oráculo visual ---
@@ -137,7 +137,7 @@ ORACULO_DELTA_PRE = 0.05
 
 # Umbral visual/alerta: alineado al mínimo operativo REAL
 IA_VERDE_THR = IA_ACTIVACION_REAL_THR
-AUTO_REAL_THR = IA_OBJETIVO_REAL_THR      # techo: mantener foco en acercarse al 75%
+AUTO_REAL_THR = IA_OBJETIVO_REAL_THR      # techo: mantener foco en acercarse al 70%
 AUTO_REAL_THR_MIN = IA_ACTIVACION_REAL_THR  # piso: permitir activación REAL desde 65%
 AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
 AUTO_REAL_MARGIN = 0.01   # pequeño margen para evitar quedar fuera por décimas
@@ -150,7 +150,7 @@ IA_METRIC_THRESHOLD = IA_ACTIVACION_REAL_THR
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
 IA_CALIB_THRESHOLD = 0.60
-IA_CALIB_GOAL_THRESHOLD = IA_OBJETIVO_REAL_THR  # objetivo real: medir cierres fuertes cerca de 75%
+IA_CALIB_GOAL_THRESHOLD = IA_OBJETIVO_REAL_THR  # objetivo real: medir cierres fuertes cerca de 70%
 IA_CALIB_MIN_CLOSED = 200  # mínimo recomendado para considerar estable la auditoría
 
 # Recomendaciones operativas conservadoras (anti-sobreconfianza)
@@ -172,6 +172,15 @@ GATE_SEGMENTO_ENABLED = True
 GATE_SEGMENTO_MIN_MUESTRA = 35
 GATE_SEGMENTO_MIN_WR = 0.50
 GATE_SEGMENTO_LOOKBACK = 240
+
+# Embudo IA en 2 capas: A=régimen (tradeable), B=prob fina (modelo)
+REGIME_GATE_MIN_SCORE = 0.52          # mínimo score de régimen para considerar señal
+REGIME_GATE_WEIGHT_PROB = 0.70        # peso de la prob del modelo en ranking final
+REGIME_GATE_WEIGHT_REGIME = 0.20      # peso de la calidad de régimen
+REGIME_GATE_WEIGHT_EVIDENCE = 0.10    # peso de evidencia histórica real (N + WR)
+EVIDENCE_MIN_N_HARD = 60              # si hay >=N evidencia fuerte, exigir WR mínimo
+EVIDENCE_MIN_WR_HARD = 0.70           # objetivo de calidad real por bot para habilitar auto-REAL
+EVIDENCE_CACHE_TTL_S = 20.0
 
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
 AUDIO_IA53_THR = IA_ACTIVACION_REAL_THR
@@ -511,7 +520,10 @@ estado_bots = {
         "ia_aciertos": 0,
         "ia_fallos": 0,
         "ia_senal_pendiente": False,  # Flag para operación recomendada por IA
-        "ia_prob_senal": None         # NUEVO: prob IA en el momento de la señal
+        "ia_prob_senal": None,        # prob IA en el momento de la señal
+        "ia_regime_score": 0.0,       # capa A (régimen)
+        "ia_evidence_n": 0,           # soporte histórico en umbral objetivo
+        "ia_evidence_wr": 0.0         # win-rate real en umbral objetivo
     }
     for bot in BOT_NAMES
 }
@@ -3000,6 +3012,69 @@ def _ultimo_contexto_operativo_bot(bot: str) -> dict:
     except Exception:
         pass
     return out
+
+
+
+def _score_regimen_contexto(ctx: dict) -> float:
+    """Capa A del embudo: score 0..1 de calidad de régimen actual."""
+    try:
+        racha = float(ctx.get("racha_actual", 0.0) or 0.0)
+        reb = float(ctx.get("es_rebote", 0.0) or 0.0)
+        seg_p = str(ctx.get("seg_payout", "") or "")
+        seg_h = str(ctx.get("seg_hora", "") or "")
+
+        score = 0.50
+        # racha positiva suma; racha muy negativa resta
+        score += max(-0.18, min(0.18, 0.03 * racha))
+        # rebote puede rescatar contextos negativos
+        score += 0.08 if reb >= 0.5 else 0.0
+        # payout bajo suele rendir peor
+        if seg_p == "bajo":
+            score -= 0.12
+        elif seg_p == "alto":
+            score += 0.04
+        # franjas horarias menos estables -> leve castigo
+        if seg_h in ("h00-05", "h18-23"):
+            score -= 0.04
+
+        return float(max(0.0, min(1.0, score)))
+    except Exception:
+        return 0.5
+
+
+def _evidencia_bot_umbral_objetivo(bot: str, force: bool = False) -> dict:
+    """Resumen por bot en umbral objetivo (N, WR, Brier/ECE) para no inflar señales."""
+    try:
+        now = time.time()
+        cache = globals().setdefault("_EVIDENCE_BOT_CACHE", {})
+        key = f"{bot}|{float(IA_CALIB_GOAL_THRESHOLD):.4f}"
+        c = cache.get(key)
+        if c and (not force) and ((now - float(c.get("ts", 0.0))) <= float(EVIDENCE_CACHE_TTL_S)):
+            return c
+
+        rep = auditar_calibracion_seniales_reales(min_prob=float(IA_CALIB_GOAL_THRESHOLD)) or {}
+        por_bot = rep.get("por_bot", {}) if isinstance(rep, dict) else {}
+        b = por_bot.get(str(bot), {}) if isinstance(por_bot, dict) else {}
+
+        n = int(b.get("n", 0) or 0)
+        wr = float(b.get("win_rate", 0.0) or 0.0) if n > 0 else 0.0
+        brier = b.get("brier", None)
+        ece = b.get("ece", None)
+        ok_hard = (n < int(EVIDENCE_MIN_N_HARD)) or (wr >= float(EVIDENCE_MIN_WR_HARD))
+
+        out = {
+            "ts": now,
+            "n": n,
+            "wr": wr,
+            "brier": brier,
+            "ece": ece,
+            "ok_hard": bool(ok_hard),
+            "goal": float(IA_CALIB_GOAL_THRESHOLD),
+        }
+        cache[key] = out
+        return out
+    except Exception:
+        return {"ts": time.time(), "n": 0, "wr": 0.0, "brier": None, "ece": None, "ok_hard": True, "goal": float(IA_CALIB_GOAL_THRESHOLD)}
 
 
 def _gate_regimen_activo_ok(bot: str, activo: str = "", ttl_s: float = 45.0):
@@ -7481,6 +7556,8 @@ def mostrar_panel():
         wr_goal = rep_goal.get("win_rate", None)
         if n_goal > 0 and isinstance(wr_goal, (int, float)):
             print(Fore.MAGENTA + f"   Meta {IA_CALIB_GOAL_THRESHOLD*100:.0f}%: n={n_goal} cierres con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}% | Real={float(wr_goal)*100:.1f}%")
+            estado_ev = "🟢" if (n_goal >= EVIDENCE_MIN_N_HARD and float(wr_goal) >= IA_CALIB_GOAL_THRESHOLD) else ("🟡" if n_goal >= max(20, EVIDENCE_MIN_N_HARD//2) else "🔴")
+            print(Fore.MAGENTA + f"   Índice evidencia: {estado_ev} N={n_goal} | WR_real={float(wr_goal)*100:.1f}% | Gate duro={IA_CALIB_GOAL_THRESHOLD*100:.0f}%")
         else:
             print(Fore.MAGENTA + f"   Meta {IA_CALIB_GOAL_THRESHOLD*100:.0f}%: aún sin cierres suficientes con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}%.")
         if n <= 0:
@@ -8668,7 +8745,34 @@ async def main():
                                         )
                                         continue
 
-                                    candidatos.append((float(p), b))
+                                    # 4) Capa A del embudo: score de régimen
+                                    regime_score = _score_regimen_contexto(ctx)
+                                    if regime_score < float(REGIME_GATE_MIN_SCORE):
+                                        continue
+
+                                    # 5) Índice de evidencia por bot en umbral objetivo (evita inflar 0.70+ sin soporte)
+                                    ev = _evidencia_bot_umbral_objetivo(b)
+                                    ev_n = int(ev.get("n", 0) or 0)
+                                    ev_wr = float(ev.get("wr", 0.0) or 0.0)
+                                    if (ev_n >= int(EVIDENCE_MIN_N_HARD)) and (not bool(ev.get("ok_hard", True))):
+                                        agregar_evento(
+                                            f"🧪 Evidencia: {b} bloqueado (n={ev_n}, WR={ev_wr*100:.1f}% < {EVIDENCE_MIN_WR_HARD*100:.1f}% @≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}%)."
+                                        )
+                                        continue
+
+                                    # 6) Ranking final (Capa B + régimen + evidencia)
+                                    evidence_score = min(1.0, ev_wr + min(0.20, ev_n / 300.0))
+                                    score_final = (
+                                        float(REGIME_GATE_WEIGHT_PROB) * float(p)
+                                        + float(REGIME_GATE_WEIGHT_REGIME) * float(regime_score)
+                                        + float(REGIME_GATE_WEIGHT_EVIDENCE) * float(evidence_score)
+                                    )
+
+                                    estado_bots[b]["ia_regime_score"] = float(regime_score)
+                                    estado_bots[b]["ia_evidence_n"] = int(ev_n)
+                                    estado_bots[b]["ia_evidence_wr"] = float(ev_wr)
+
+                                    candidatos.append((float(score_final), b, float(p), float(regime_score), int(ev_n), float(ev_wr)))
                                 except Exception:
                                     continue
 
@@ -8698,7 +8802,8 @@ async def main():
                             owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
                             if candidatos and (PENDIENTE_FORZAR_BOT is None) and (owner in (None, "none")):
                                 candidatos.sort(reverse=True)
-                                prob, mejor_bot = candidatos[0]
+                                score_top, mejor_bot, prob, reg_score, ev_n, ev_wr = candidatos[0]
+                                agregar_evento(f"🧠 Embudo IA: {mejor_bot} score={score_top*100:.1f}% | p={prob*100:.1f}% | reg={reg_score*100:.1f}% | ev={ev_wr*100:.1f}% (n={ev_n})")
                                 PENDIENTE_FORZAR_BOT = mejor_bot
                                 PENDIENTE_FORZAR_INICIO = ahora
                                 PENDIENTE_FORZAR_EXPIRA = ahora + VENTANA_DECISION_IA_S
@@ -8715,7 +8820,8 @@ async def main():
 
                         if candidatos and not MODO_REAL_MANUAL:
                             candidatos.sort(reverse=True)
-                            prob, mejor_bot = candidatos[0]
+                            score_top, mejor_bot, prob, reg_score, ev_n, ev_wr = candidatos[0]
+                            agregar_evento(f"⚙️ IA AUTO: {mejor_bot} score={score_top*100:.1f}% | p={prob*100:.1f}% | reg={reg_score*100:.1f}% | ev={ev_wr*100:.1f}% (n={ev_n})")
                             ciclo_auto = ciclo_martingala_siguiente()
                             monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
                             val = obtener_valor_saldo()
