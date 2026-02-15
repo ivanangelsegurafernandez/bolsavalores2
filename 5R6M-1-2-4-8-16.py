@@ -8768,7 +8768,10 @@ async def main():
                                         continue
 
                                     p = estado_bots[b].get("prob_ia", None)
-                                    if not (isinstance(p, (int, float)) and float(p) >= float(umbral_ia_real)):
+                                    if not isinstance(p, (int, float)):
+                                        continue
+                                    # Primer filtro suave: evitar basura por debajo del piso operativo.
+                                    if float(p) < float(IA_ACTIVACION_REAL_THR):
                                         continue
 
                                     # 1) Gate de calidad por racha/rebote (priorizar precisión real)
@@ -8816,6 +8819,10 @@ async def main():
 
                                     # 6) Prob REAL posterior (modelo + régimen + evidencia + bound)
                                     p_post = _prob_real_posterior(float(p), float(regime_score), int(ev_n), float(ev_wr), float(ev_lb))
+
+                                    # Candado final: el umbral REAL se valida sobre la probabilidad posterior (no p_model)
+                                    if float(p_post) < float(umbral_ia_real):
+                                        continue
 
                                     # 7) Ranking final (Capa B + régimen + evidencia)
                                     evidence_score = min(1.0, p_post + min(0.15, ev_n / 400.0))
