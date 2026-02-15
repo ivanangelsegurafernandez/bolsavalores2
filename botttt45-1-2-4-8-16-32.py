@@ -144,9 +144,9 @@ PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado
 VENTANA_DECISION_IA_S = 60        # segundos
 VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
 # === Filtro avanzado (sin cambiar 13 features) ===
-SCORE_MIN = 2.80            # score mínimo para aceptar un setup
-SCORE_DROP_MAX = 0.70       # caída máxima tolerada al revalidar pre-buy
-REVALIDAR_VELAS_N = 8       # velas mínimas para revalidación rápida
+SCORE_MIN = 2.90            # equilibrio: calidad alta sin ahogar frecuencia de señal
+SCORE_DROP_MAX = 0.60       # equilibrio: tolerancia moderada en revalidación pre-buy
+REVALIDAR_VELAS_N = 8       # revalidación ágil para no perder demasiadas entradas válidas
 resultado_global = {"demo": 0.0, "real": 0.0}
 ultimo_token = None
 reinicio_forzado = asyncio.Event()
