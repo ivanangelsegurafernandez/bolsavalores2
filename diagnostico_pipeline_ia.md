@@ -1,12 +1,14 @@
 # Diagnóstico unificado IA (bots 45-50 + incremental + señales)
 
-- Generado (UTC): 2026-02-15T20:27:05.587879+00:00
+- Generado (UTC): 2026-02-15T20:37:55.567246+00:00
 
 ## Modelo actual
 - reliable: False
 - auc: 0.5666666666666667
 - brier: 0.2586050223219748
 - features activas: ['racha_actual']
+- chequeo orientación AUC: ok | auc=0.566667 | auc_invertida=0.433333
+- nota AUC: Orientación AUC aparentemente correcta.
 
 ## Incremental
 - filas: 154

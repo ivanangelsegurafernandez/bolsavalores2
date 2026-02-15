@@ -221,12 +221,38 @@ def summarize_model_meta() -> dict[str, Any]:
     }
 
 
+
+
+def _auc_orientation_check(auc_val: Any) -> dict[str, Any]:
+    a = _to_float(auc_val)
+    if a is None:
+        return {"status": "unknown", "auc": None, "auc_if_flipped": None, "message": "AUC no disponible."}
+    if a < 0.50:
+        return {
+            "status": "possible_inversion",
+            "auc": round(a, 6),
+            "auc_if_flipped": round(1.0 - a, 6),
+            "message": "AUC<0.50: revisar posible inversión de orientación (p -> 1-p).",
+        }
+    return {
+        "status": "ok",
+        "auc": round(a, 6),
+        "auc_if_flipped": round(1.0 - a, 6),
+        "message": "Orientación AUC aparentemente correcta.",
+    }
+
 def build_actions(diag: dict[str, Any]) -> list[str]:
     actions: list[str] = []
 
     inc = diag["incremental"]
     if inc.get("rows", 0) < 400:
         actions.append("Subir muestra incremental a >=400 filas cerradas antes de cambios estructurales.")
+
+    auc_check = diag.get("auc_orientation", {})
+    if str(auc_check.get("status")) == "possible_inversion":
+        actions.append(
+            f"Revisar orientación del modelo: AUC={auc_check.get('auc')} (<0.50), AUC invertida estimada={auc_check.get('auc_if_flipped')}."
+        )
 
     fvol = inc.get("features", {}).get("volatilidad", {})
     fhb = inc.get("features", {}).get("hora_bucket", {})
@@ -266,11 +292,14 @@ def build_markdown(diag: dict[str, Any]) -> str:
     md.append(f"- Generado (UTC): {diag['generated_at']}")
 
     meta = diag["model_meta"]
+    auc_check = diag.get("auc_orientation", {})
     md.append("\n## Modelo actual")
     md.append(f"- reliable: {meta.get('reliable')}")
     md.append(f"- auc: {meta.get('auc')}")
     md.append(f"- brier: {meta.get('brier')}")
     md.append(f"- features activas: {meta.get('features')}")
+    md.append(f"- chequeo orientación AUC: {auc_check.get('status')} | auc={auc_check.get('auc')} | auc_invertida={auc_check.get('auc_if_flipped')}")
+    md.append(f"- nota AUC: {auc_check.get('message')}")
 
     inc = diag["incremental"]
     md.append("\n## Incremental")
@@ -318,6 +347,7 @@ def main() -> int:
         "bots": [summarize_bot(b) for b in BOTS],
         "signals": summarize_signals(),
     }
+    diag["auc_orientation"] = _auc_orientation_check(diag.get("model_meta", {}).get("auc"))
     diag["actions"] = build_actions(diag)
 
     (ROOT / "diagnostico_pipeline_ia.json").write_text(
