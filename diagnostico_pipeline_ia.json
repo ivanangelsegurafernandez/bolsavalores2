@@ -1,14 +1,17 @@
 {
-  "generated_at": "2026-02-15T20:47:40.660076+00:00",
+  "generated_at": "2026-02-15T20:59:20.684883+00:00",
   "model_meta": {
     "exists": true,
-    "trained_at": "2026-02-14 22:59:45",
-    "n": 152,
-    "auc": 0.5666666666666667,
-    "brier": 0.2586050223219748,
+    "trained_at": "2026-02-15 08:53:24",
+    "n": 81,
+    "auc": 0.34375,
+    "brier": 0.3075384375731013,
     "reliable": false,
     "features": [
-      "racha_actual"
+      "racha_actual",
+      "rsi_14",
+      "rsi_reversion",
+      "sma_5"
     ],
     "dropped": [
       {
@@ -28,94 +31,94 @@
   "incremental": {
     "path": "dataset_incremental.csv",
     "exists": true,
-    "rows": 154,
+    "rows": 372,
     "features": {
       "rsi_9": {
-        "n": 154,
-        "uniq": 115,
-        "dominance": 0.038961,
-        "top": "35.18"
+        "n": 372,
+        "uniq": 311,
+        "dominance": 0.013441,
+        "top": "99.99"
       },
       "rsi_14": {
-        "n": 154,
-        "uniq": 115,
-        "dominance": 0.038961,
-        "top": "28.36"
+        "n": 372,
+        "uniq": 306,
+        "dominance": 0.010753,
+        "top": "51.44"
       },
       "sma_5": {
-        "n": 154,
-        "uniq": 116,
-        "dominance": 0.038961,
-        "top": "1695.1739999999998"
+        "n": 372,
+        "uniq": 320,
+        "dominance": 0.008065,
+        "top": "3359.512"
       },
       "sma_spread": {
-        "n": 154,
-        "uniq": 116,
-        "dominance": 0.038961,
-        "top": "0.007776594125704282"
+        "n": 372,
+        "uniq": 320,
+        "dominance": 0.008065,
+        "top": "0.00017752402935814724"
       },
       "cruce_sma": {
-        "n": 154,
-        "uniq": 116,
-        "dominance": 0.038961,
-        "top": "0.8787270430552993"
+        "n": 372,
+        "uniq": 320,
+        "dominance": 0.008065,
+        "top": "0.32936877188552316"
       },
       "breakout": {
-        "n": 154,
-        "uniq": 116,
-        "dominance": 0.038961,
-        "top": "0.7556247290476457"
+        "n": 372,
+        "uniq": 320,
+        "dominance": 0.008065,
+        "top": "0.49795540218084355"
       },
       "rsi_reversion": {
-        "n": 154,
-        "uniq": 115,
-        "dominance": 0.038961,
-        "top": "0.18971428571428572"
+        "n": 372,
+        "uniq": 310,
+        "dominance": 0.013441,
+        "top": "0.9997142857142856"
       },
       "racha_actual": {
-        "n": 154,
-        "uniq": 11,
-        "dominance": 0.253247,
+        "n": 372,
+        "uniq": 14,
+        "dominance": 0.282258,
         "top": "1.0"
       },
       "payout": {
-        "n": 154,
-        "uniq": 8,
-        "dominance": 0.597403,
+        "n": 372,
+        "uniq": 10,
+        "dominance": 0.572581,
         "top": "0.95"
       },
       "puntaje_estrategia": {
-        "n": 154,
-        "uniq": 125,
-        "dominance": 0.038961,
-        "top": "0.5106967836787809"
+        "n": 372,
+        "uniq": 334,
+        "dominance": 0.008065,
+        "top": "0.26204185142969394"
       },
       "volatilidad": {
-        "n": 154,
+        "n": 372,
         "uniq": 1,
         "dominance": 1.0,
         "top": "0.9999546000702375"
       },
       "es_rebote": {
-        "n": 154,
-        "uniq": 125,
-        "dominance": 0.038961,
-        "top": "0.06242857142857143"
+        "n": 372,
+        "uniq": 328,
+        "dominance": 0.010753,
+        "top": "0.020149999999999994"
       },
       "hora_bucket": {
-        "n": 154,
+        "n": 372,
         "uniq": 1,
         "dominance": 1.0,
         "top": "0.0"
       }
     },
-    "duplicates_exact": 29,
-    "duplicates_ratio": 0.188312,
+    "duplicates_exact": 35,
+    "duplicates_ratio": 0.094086,
     "class_balance": {
-      "0": 69,
-      "1": 85,
-      "p0": 0.4481,
-      "p1": 0.5519
+      "0": 188,
+      "1": 184,
+      "p0": 0.5054,
+      "p1": 0.4946
     }
   },
   "bots": [
@@ -123,51 +126,51 @@
       "bot": "fulll45",
       "path": "registro_enriquecido_fulll45.csv",
       "exists": true,
-      "rows": 12012,
-      "closed": 5868,
-      "wins": 2883,
-      "losses": 2985,
-      "win_rate": 0.491309,
-      "last_ts": "2026-02-15T04:00:22.938710+00:00",
+      "rows": 12572,
+      "closed": 6147,
+      "wins": 3016,
+      "losses": 3131,
+      "win_rate": 0.490646,
+      "last_ts": "2026-02-15T20:58:59.883982+00:00",
       "feature_dominance": {
         "cruce_sma": {
-          "n": 5868,
+          "n": 6147,
           "uniq": 2,
-          "dominance": 0.98756,
+          "dominance": 0.988124,
           "top": "1"
         },
         "breakout": {
-          "n": 5868,
+          "n": 6147,
           "uniq": 2,
-          "dominance": 0.948194,
+          "dominance": 0.949569,
           "top": "1"
         },
         "rsi_reversion": {
-          "n": 5868,
+          "n": 6147,
           "uniq": 2,
-          "dominance": 0.900307,
+          "dominance": 0.900114,
           "top": "0"
         },
         "puntaje_estrategia": {
-          "n": 5868,
+          "n": 6147,
           "uniq": 2,
-          "dominance": 0.964554,
+          "dominance": 0.962421,
           "top": "0.666667"
         },
         "es_rebote": {
-          "n": 5868,
+          "n": 6147,
           "uniq": 2,
-          "dominance": 0.935242,
+          "dominance": 0.93444,
           "top": "0"
         },
         "volatilidad": {
-          "n": 5868,
+          "n": 6147,
           "uniq": 1,
           "dominance": 1.0,
           "top": ""
         },
         "hora_bucket": {
-          "n": 5868,
+          "n": 6147,
           "uniq": 1,
           "dominance": 1.0,
           "top": ""
@@ -178,51 +181,51 @@
       "bot": "fulll46",
       "path": "registro_enriquecido_fulll46.csv",
       "exists": true,
-      "rows": 10329,
-      "closed": 5065,
-      "wins": 2541,
-      "losses": 2524,
-      "win_rate": 0.501678,
-      "last_ts": "2026-02-10T22:24:02.583320+00:00",
+      "rows": 14178,
+      "closed": 6945,
+      "wins": 3489,
+      "losses": 3456,
+      "win_rate": 0.502376,
+      "last_ts": "2026-02-15T20:58:57.468905+00:00",
       "feature_dominance": {
         "cruce_sma": {
-          "n": 5065,
+          "n": 6945,
           "uniq": 2,
-          "dominance": 0.985982,
+          "dominance": 0.988769,
           "top": "1"
         },
         "breakout": {
-          "n": 5065,
+          "n": 6945,
           "uniq": 2,
-          "dominance": 0.949062,
+          "dominance": 0.954788,
           "top": "1"
         },
         "rsi_reversion": {
-          "n": 5065,
+          "n": 6945,
           "uniq": 2,
-          "dominance": 0.903258,
+          "dominance": 0.906983,
           "top": "0"
         },
         "puntaje_estrategia": {
-          "n": 5065,
+          "n": 6945,
           "uniq": 2,
-          "dominance": 0.968213,
+          "dominance": 0.963427,
           "top": "0.666667"
         },
         "es_rebote": {
-          "n": 5065,
+          "n": 6945,
           "uniq": 2,
-          "dominance": 0.936032,
+          "dominance": 0.933333,
           "top": "0"
         },
         "volatilidad": {
-          "n": 5065,
+          "n": 6945,
           "uniq": 1,
           "dominance": 1.0,
           "top": ""
         },
         "hora_bucket": {
-          "n": 5065,
+          "n": 6945,
           "uniq": 1,
           "dominance": 1.0,
           "top": ""
@@ -233,51 +236,51 @@
       "bot": "fulll47",
       "path": "registro_enriquecido_fulll47.csv",
       "exists": true,
-      "rows": 10330,
-      "closed": 5066,
-      "wins": 2537,
-      "losses": 2529,
-      "win_rate": 0.50079,
-      "last_ts": "2026-02-10T22:24:01.490602+00:00",
+      "rows": 14165,
+      "closed": 6943,
+      "wins": 3474,
+      "losses": 3469,
+      "win_rate": 0.50036,
+      "last_ts": "2026-02-15T20:58:49.048027+00:00",
       "feature_dominance": {
         "cruce_sma": {
-          "n": 5066,
+          "n": 6943,
           "uniq": 2,
-          "dominance": 0.985985,
+          "dominance": 0.98891,
           "top": "1"
         },
         "breakout": {
-          "n": 5066,
+          "n": 6943,
           "uniq": 2,
-          "dominance": 0.942163,
+          "dominance": 0.949157,
           "top": "1"
         },
         "rsi_reversion": {
-          "n": 5066,
+          "n": 6943,
           "uniq": 2,
-          "dominance": 0.898342,
+          "dominance": 0.903644,
           "top": "0"
         },
         "puntaje_estrategia": {
-          "n": 5066,
+          "n": 6943,
           "uniq": 2,
-          "dominance": 0.970193,
+          "dominance": 0.965577,
           "top": "0.666667"
         },
         "es_rebote": {
-          "n": 5066,
+          "n": 6943,
           "uniq": 2,
-          "dominance": 0.941966,
+          "dominance": 0.939651,
           "top": "0"
         },
         "volatilidad": {
-          "n": 5066,
+          "n": 6943,
           "uniq": 1,
           "dominance": 1.0,
           "top": ""
         },
         "hora_bucket": {
-          "n": 5066,
+          "n": 6943,
           "uniq": 1,
           "dominance": 1.0,
           "top": ""
@@ -288,51 +291,51 @@
       "bot": "fulll48",
       "path": "registro_enriquecido_fulll48.csv",
       "exists": true,
-      "rows": 10324,
-      "closed": 5058,
-      "wins": 2514,
-      "losses": 2544,
-      "win_rate": 0.497034,
-      "last_ts": "2026-02-10T22:23:48.786682+00:00",
+      "rows": 14140,
+      "closed": 6926,
+      "wins": 3443,
+      "losses": 3483,
+      "win_rate": 0.497112,
+      "last_ts": "2026-02-15T20:58:48.571898+00:00",
       "feature_dominance": {
         "cruce_sma": {
-          "n": 5058,
+          "n": 6926,
           "uniq": 2,
-          "dominance": 0.987742,
+          "dominance": 0.989604,
           "top": "1"
         },
         "breakout": {
-          "n": 5058,
+          "n": 6926,
           "uniq": 2,
-          "dominance": 0.948794,
+          "dominance": 0.953797,
           "top": "1"
         },
         "rsi_reversion": {
-          "n": 5058,
+          "n": 6926,
           "uniq": 2,
-          "dominance": 0.906287,
+          "dominance": 0.908172,
           "top": "0"
         },
         "puntaje_estrategia": {
-          "n": 5058,
+          "n": 6926,
           "uniq": 2,
-          "dominance": 0.969751,
+          "dominance": 0.96477,
           "top": "0.666667"
         },
         "es_rebote": {
-          "n": 5058,
+          "n": 6926,
           "uniq": 2,
-          "dominance": 0.94227,
+          "dominance": 0.942102,
           "top": "0"
         },
         "volatilidad": {
-          "n": 5058,
+          "n": 6926,
           "uniq": 1,
           "dominance": 1.0,
           "top": ""
         },
         "hora_bucket": {
-          "n": 5058,
+          "n": 6926,
           "uniq": 1,
           "dominance": 1.0,
           "top": ""
@@ -343,51 +346,51 @@
       "bot": "fulll49",
       "path": "registro_enriquecido_fulll49.csv",
       "exists": true,
-      "rows": 10348,
-      "closed": 5064,
-      "wins": 2536,
-      "losses": 2528,
-      "win_rate": 0.50079,
-      "last_ts": "2026-02-10T22:24:02.156623+00:00",
+      "rows": 14190,
+      "closed": 6947,
+      "wins": 3472,
+      "losses": 3475,
+      "win_rate": 0.499784,
+      "last_ts": "2026-02-15T20:59:01.163335+00:00",
       "feature_dominance": {
         "cruce_sma": {
-          "n": 5064,
+          "n": 6947,
           "uniq": 2,
-          "dominance": 0.987164,
+          "dominance": 0.988628,
           "top": "1"
         },
         "breakout": {
-          "n": 5064,
+          "n": 6947,
           "uniq": 2,
-          "dominance": 0.94293,
+          "dominance": 0.949475,
           "top": "1"
         },
         "rsi_reversion": {
-          "n": 5064,
+          "n": 6947,
           "uniq": 2,
-          "dominance": 0.898302,
+          "dominance": 0.901828,
           "top": "0"
         },
         "puntaje_estrategia": {
-          "n": 5064,
+          "n": 6947,
           "uniq": 2,
-          "dominance": 0.968207,
+          "dominance": 0.963725,
           "top": "0.666667"
         },
         "es_rebote": {
-          "n": 5064,
+          "n": 6947,
           "uniq": 2,
-          "dominance": 0.946485,
+          "dominance": 0.943573,
           "top": "0"
         },
         "volatilidad": {
-          "n": 5064,
+          "n": 6947,
           "uniq": 1,
           "dominance": 1.0,
           "top": ""
         },
         "hora_bucket": {
-          "n": 5064,
+          "n": 6947,
           "uniq": 1,
           "dominance": 1.0,
           "top": ""
@@ -398,51 +401,51 @@
       "bot": "fulll50",
       "path": "registro_enriquecido_fulll50.csv",
       "exists": true,
-      "rows": 10352,
-      "closed": 5076,
-      "wins": 2446,
-      "losses": 2630,
-      "win_rate": 0.481875,
-      "last_ts": "2026-02-10T22:23:48.797948+00:00",
+      "rows": 14209,
+      "closed": 6959,
+      "wins": 3404,
+      "losses": 3555,
+      "win_rate": 0.489151,
+      "last_ts": "2026-02-15T20:57:19.891314+00:00",
       "feature_dominance": {
         "cruce_sma": {
-          "n": 5076,
+          "n": 6959,
           "uniq": 2,
-          "dominance": 0.987392,
+          "dominance": 0.988791,
           "top": "1"
         },
         "breakout": {
-          "n": 5076,
+          "n": 6959,
           "uniq": 2,
-          "dominance": 0.94602,
+          "dominance": 0.951142,
           "top": "1"
         },
         "rsi_reversion": {
-          "n": 5076,
+          "n": 6959,
           "uniq": 2,
-          "dominance": 0.900709,
+          "dominance": 0.903147,
           "top": "0"
         },
         "puntaje_estrategia": {
-          "n": 5076,
+          "n": 6959,
           "uniq": 2,
-          "dominance": 0.967297,
+          "dominance": 0.963213,
           "top": "0.666667"
         },
         "es_rebote": {
-          "n": 5076,
+          "n": 6959,
           "uniq": 2,
-          "dominance": 0.927502,
+          "dominance": 0.930162,
           "top": "0"
         },
         "volatilidad": {
-          "n": 5076,
+          "n": 6959,
           "uniq": 1,
           "dominance": 1.0,
           "top": ""
         },
         "hora_bucket": {
-          "n": 5076,
+          "n": 6959,
           "uniq": 1,
           "dominance": 1.0,
           "top": ""
@@ -453,61 +456,68 @@
   "signals": {
     "path": "ia_signals_log.csv",
     "exists": true,
-    "rows": 82,
-    "closed": 82,
+    "rows": 117,
+    "closed": 117,
     "by_threshold": {
       "0.65": {
-        "n": 82,
-        "hits": 37,
-        "win_rate": 0.45121951219512196
+        "n": 117,
+        "hits": 53,
+        "win_rate": 0.452991452991453
       },
       "0.7": {
-        "n": 82,
-        "hits": 37,
-        "win_rate": 0.45121951219512196
+        "n": 117,
+        "hits": 53,
+        "win_rate": 0.452991452991453
       },
       "0.75": {
-        "n": 69,
-        "hits": 30,
-        "win_rate": 0.43478260869565216
+        "n": 104,
+        "hits": 46,
+        "win_rate": 0.4423076923076923
       },
       "0.8": {
-        "n": 38,
-        "hits": 19,
+        "n": 50,
+        "hits": 25,
         "win_rate": 0.5
       }
     },
     "bins": {
       "[0.70,0.80)": {
-        "n": 44,
-        "avg_pred": 0.752935,
-        "avg_real": 0.409091,
-        "gap": 0.343844
+        "n": 67,
+        "avg_pred": 0.756653,
+        "avg_real": 0.41791,
+        "gap": 0.338742
       },
       "[0.80,0.90)": {
-        "n": 29,
-        "avg_pred": 0.822706,
-        "avg_real": 0.482759,
-        "gap": 0.339948
+        "n": 39,
+        "avg_pred": 0.822463,
+        "avg_real": 0.487179,
+        "gap": 0.335284
       },
       "[0.90,1.00)": {
-        "n": 9,
-        "avg_pred": 0.999999,
-        "avg_real": 0.555556,
-        "gap": 0.444443
+        "n": 11,
+        "avg_pred": 0.98347,
+        "avg_real": 0.545455,
+        "gap": 0.438016
       }
     },
-    "max_gap_abs_high_bins": 0.444443
+    "max_gap_abs_high_bins": 0.438016,
+    "orientation": {
+      "status": "ok",
+      "auc": 0.550855,
+      "auc_if_flipped": 0.449145,
+      "message": "Orientación de señales cerradas aparentemente correcta."
+    }
   },
   "auc_orientation": {
-    "status": "ok",
-    "auc": 0.566667,
-    "auc_if_flipped": 0.433333,
-    "message": "Orientación AUC aparentemente correcta."
+    "status": "possible_inversion",
+    "auc": 0.34375,
+    "auc_if_flipped": 0.65625,
+    "message": "AUC<0.50: revisar posible inversión de orientación (p -> 1-p)."
   },
   "actions": [
     "Subir muestra incremental a >=400 filas cerradas antes de cambios estructurales.",
-    "Eliminar duplicados exactos en incremental: ratio actual=18.83% (> 2%).",
+    "Eliminar duplicados exactos en incremental: ratio actual=9.41% (> 2%).",
+    "Revisar orientación del modelo: AUC=0.34375 (<0.50), AUC invertida estimada=0.65625.",
     "Corregir generación de volatilidad en origen bot: actualmente está plana en incremental.",
     "Corregir generación de hora_bucket en origen bot: actualmente está plano en incremental.",
     "Mantener gate conservador (LB + evidencia). No forzar gatillo duro 70% todavía.",
@@ -517,6 +527,11 @@
   ],
   "checklist": [
     {
+      "metric": "orientación modelo/señal consistente (AUC>0.50)",
+      "ok": false,
+      "detail": "model=possible_inversion, signals=ok"
+    },
+    {
       "metric": "volatilidad y hora_bucket dejan de ser ROTA",
       "ok": false,
       "detail": "volatilidad_uniq=1, hora_bucket_uniq=1"
@@ -524,22 +539,22 @@
     {
       "metric": "duplicados exactos incremental <2%",
       "ok": false,
-      "detail": "duplicates_ratio=18.83%"
+      "detail": "duplicates_ratio=9.41%"
     },
     {
       "metric": "gap bins altos <10pp",
       "ok": false,
-      "detail": "max_gap_abs_high_bins=44.44%"
+      "detail": "max_gap_abs_high_bins=43.80%"
     },
     {
       "metric": "señales cerradas >=70% con evidencia >=200",
       "ok": false,
-      "detail": "n_ge70=82"
+      "detail": "n_ge70=117"
     },
     {
       "metric": "hit real en >=70% >60% sostenido",
       "ok": false,
-      "detail": "wr_ge70=45.12% con n=82"
+      "detail": "wr_ge70=45.30% con n=117"
     }
   ]
 }
