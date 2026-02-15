@@ -2,6 +2,7 @@
 import csv
 import json
 import math
+import argparse
 from collections import defaultdict
 from pathlib import Path
 from datetime import datetime, timezone
@@ -10,6 +11,14 @@ ROOT = Path('.')
 BOTS = [f'fulll{n}' for n in range(45, 51)]
 TARGET = 0.70
 THRESHOLDS = [0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+MIN_STRONG_SAMPLE = 200
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Actualiza estado de calibración IA")
+    parser.add_argument("--target", type=float, default=TARGET, help="Objetivo de probabilidad real (ej. 0.70)")
+    parser.add_argument("--min-strong-sample", type=int, default=MIN_STRONG_SAMPLE, help="Muestra mínima recomendada en el umbral objetivo")
+    return parser.parse_args()
 
 
 def _wilson_interval(successes: int, n: int, z: float = 1.96):
@@ -240,20 +249,20 @@ def per_bot_signal_table(closed_rows):
     return sorted(out, key=lambda x: x['priority_score'], reverse=True)
 
 
-def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signal_rows, model_meta):
+def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signal_rows, model_meta, target, min_strong_sample):
     recs = []
 
-    if real_rate < TARGET:
+    if real_rate < target:
         recs.append(
-            f"Brecha principal: estás en {real_rate:.2%} global vs objetivo {TARGET:.0%}. "
+            f"Brecha principal: estás en {real_rate:.2%} global vs objetivo {target:.0%}. "
             "En corto plazo, prioriza reducir exposición REAL y subir filtro de calidad antes de aumentar volumen."
         )
 
     n70 = ia_summary['signals_ge70']
-    if n70 < 200:
+    if n70 < min_strong_sample:
         recs.append(
-            f"Muestra IA >=70% insuficiente (n={n70}). "
-            "No tomes decisiones estructurales hasta llegar al menos a n>=200 cierres IA >=70%."
+            f"Muestra IA >={target:.0%} insuficiente (n={n70}). "
+            f"No tomes decisiones estructurales hasta llegar al menos a n>={int(min_strong_sample)} cierres IA >={target:.0%}."
         )
 
     viable = [r for r in thr_rows if r['n'] >= 30]
@@ -295,6 +304,12 @@ def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signa
 
 
 def main():
+    args = parse_args()
+    target = max(0.0, min(1.0, float(args.target)))
+    min_strong_sample = max(1, int(args.min_strong_sample))
+
+    global TARGET
+    TARGET = target
     bot_stats = [read_bot_stats(b) for b in BOTS]
     ia_rows = read_ia_signals()
     ia_summary, ia_closed_rows = summarize_ia(ia_rows)
@@ -335,26 +350,26 @@ def main():
         for row in bot_signal_rows:
             w.writerow(row)
 
-    recs = build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signal_rows, model_meta)
+    recs = build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signal_rows, model_meta, target, min_strong_sample)
 
     md = []
     md.append('# Estado IA y avance al objetivo\n')
     md.append(f'- Actualizado (UTC): {datetime.now(timezone.utc).isoformat()}')
-    md.append(f'- Objetivo principal (Prob IA real): {TARGET:.0%}')
+    md.append(f'- Objetivo principal (Prob IA real): {target:.0%}')
     md.append(f'- Efectividad real global de cierres (bots 45-50): {real_rate:.2%} ({wins_total}/{closed_total})')
-    md.append(f'- Brecha vs objetivo: {(real_rate - TARGET):+.2%}')
+    md.append(f'- Brecha vs objetivo: {(real_rate - target):+.2%}')
     md.append('')
 
     md.append('## Señales IA cerradas (log)')
     md.append(f"- Total señales registradas: {ia_summary['signals_total']}")
     md.append(f"- Total señales cerradas: {ia_summary['signals_closed']}")
-    md.append(f"- Señales cerradas con prob >=70%: {ia_summary['signals_ge70']}")
+    md.append(f"- Señales cerradas con prob >={target:.0%}: {ia_summary['signals_ge70']}")
     md.append(
-        f"- Acierto real en señales >=70%: {ia_summary['hit_rate_ge70']:.2%} "
+        f"- Acierto real en señales >={target:.0%}: {ia_summary['hit_rate_ge70']:.2%} "
         f"({ia_summary['hits_ge70']}/{ia_summary['signals_ge70']}) | "
         f"IC95%=[{ia_summary['wilson_low_ge70']:.2%},{ia_summary['wilson_high_ge70']:.2%}]"
     )
-    md.append(f"- Estado semáforo objetivo 70%: {'🟢 OK' if ia_summary['hit_rate_ge70'] >= TARGET and ia_summary['signals_ge70'] > 0 else '🔴 Aún no'}")
+    md.append(f"- Estado semáforo objetivo {target:.0%}: {'🟢 OK' if ia_summary['hit_rate_ge70'] >= target and ia_summary['signals_ge70'] > 0 else '🔴 Aún no'}")
     md.append('')
 
     md.append('## Recomendaciones priorizadas para subir Prob IA real')
