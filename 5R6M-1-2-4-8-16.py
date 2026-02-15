@@ -8298,7 +8298,7 @@ async def cargar_datos_bot(bot, token_actual):
                     elif resultado == "PÉRDIDA":
                         estado_bots[bot]["ia_fallos"] += 1
 
-                if prob_senal is not None and prob_senal >= 0.7:
+                if prob_senal is not None and prob_senal >= 0.65:
                     IA90_stats[bot]["n"] += 1
                     if resultado == "GANANCIA":
                         IA90_stats[bot]["ok"] += 1
