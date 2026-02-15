@@ -259,7 +259,7 @@ def build_recommendations(real_rate, ia_summary, thr_rows, calib_rows, bot_signa
         )
 
     n70 = ia_summary['signals_ge70']
-    if n70 < 200:
+    if n70 < min_strong_sample:
         recs.append(
             f"Muestra IA >={target:.0%} insuficiente (n={n70}). "
             f"No tomes decisiones estructurales hasta llegar al menos a n>={int(min_strong_sample)} cierres IA >={target:.0%}."

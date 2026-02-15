@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-02-15T20:37:55.567246+00:00",
+  "generated_at": "2026-02-15T20:47:40.660076+00:00",
   "model_meta": {
     "exists": true,
     "trained_at": "2026-02-14 22:59:45",
@@ -110,6 +110,7 @@
       }
     },
     "duplicates_exact": 29,
+    "duplicates_ratio": 0.188312,
     "class_balance": {
       "0": 69,
       "1": 85,
@@ -495,7 +496,8 @@
         "avg_real": 0.555556,
         "gap": 0.444443
       }
-    }
+    },
+    "max_gap_abs_high_bins": 0.444443
   },
   "auc_orientation": {
     "status": "ok",
@@ -505,10 +507,39 @@
   },
   "actions": [
     "Subir muestra incremental a >=400 filas cerradas antes de cambios estructurales.",
+    "Eliminar duplicados exactos en incremental: ratio actual=18.83% (> 2%).",
     "Corregir generación de volatilidad en origen bot: actualmente está plana en incremental.",
     "Corregir generación de hora_bucket en origen bot: actualmente está plano en incremental.",
     "Mantener gate conservador (LB + evidencia). No forzar gatillo duro 70% todavía.",
     "Priorizar recalibración + shrink dinámico hasta reducir gap de bins altos a <10pp.",
-    "Rediseñar features binarias dominantes a intensidades continuas: cruce_sma, breakout, rsi_reversion, puntaje_estrategia, es_rebote, volatilidad, hora_bucket."
+    "Aumentar evidencia en señales >=75% hasta n>=200 antes de usar 75% como gatillo duro.",
+    "Rediseñar features binarias dominantes a intensidades continuas: breakout, cruce_sma, es_rebote, hora_bucket, puntaje_estrategia, rsi_reversion, volatilidad."
+  ],
+  "checklist": [
+    {
+      "metric": "volatilidad y hora_bucket dejan de ser ROTA",
+      "ok": false,
+      "detail": "volatilidad_uniq=1, hora_bucket_uniq=1"
+    },
+    {
+      "metric": "duplicados exactos incremental <2%",
+      "ok": false,
+      "detail": "duplicates_ratio=18.83%"
+    },
+    {
+      "metric": "gap bins altos <10pp",
+      "ok": false,
+      "detail": "max_gap_abs_high_bins=44.44%"
+    },
+    {
+      "metric": "señales cerradas >=70% con evidencia >=200",
+      "ok": false,
+      "detail": "n_ge70=82"
+    },
+    {
+      "metric": "hit real en >=70% >60% sostenido",
+      "ok": false,
+      "detail": "wr_ge70=45.12% con n=82"
+    }
   ]
 }

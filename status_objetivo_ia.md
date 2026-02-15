@@ -1,6 +1,6 @@
 # Estado IA y avance al objetivo
 
-- Actualizado (UTC): 2026-02-15T11:32:34.367303+00:00
+- Actualizado (UTC): 2026-02-15T20:47:45.315510+00:00
 - Objetivo principal (Prob IA real): 70%
 - Efectividad real global de cierres (bots 45-50): 49.55% (15457/31197)
 - Brecha vs objetivo: -20.45%

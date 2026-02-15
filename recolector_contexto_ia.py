@@ -34,6 +34,10 @@ FEATURES_CORE = [
     "volatilidad", "es_rebote", "hora_bucket",
 ]
 
+TARGET_DUPLICATES_RATIO_MAX = 0.02
+TARGET_BIN_GAP_MAX = 0.10
+TARGET_HIGH_SAMPLE_MIN = 200
+
 
 def _safe_read_csv(path: Path) -> list[dict[str, str]]:
     if not path.exists():
@@ -81,6 +85,7 @@ def summarize_incremental() -> dict[str, Any]:
         "rows": len(rows),
         "features": {},
         "duplicates_exact": 0,
+        "duplicates_ratio": 0.0,
         "class_balance": {},
     }
     if not rows:
@@ -93,6 +98,7 @@ def summarize_incremental() -> dict[str, Any]:
         sigs.append(sig)
     c = Counter(sigs)
     out["duplicates_exact"] = int(sum(v - 1 for v in c.values() if v > 1))
+    out["duplicates_ratio"] = round(out["duplicates_exact"] / max(1, len(rows)), 6)
 
     # dominancia por feature
     for feat in FEATURES_CORE:
@@ -158,6 +164,7 @@ def summarize_signals() -> dict[str, Any]:
         "closed": 0,
         "by_threshold": {},
         "bins": {},
+        "max_gap_abs_high_bins": 0.0,
     }
     if not rows:
         return out
@@ -183,6 +190,7 @@ def summarize_signals() -> dict[str, Any]:
         out["by_threshold"][str(thr)] = {"n": n, "hits": hits, "win_rate": wr}
 
     bins = [(0.70, 0.80), (0.80, 0.90), (0.90, 1.01)]
+    max_gap = 0.0
     for lo, hi in bins:
         grp = [(p, y) for p, y in parsed if lo <= p < hi]
         n = len(grp)
@@ -198,6 +206,10 @@ def summarize_signals() -> dict[str, Any]:
             "avg_real": round(avg_real, 6),
             "gap": round(avg_pred - avg_real, 6),
         }
+        if n > 0:
+            max_gap = max(max_gap, abs(avg_pred - avg_real))
+
+    out["max_gap_abs_high_bins"] = round(max_gap, 6)
 
     return out
 
@@ -247,6 +259,10 @@ def build_actions(diag: dict[str, Any]) -> list[str]:
     inc = diag["incremental"]
     if inc.get("rows", 0) < 400:
         actions.append("Subir muestra incremental a >=400 filas cerradas antes de cambios estructurales.")
+    if float(inc.get("duplicates_ratio", 0.0)) > TARGET_DUPLICATES_RATIO_MAX:
+        actions.append(
+            f"Eliminar duplicados exactos en incremental: ratio actual={inc.get('duplicates_ratio'):.2%} (> {TARGET_DUPLICATES_RATIO_MAX:.0%})."
+        )
 
     auc_check = diag.get("auc_orientation", {})
     if str(auc_check.get("status")) == "possible_inversion":
@@ -269,21 +285,70 @@ def build_actions(diag: dict[str, Any]) -> list[str]:
             actions.append("Mantener gate conservador (LB + evidencia). No forzar gatillo duro 70% todavía.")
 
     b = sig.get("bins", {})
-    gaps = [abs(float(v.get("gap", 0.0))) for v in b.values() if int(v.get("n", 0)) > 0]
-    if gaps and max(gaps) > 0.10:
+    max_gap = float(sig.get("max_gap_abs_high_bins", 0.0) or 0.0)
+    if max_gap > TARGET_BIN_GAP_MAX:
         actions.append("Priorizar recalibración + shrink dinámico hasta reducir gap de bins altos a <10pp.")
 
-    bot45 = next((x for x in diag["bots"] if x.get("bot") == "fulll45"), None)
-    if bot45:
-        dom = bot45.get("feature_dominance", {})
-        high = [k for k, v in dom.items() if float(v.get("dominance", 0.0)) >= 0.90]
-        if high:
-            actions.append(f"Rediseñar features binarias dominantes a intensidades continuas: {', '.join(high)}.")
+    t75 = sig.get("by_threshold", {}).get("0.75", {})
+    if int(t75.get("n", 0)) < TARGET_HIGH_SAMPLE_MIN:
+        actions.append(
+            f"Aumentar evidencia en señales >=75% hasta n>={TARGET_HIGH_SAMPLE_MIN} antes de usar 75% como gatillo duro."
+        )
+
+    dominant_features: set[str] = set()
+    for bot in diag.get("bots", []):
+        dom = bot.get("feature_dominance", {})
+        for feat, stats in dom.items():
+            if float(stats.get("dominance", 0.0)) >= 0.90:
+                dominant_features.add(feat)
+    if dominant_features:
+        feats = ", ".join(sorted(dominant_features))
+        actions.append(f"Rediseñar features binarias dominantes a intensidades continuas: {feats}.")
 
     if not actions:
         actions.append("Data y calibración en zona estable: continuar monitoreo semanal.")
 
     return actions
+
+
+def build_checklist(diag: dict[str, Any]) -> list[dict[str, Any]]:
+    inc = diag.get("incremental", {})
+    sig = diag.get("signals", {})
+
+    volatility_ok = int(inc.get("features", {}).get("volatilidad", {}).get("uniq", 0)) > 1
+    hour_ok = int(inc.get("features", {}).get("hora_bucket", {}).get("uniq", 0)) > 1
+    dups_ratio = float(inc.get("duplicates_ratio", 0.0) or 0.0)
+    gap = float(sig.get("max_gap_abs_high_bins", 0.0) or 0.0)
+    n70 = int(sig.get("by_threshold", {}).get("0.7", {}).get("n", 0) or 0)
+    wr70 = float(sig.get("by_threshold", {}).get("0.7", {}).get("win_rate", 0.0) or 0.0)
+
+    return [
+        {
+            "metric": "volatilidad y hora_bucket dejan de ser ROTA",
+            "ok": volatility_ok and hour_ok,
+            "detail": f"volatilidad_uniq={inc.get('features', {}).get('volatilidad', {}).get('uniq', 0)}, hora_bucket_uniq={inc.get('features', {}).get('hora_bucket', {}).get('uniq', 0)}",
+        },
+        {
+            "metric": "duplicados exactos incremental <2%",
+            "ok": dups_ratio < TARGET_DUPLICATES_RATIO_MAX,
+            "detail": f"duplicates_ratio={dups_ratio:.2%}",
+        },
+        {
+            "metric": "gap bins altos <10pp",
+            "ok": gap < TARGET_BIN_GAP_MAX,
+            "detail": f"max_gap_abs_high_bins={gap:.2%}",
+        },
+        {
+            "metric": "señales cerradas >=70% con evidencia >=200",
+            "ok": n70 >= TARGET_HIGH_SAMPLE_MIN,
+            "detail": f"n_ge70={n70}",
+        },
+        {
+            "metric": "hit real en >=70% >60% sostenido",
+            "ok": n70 >= TARGET_HIGH_SAMPLE_MIN and wr70 > 0.60,
+            "detail": f"wr_ge70={wr70:.2%} con n={n70}",
+        },
+    ]
 
 
 def build_markdown(diag: dict[str, Any]) -> str:
@@ -305,6 +370,7 @@ def build_markdown(diag: dict[str, Any]) -> str:
     md.append("\n## Incremental")
     md.append(f"- filas: {inc.get('rows')}")
     md.append(f"- duplicados exactos: {inc.get('duplicates_exact')}")
+    md.append(f"- ratio duplicados exactos: {inc.get('duplicates_ratio', 0.0):.2%}")
     for k in ("volatilidad", "hora_bucket", "payout", "racha_actual"):
         d = inc.get("features", {}).get(k, {})
         md.append(f"- {k}: uniq={d.get('uniq')} dom={d.get('dominance')} top={d.get('top')}")
@@ -331,6 +397,14 @@ def build_markdown(diag: dict[str, Any]) -> str:
     md.append("|---|---:|---:|---:|---:|")
     for k, v in sig.get("bins", {}).items():
         md.append(f"| {k} | {v.get('n',0)} | {v.get('avg_pred',0):.4f} | {v.get('avg_real',0):.4f} | {v.get('gap',0):+.4f} |")
+    md.append(f"- max |gap| bins altos: {sig.get('max_gap_abs_high_bins', 0.0):.2%}")
+
+    md.append("\n## Checklist objetivo (sin autoengaño)")
+    md.append("| Métrica | Estado | Detalle |")
+    md.append("|---|:---:|---|")
+    for row in diag.get("checklist", []):
+        status = "✅" if row.get("ok") else "❌"
+        md.append(f"| {row.get('metric')} | {status} | {row.get('detail')} |")
 
     md.append("\n## Acciones sugeridas")
     for i, a in enumerate(diag["actions"], start=1):
@@ -349,6 +423,7 @@ def main() -> int:
     }
     diag["auc_orientation"] = _auc_orientation_check(diag.get("model_meta", {}).get("auc"))
     diag["actions"] = build_actions(diag)
+    diag["checklist"] = build_checklist(diag)
 
     (ROOT / "diagnostico_pipeline_ia.json").write_text(
         json.dumps(diag, ensure_ascii=False, indent=2),
