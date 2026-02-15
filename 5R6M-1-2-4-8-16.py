@@ -7678,15 +7678,22 @@ def mostrar_panel():
         print(Fore.CYAN + f" IA ▶ modelo XGBoost entrenado: n={n} (GAN={pos}, PERD={neg})")
         print(Fore.CYAN + f"      AUC={auc:.3f}  | Thr={thr:.2f}  | Modo={modo_txt}")
 
-    # Mostrar contadores de aciertos IA por bot
-    print(Fore.CYAN + " IA ACIERTOS POR BOT:")
+    # Mostrar contadores de aciertos IA por bot (resumen compacto para reducir ruido)
+    resumen_hits = []
     for bot in BOT_NAMES:
-        sig = estado_bots[bot]["ia_seniales"]
-        if sig > 0:
-            ac = estado_bots[bot]["ia_aciertos"]
-            fa = estado_bots[bot]["ia_fallos"]
-            pct = (ac / sig * 100) if sig > 0 else 0
-            print(Fore.CYAN + f"   {bot}: {ac}/{sig} ({pct:.1f}%)")
+        sig = int(estado_bots[bot].get("ia_seniales", 0) or 0)
+        if sig <= 0:
+            continue
+        ac = int(estado_bots[bot].get("ia_aciertos", 0) or 0)
+        pct = (ac / sig * 100.0) if sig > 0 else 0.0
+        resumen_hits.append((pct, bot, ac, sig))
+
+    if resumen_hits:
+        top_hits = sorted(resumen_hits, key=lambda x: x[0], reverse=True)[:3]
+        txt = " | ".join([f"{b}:{ac}/{sg} ({pc:.1f}%)" for pc, b, ac, sg in top_hits])
+        print(Fore.CYAN + f" IA ACIERTOS (Top): {txt}")
+    else:
+        print(Fore.CYAN + " IA ACIERTOS: sin cierres auditados todavía.")
 
     # Contadores IA ≥70% por bot
         # HISTÓRICO: señales IA (>=70%) que llegaron a ejecutarse y cerraron con resultado
@@ -7722,87 +7729,8 @@ def mostrar_panel():
         for b, p in sorted(now, key=lambda x: x[1], reverse=True):
             print(Fore.YELLOW + f"  {b}: {p*100:.1f}%")
 
-    # ==========================================================
-    # Mini-panel: Prob IA “Ficticia” vs “Real” (calibración observada)
-    # Mide inflación = pred_mean - win_rate (en puntos porcentuales)
-    # Usa IA_SIGNALS_LOG (señales cerradas). No toca trading.
-    # ==========================================================
-    try:
-        global _IA_CALIB_CACHE
-        if "_IA_CALIB_CACHE" not in globals():
-            _IA_CALIB_CACHE = {"ts": 0.0, "rep": None, "rep_goal": None}
-
-        if (time.time() - float(_IA_CALIB_CACHE.get("ts", 0.0) or 0.0)) >= 15.0:
-            _IA_CALIB_CACHE["rep"] = auditar_calibracion_seniales_reales(min_prob=float(IA_CALIB_THRESHOLD))
-            _IA_CALIB_CACHE["rep_goal"] = auditar_calibracion_seniales_reales(min_prob=float(IA_CALIB_GOAL_THRESHOLD))
-            _IA_CALIB_CACHE["ts"] = float(time.time())
-
-        rep = _IA_CALIB_CACHE.get("rep", None) or {}
-        rep_goal = _IA_CALIB_CACHE.get("rep_goal", None) or {}
-        n = int(rep.get("n", 0) or 0)
-        n_total_closed = int(rep.get("n_total_closed", 0) or 0)
-        min_prob_cal = float(rep.get("min_prob", IA_CALIB_THRESHOLD) or IA_CALIB_THRESHOLD)
-
-        print(Fore.MAGENTA + f"\n✅ Prob IA REAL vs Prob IA FICTICIA (señales cerradas, ≥{IA_CALIB_THRESHOLD*100:.0f}%):")
-        print(Fore.MAGENTA + f"   Alcance: {n} de {n_total_closed} cierres (solo señales con Prob IA ≥{min_prob_cal*100:.0f}% de todos los bots).")
-        n_goal = int(rep_goal.get("n", 0) or 0)
-        wr_goal = rep_goal.get("win_rate", None)
-        if n_goal > 0 and isinstance(wr_goal, (int, float)):
-            print(Fore.MAGENTA + f"   Meta {IA_CALIB_GOAL_THRESHOLD*100:.0f}%: n={n_goal} cierres con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}% | Real={float(wr_goal)*100:.1f}%")
-            hits_goal = int(round(float(wr_goal) * n_goal)) if n_goal > 0 else 0
-            lb_goal = _wilson_lower_bound(hits_goal, n_goal) if n_goal > 0 else 0.0
-            estado_ev = "🟢" if (n_goal >= EVIDENCE_MIN_N_HARD and lb_goal >= EVIDENCE_MIN_LB_HARD) else ("🟡" if n_goal >= max(20, EVIDENCE_MIN_N_HARD//2) else "🔴")
-            print(Fore.MAGENTA + f"   Índice evidencia: {estado_ev} N={n_goal} | WR_real={float(wr_goal)*100:.1f}% | LB={lb_goal*100:.1f}% | Gate LB={EVIDENCE_MIN_LB_HARD*100:.0f}%")
-        else:
-            print(Fore.MAGENTA + f"   Meta {IA_CALIB_GOAL_THRESHOLD*100:.0f}%: aún sin cierres suficientes con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}%.")
-        if n <= 0:
-            print(Fore.MAGENTA + "   (Aún no hay cierres suficientes para medir calibración.)")
-        else:
-            pred_mean = float(rep.get("avg_pred", 0.0) or 0.0)
-            win_rate = float(rep.get("win_rate", 0.0) or 0.0)
-            infl_pp = float(rep.get("inflacion_pp", 0.0) or 0.0)
-            factor = float(rep.get("factor", 1.0) or 1.0)
-            min_reco = int(rep.get("min_recommended_n", IA_CALIB_MIN_CLOSED) or IA_CALIB_MIN_CLOSED)
-
-            print(
-                Fore.MAGENTA
-                + f"   n={n} | PredMedia={pred_mean*100:.1f}% | Real={win_rate*100:.1f}% | Inflación={infl_pp:+.1f}pp | Factor≈{factor:.3f}"
-            )
-
-            sem_emoji, sem_label, sem_det = semaforo_calibracion(n, infl_pp)
-            print(Fore.MAGENTA + f"   Semáforo calibración: {sem_emoji} {sem_label} ({sem_det})")
-            print(
-                Fore.MAGENTA
-                + "   "
-                + diagnostico_calibracion(n=n, pred_mean=pred_mean, win_rate=win_rate, infl_pp=infl_pp)
-            )
-
-            if n < int(MIN_IA_SENIALES_CONF):
-                print(
-                    Fore.MAGENTA
-                    + f"   ⚠ muestra baja (n<{MIN_IA_SENIALES_CONF}). Úsalo como referencia, no como decisión final."
-                )
-            elif n < min_reco:
-                print(
-                    Fore.MAGENTA
-                    + f"   ⚠ muestra aún en formación (recomendado n≥{min_reco} para estabilidad)."
-                )
-
-            por_bot = rep.get("por_bot", {}) if isinstance(rep.get("por_bot", {}), dict) else {}
-            # Mostrar por bot (solo si hay datos)
-            for bn in BOT_NAMES:
-                sb = por_bot.get(bn, None)
-                if isinstance(sb, dict) and int(sb.get("n", 0) or 0) >= int(MIN_IA_SENIALES_CONF):
-                    pm = float(sb.get("avg_pred", 0.0) or 0.0)
-                    wr = float(sb.get("win_rate", 0.0) or 0.0)
-                    ip = float(sb.get("inflacion_pp", 0.0) or 0.0)
-                    print(Fore.MAGENTA + f"   - {bn}: n={int(sb.get('n',0) or 0)} | Pred={pm*100:.1f}% | Real={wr*100:.1f}% | Infl={ip:+.1f}pp")
-    except Exception:
-        # No rompemos el HUD por auditoría
-        try:
-            print(Fore.MAGENTA + "\n✅ Prob IA REAL vs Prob IA FICTICIA: (error leyendo auditoría)")
-        except Exception:
-            pass    
+        # Calibración detallada movida a reporte externo (menos ruido en HUD principal)
+    print(Fore.MAGENTA + "\nℹ️ Calibración IA detallada desactivada en HUD (usar: python reporte_real_vs_ficticio_ia.py).")
 
     panel_lines = [
         "┌────────────────────────────────────────────┐",
