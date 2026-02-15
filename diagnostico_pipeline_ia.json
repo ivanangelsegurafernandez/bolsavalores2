@@ -1,0 +1,514 @@
+{
+  "generated_at": "2026-02-15T20:37:55.567246+00:00",
+  "model_meta": {
+    "exists": true,
+    "trained_at": "2026-02-14 22:59:45",
+    "n": 152,
+    "auc": 0.5666666666666667,
+    "brier": 0.2586050223219748,
+    "reliable": false,
+    "features": [
+      "racha_actual"
+    ],
+    "dropped": [
+      {
+        "feature": "sma_spread",
+        "reason": "ROTA:nunique=1"
+      },
+      {
+        "feature": "volatilidad",
+        "reason": "ROTA:nunique=1"
+      },
+      {
+        "feature": "hora_bucket",
+        "reason": "ROTA:nunique=1"
+      }
+    ]
+  },
+  "incremental": {
+    "path": "dataset_incremental.csv",
+    "exists": true,
+    "rows": 154,
+    "features": {
+      "rsi_9": {
+        "n": 154,
+        "uniq": 115,
+        "dominance": 0.038961,
+        "top": "35.18"
+      },
+      "rsi_14": {
+        "n": 154,
+        "uniq": 115,
+        "dominance": 0.038961,
+        "top": "28.36"
+      },
+      "sma_5": {
+        "n": 154,
+        "uniq": 116,
+        "dominance": 0.038961,
+        "top": "1695.1739999999998"
+      },
+      "sma_spread": {
+        "n": 154,
+        "uniq": 116,
+        "dominance": 0.038961,
+        "top": "0.007776594125704282"
+      },
+      "cruce_sma": {
+        "n": 154,
+        "uniq": 116,
+        "dominance": 0.038961,
+        "top": "0.8787270430552993"
+      },
+      "breakout": {
+        "n": 154,
+        "uniq": 116,
+        "dominance": 0.038961,
+        "top": "0.7556247290476457"
+      },
+      "rsi_reversion": {
+        "n": 154,
+        "uniq": 115,
+        "dominance": 0.038961,
+        "top": "0.18971428571428572"
+      },
+      "racha_actual": {
+        "n": 154,
+        "uniq": 11,
+        "dominance": 0.253247,
+        "top": "1.0"
+      },
+      "payout": {
+        "n": 154,
+        "uniq": 8,
+        "dominance": 0.597403,
+        "top": "0.95"
+      },
+      "puntaje_estrategia": {
+        "n": 154,
+        "uniq": 125,
+        "dominance": 0.038961,
+        "top": "0.5106967836787809"
+      },
+      "volatilidad": {
+        "n": 154,
+        "uniq": 1,
+        "dominance": 1.0,
+        "top": "0.9999546000702375"
+      },
+      "es_rebote": {
+        "n": 154,
+        "uniq": 125,
+        "dominance": 0.038961,
+        "top": "0.06242857142857143"
+      },
+      "hora_bucket": {
+        "n": 154,
+        "uniq": 1,
+        "dominance": 1.0,
+        "top": "0.0"
+      }
+    },
+    "duplicates_exact": 29,
+    "class_balance": {
+      "0": 69,
+      "1": 85,
+      "p0": 0.4481,
+      "p1": 0.5519
+    }
+  },
+  "bots": [
+    {
+      "bot": "fulll45",
+      "path": "registro_enriquecido_fulll45.csv",
+      "exists": true,
+      "rows": 12012,
+      "closed": 5868,
+      "wins": 2883,
+      "losses": 2985,
+      "win_rate": 0.491309,
+      "last_ts": "2026-02-15T04:00:22.938710+00:00",
+      "feature_dominance": {
+        "cruce_sma": {
+          "n": 5868,
+          "uniq": 2,
+          "dominance": 0.98756,
+          "top": "1"
+        },
+        "breakout": {
+          "n": 5868,
+          "uniq": 2,
+          "dominance": 0.948194,
+          "top": "1"
+        },
+        "rsi_reversion": {
+          "n": 5868,
+          "uniq": 2,
+          "dominance": 0.900307,
+          "top": "0"
+        },
+        "puntaje_estrategia": {
+          "n": 5868,
+          "uniq": 2,
+          "dominance": 0.964554,
+          "top": "0.666667"
+        },
+        "es_rebote": {
+          "n": 5868,
+          "uniq": 2,
+          "dominance": 0.935242,
+          "top": "0"
+        },
+        "volatilidad": {
+          "n": 5868,
+          "uniq": 1,
+          "dominance": 1.0,
+          "top": ""
+        },
+        "hora_bucket": {
+          "n": 5868,
+          "uniq": 1,
+          "dominance": 1.0,
+          "top": ""
+        }
+      }
+    },
+    {
+      "bot": "fulll46",
+      "path": "registro_enriquecido_fulll46.csv",
+      "exists": true,
+      "rows": 10329,
+      "closed": 5065,
+      "wins": 2541,
+      "losses": 2524,
+      "win_rate": 0.501678,
+      "last_ts": "2026-02-10T22:24:02.583320+00:00",
+      "feature_dominance": {
+        "cruce_sma": {
+          "n": 5065,
+          "uniq": 2,
+          "dominance": 0.985982,
+          "top": "1"
+        },
+        "breakout": {
+          "n": 5065,
+          "uniq": 2,
+          "dominance": 0.949062,
+          "top": "1"
+        },
+        "rsi_reversion": {
+          "n": 5065,
+          "uniq": 2,
+          "dominance": 0.903258,
+          "top": "0"
+        },
+        "puntaje_estrategia": {
+          "n": 5065,
+          "uniq": 2,
+          "dominance": 0.968213,
+          "top": "0.666667"
+        },
+        "es_rebote": {
+          "n": 5065,
+          "uniq": 2,
+          "dominance": 0.936032,
+          "top": "0"
+        },
+        "volatilidad": {
+          "n": 5065,
+          "uniq": 1,
+          "dominance": 1.0,
+          "top": ""
+        },
+        "hora_bucket": {
+          "n": 5065,
+          "uniq": 1,
+          "dominance": 1.0,
+          "top": ""
+        }
+      }
+    },
+    {
+      "bot": "fulll47",
+      "path": "registro_enriquecido_fulll47.csv",
+      "exists": true,
+      "rows": 10330,
+      "closed": 5066,
+      "wins": 2537,
+      "losses": 2529,
+      "win_rate": 0.50079,
+      "last_ts": "2026-02-10T22:24:01.490602+00:00",
+      "feature_dominance": {
+        "cruce_sma": {
+          "n": 5066,
+          "uniq": 2,
+          "dominance": 0.985985,
+          "top": "1"
+        },
+        "breakout": {
+          "n": 5066,
+          "uniq": 2,
+          "dominance": 0.942163,
+          "top": "1"
+        },
+        "rsi_reversion": {
+          "n": 5066,
+          "uniq": 2,
+          "dominance": 0.898342,
+          "top": "0"
+        },
+        "puntaje_estrategia": {
+          "n": 5066,
+          "uniq": 2,
+          "dominance": 0.970193,
+          "top": "0.666667"
+        },
+        "es_rebote": {
+          "n": 5066,
+          "uniq": 2,
+          "dominance": 0.941966,
+          "top": "0"
+        },
+        "volatilidad": {
+          "n": 5066,
+          "uniq": 1,
+          "dominance": 1.0,
+          "top": ""
+        },
+        "hora_bucket": {
+          "n": 5066,
+          "uniq": 1,
+          "dominance": 1.0,
+          "top": ""
+        }
+      }
+    },
+    {
+      "bot": "fulll48",
+      "path": "registro_enriquecido_fulll48.csv",
+      "exists": true,
+      "rows": 10324,
+      "closed": 5058,
+      "wins": 2514,
+      "losses": 2544,
+      "win_rate": 0.497034,
+      "last_ts": "2026-02-10T22:23:48.786682+00:00",
+      "feature_dominance": {
+        "cruce_sma": {
+          "n": 5058,
+          "uniq": 2,
+          "dominance": 0.987742,
+          "top": "1"
+        },
+        "breakout": {
+          "n": 5058,
+          "uniq": 2,
+          "dominance": 0.948794,
+          "top": "1"
+        },
+        "rsi_reversion": {
+          "n": 5058,
+          "uniq": 2,
+          "dominance": 0.906287,
+          "top": "0"
+        },
+        "puntaje_estrategia": {
+          "n": 5058,
+          "uniq": 2,
+          "dominance": 0.969751,
+          "top": "0.666667"
+        },
+        "es_rebote": {
+          "n": 5058,
+          "uniq": 2,
+          "dominance": 0.94227,
+          "top": "0"
+        },
+        "volatilidad": {
+          "n": 5058,
+          "uniq": 1,
+          "dominance": 1.0,
+          "top": ""
+        },
+        "hora_bucket": {
+          "n": 5058,
+          "uniq": 1,
+          "dominance": 1.0,
+          "top": ""
+        }
+      }
+    },
+    {
+      "bot": "fulll49",
+      "path": "registro_enriquecido_fulll49.csv",
+      "exists": true,
+      "rows": 10348,
+      "closed": 5064,
+      "wins": 2536,
+      "losses": 2528,
+      "win_rate": 0.50079,
+      "last_ts": "2026-02-10T22:24:02.156623+00:00",
+      "feature_dominance": {
+        "cruce_sma": {
+          "n": 5064,
+          "uniq": 2,
+          "dominance": 0.987164,
+          "top": "1"
+        },
+        "breakout": {
+          "n": 5064,
+          "uniq": 2,
+          "dominance": 0.94293,
+          "top": "1"
+        },
+        "rsi_reversion": {
+          "n": 5064,
+          "uniq": 2,
+          "dominance": 0.898302,
+          "top": "0"
+        },
+        "puntaje_estrategia": {
+          "n": 5064,
+          "uniq": 2,
+          "dominance": 0.968207,
+          "top": "0.666667"
+        },
+        "es_rebote": {
+          "n": 5064,
+          "uniq": 2,
+          "dominance": 0.946485,
+          "top": "0"
+        },
+        "volatilidad": {
+          "n": 5064,
+          "uniq": 1,
+          "dominance": 1.0,
+          "top": ""
+        },
+        "hora_bucket": {
+          "n": 5064,
+          "uniq": 1,
+          "dominance": 1.0,
+          "top": ""
+        }
+      }
+    },
+    {
+      "bot": "fulll50",
+      "path": "registro_enriquecido_fulll50.csv",
+      "exists": true,
+      "rows": 10352,
+      "closed": 5076,
+      "wins": 2446,
+      "losses": 2630,
+      "win_rate": 0.481875,
+      "last_ts": "2026-02-10T22:23:48.797948+00:00",
+      "feature_dominance": {
+        "cruce_sma": {
+          "n": 5076,
+          "uniq": 2,
+          "dominance": 0.987392,
+          "top": "1"
+        },
+        "breakout": {
+          "n": 5076,
+          "uniq": 2,
+          "dominance": 0.94602,
+          "top": "1"
+        },
+        "rsi_reversion": {
+          "n": 5076,
+          "uniq": 2,
+          "dominance": 0.900709,
+          "top": "0"
+        },
+        "puntaje_estrategia": {
+          "n": 5076,
+          "uniq": 2,
+          "dominance": 0.967297,
+          "top": "0.666667"
+        },
+        "es_rebote": {
+          "n": 5076,
+          "uniq": 2,
+          "dominance": 0.927502,
+          "top": "0"
+        },
+        "volatilidad": {
+          "n": 5076,
+          "uniq": 1,
+          "dominance": 1.0,
+          "top": ""
+        },
+        "hora_bucket": {
+          "n": 5076,
+          "uniq": 1,
+          "dominance": 1.0,
+          "top": ""
+        }
+      }
+    }
+  ],
+  "signals": {
+    "path": "ia_signals_log.csv",
+    "exists": true,
+    "rows": 82,
+    "closed": 82,
+    "by_threshold": {
+      "0.65": {
+        "n": 82,
+        "hits": 37,
+        "win_rate": 0.45121951219512196
+      },
+      "0.7": {
+        "n": 82,
+        "hits": 37,
+        "win_rate": 0.45121951219512196
+      },
+      "0.75": {
+        "n": 69,
+        "hits": 30,
+        "win_rate": 0.43478260869565216
+      },
+      "0.8": {
+        "n": 38,
+        "hits": 19,
+        "win_rate": 0.5
+      }
+    },
+    "bins": {
+      "[0.70,0.80)": {
+        "n": 44,
+        "avg_pred": 0.752935,
+        "avg_real": 0.409091,
+        "gap": 0.343844
+      },
+      "[0.80,0.90)": {
+        "n": 29,
+        "avg_pred": 0.822706,
+        "avg_real": 0.482759,
+        "gap": 0.339948
+      },
+      "[0.90,1.00)": {
+        "n": 9,
+        "avg_pred": 0.999999,
+        "avg_real": 0.555556,
+        "gap": 0.444443
+      }
+    }
+  },
+  "auc_orientation": {
+    "status": "ok",
+    "auc": 0.566667,
+    "auc_if_flipped": 0.433333,
+    "message": "Orientación AUC aparentemente correcta."
+  },
+  "actions": [
+    "Subir muestra incremental a >=400 filas cerradas antes de cambios estructurales.",
+    "Corregir generación de volatilidad en origen bot: actualmente está plana en incremental.",
+    "Corregir generación de hora_bucket en origen bot: actualmente está plano en incremental.",
+    "Mantener gate conservador (LB + evidencia). No forzar gatillo duro 70% todavía.",
+    "Priorizar recalibración + shrink dinámico hasta reducir gap de bins altos a <10pp.",
+    "Rediseñar features binarias dominantes a intensidades continuas: cruce_sma, breakout, rsi_reversion, puntaje_estrategia, es_rebote, volatilidad, hora_bucket."
+  ]
+}
