@@ -13,6 +13,7 @@ import pandas as pd
 import time  # Added for timestamps in orden_real and BLOQUE 5
 import random  # Added for jitter in BLOQUE 1.3
 import itertools  # For req_counter in api_call
+import socket
 
 # === BLINDAJE: señales limpias ===
 import signal
@@ -249,7 +250,7 @@ def leer_orden_real(bot: str):
 # <<< PATCH 1
 
 # >>> PATCH: WS robusto
-WS_KW = dict(ping_interval=15, ping_timeout=10, close_timeout=5, max_queue=None)
+WS_KW = dict(ping_interval=20, ping_timeout=20, close_timeout=8, max_queue=None)
 # <<< PATCH
 
 # >>> PATCH (cerca de tus globals) BLOQUE 10
@@ -1602,12 +1603,28 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
             if _print_once("no-close-frame", ttl=15):
                 print(Fore.YELLOW + "WS cerrado sin close frame (resolverá en background). Mismo ciclo.")
             try:
+                asyncio.create_task(finalizar_contrato_bg(
+                    contract_id, 0, symbol, direccion, monto,
+                    rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
+                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade
+                ))
+            except Exception:
+                pass
+            try:
                 play_sfx("REINTENTA", vol=0.8)
             except Exception:
                 pass
             return "INDEFINIDO", 0.0
         except Exception as e:
             print(Fore.RED + Style.BRIGHT + f"[ERROR] Resultado INDEFINIDO: {e}. Reintentando mismo ciclo...")
+            try:
+                asyncio.create_task(finalizar_contrato_bg(
+                    contract_id, 0, symbol, direccion, monto,
+                    rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
+                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade
+                ))
+            except Exception:
+                pass
             try:
                 play_sfx("REINTENTA", vol=0.8)
             except Exception:
@@ -1896,10 +1913,23 @@ async def ejecutar_panel():
         except Exception:
             pass
 
-    async def _abrir_ws(token: str):
-        _ws = await websockets.connect(DERIV_WS_URL, **WS_KW)
-        await authorize_ws(_ws, token)
-        return _ws
+    async def _abrir_ws(token: str, tries: int = 4):
+        last = None
+        for i in range(max(1, int(tries))):
+            try:
+                _ws = await websockets.connect(DERIV_WS_URL, **WS_KW)
+                await authorize_ws(_ws, token)
+                return _ws
+            except (websockets.exceptions.WebSocketException, asyncio.TimeoutError, TimeoutError, OSError, socket.gaierror) as e:
+                last = e
+                wait_s = min(8.0, 1.0 + (i * 1.5)) + random.uniform(0.0, 0.5)
+                if _print_once(f"ws-open-retry-{type(e).__name__}", ttl=6):
+                    print(Fore.YELLOW + f"WS/NET inestable al abrir sesión ({type(e).__name__}). Reintento {i+1}/{tries} en {wait_s:.1f}s...")
+                await asyncio.sleep(wait_s)
+            except Exception as e:
+                last = e
+                await asyncio.sleep(0.8 + random.uniform(0.0, 0.3))
+        raise last if last else RuntimeError("No se pudo abrir WS")
 
     ws = None
     try:
