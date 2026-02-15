@@ -144,9 +144,9 @@ PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado
 VENTANA_DECISION_IA_S = 60        # segundos
 VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
 # === Filtro avanzado (sin cambiar 13 features) ===
-SCORE_MIN = 2.90            # equilibrio: calidad alta sin ahogar frecuencia de señal
-SCORE_DROP_MAX = 0.60       # equilibrio: tolerancia moderada en revalidación pre-buy
-REVALIDAR_VELAS_N = 8       # revalidación ágil para no perder demasiadas entradas válidas
+SCORE_MIN = 2.85            # equilibrio: más entradas válidas sin relajar demasiado la calidad
+SCORE_DROP_MAX = 0.65       # tolerancia un poco mayor para no perder señales por micro-ruido
+REVALIDAR_VELAS_N = 7       # revalidación más rápida para evitar quedarse colgado buscando chance
 resultado_global = {"demo": 0.0, "real": 0.0}
 ultimo_token = None
 reinicio_forzado = asyncio.Event()
@@ -1026,9 +1026,9 @@ def puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, c
 
 
 def setup_pasa_filtro(score: float, condiciones: int) -> bool:
-    """Gate de calidad: mantiene >=2/3 y exige score mínimo."""
+    """Gate de calidad: exige al menos 2 confirmaciones y score mínimo."""
     try:
-        return (int(condiciones) >= 3) and (float(score) >= float(SCORE_MIN))
+        return (int(condiciones) >= 2) and (float(score) >= float(SCORE_MIN))
     except Exception:
         return False
 # ==================== WS HELPERS ====================
@@ -1340,7 +1340,7 @@ async def consultar_saldo_real(ws):
 # ==================== LÓGICA DE OPERACIÓN ====================
 async def buscar_estrategia(ws, ciclo, token):
     print(Fore.MAGENTA + Style.BRIGHT + f"\nBuscando señal válida para Martingala #{ciclo}")
-    for intento in range(1, 11):
+    for intento in range(1, 9):
         if reinicio_forzado.is_set():
             return "REINTENTAR", None, None, None, None, None, None, None, None, None
         if MODO_SILENCIOSO and estado_bot.get("modo_manual"):
@@ -1385,9 +1385,9 @@ async def buscar_estrategia(ws, ciclo, token):
         if activos_invalidos:
             msg_sil = (MODO_SILENCIOSO and estado_bot.get("modo_manual"))
             if not msg_sil:
-                print(Fore.YELLOW + f"Ningún activo válido en intento #{intento}. Esperando 15s...")
-            elif intento in (1, 5, 10):
-                print(Fore.YELLOW + f"Sin activo válido (intento #{intento}, silencioso). Esperando 15s...")
+                print(Fore.YELLOW + f"Ningún activo válido en intento #{intento}. Esperando 12s...")
+            elif intento in (1, 4, 8):
+                print(Fore.YELLOW + f"Sin activo válido (intento #{intento}, silencioso). Esperando 12s...")
         # Nueva lógica: si todos salieron inválidos y la racha de 1006 es alta, pide reconexión
         if len(activos_invalidos) == len(ACTIVOS) and _ws_fail_streak >= len(ACTIVOS):
             if _print_once("ws-reopen-needed", ttl=15):
@@ -1395,13 +1395,13 @@ async def buscar_estrategia(ws, ciclo, token):
             ws_reset_needed.set()
             # No seguimos martillando: pequeño respiro
             await asyncio.sleep(1.0 + random.uniform(0.0, 0.5))  # Jitter
-        await asyncio.sleep(15 + random.uniform(0.0, 0.5))  # Jitter para pausas
-    print(Fore.RED + Style.BRIGHT + f"No se encontró activo válido tras 10 intentos para Martingala #{ciclo}. Reintentando MISMO ciclo...")
+        await asyncio.sleep(12 + random.uniform(0.0, 0.5))  # Jitter para pausas (más ágil)
+    print(Fore.RED + Style.BRIGHT + f"No se encontró activo válido tras 8 intentos para Martingala #{ciclo}. Reintentando MISMO ciclo...")
     try:
         play_sfx("REINTENTA", vol=0.8)
     except Exception:
         pass
-    await asyncio.sleep(30)
+    await asyncio.sleep(20)
     return "REINTENTAR", None, None, None, None, None, None, None, None, None
 
 async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, ciclo, payout, condiciones, token_usado_buy, epoch_pretrade=None):
