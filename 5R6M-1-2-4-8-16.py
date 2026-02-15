@@ -180,7 +180,10 @@ REGIME_GATE_WEIGHT_REGIME = 0.20      # peso de la calidad de régimen
 REGIME_GATE_WEIGHT_EVIDENCE = 0.10    # peso de evidencia histórica real (N + WR)
 EVIDENCE_MIN_N_HARD = 60              # si hay >=N evidencia fuerte, exigir WR mínimo
 EVIDENCE_MIN_WR_HARD = 0.70           # objetivo de calidad real por bot para habilitar auto-REAL
-EVIDENCE_MIN_LB_HARD = 0.65           # candado conservador: límite inferior mínimo con evidencia
+EVIDENCE_MIN_LB_HARD = 0.65           # candado conservador: límite inferior mínimo con evidencia fuerte
+EVIDENCE_MIN_N_SOFT = 20              # evidencia mínima blanda para validar LB intermedio
+EVIDENCE_MIN_LB_SOFT = 0.55           # LB mínimo cuando N aún es intermedio
+EVIDENCE_LOW_N_EXTRA_MARGIN = 0.05    # margen extra de p_real si aún no hay N mínimo blando
 POSTERIOR_EVIDENCE_K = 80             # inercia: más alto = más peso al histórico para p_real
 POSTERIOR_REGIME_BLEND = 0.35         # mezcla del score de régimen dentro de p_real
 EVIDENCE_CACHE_TTL_S = 20.0
@@ -8817,11 +8820,18 @@ async def main():
                                         )
                                         continue
 
+                                    # Candado blando: con muestra intermedia exigimos LB mínimo intermedio.
+                                    if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (ev_lb < float(EVIDENCE_MIN_LB_SOFT)):
+                                        continue
+
                                     # 6) Prob REAL posterior (modelo + régimen + evidencia + bound)
                                     p_post = _prob_real_posterior(float(p), float(regime_score), int(ev_n), float(ev_wr), float(ev_lb))
 
                                     # Candado final: el umbral REAL se valida sobre la probabilidad posterior (no p_model)
-                                    if float(p_post) < float(umbral_ia_real):
+                                    thr_post = float(umbral_ia_real)
+                                    if ev_n < int(EVIDENCE_MIN_N_SOFT):
+                                        thr_post = min(0.99, thr_post + float(EVIDENCE_LOW_N_EXTRA_MARGIN))
+                                    if float(p_post) < float(thr_post):
                                         continue
 
                                     # 7) Ranking final (Capa B + régimen + evidencia)
