@@ -188,6 +188,14 @@ POSTERIOR_EVIDENCE_K = 80             # inercia: más alto = más peso al histó
 POSTERIOR_REGIME_BLEND = 0.35         # mezcla del score de régimen dentro de p_real
 EVIDENCE_CACHE_TTL_S = 20.0
 
+# Guardas de honestidad operacional (alineadas al diagnóstico)
+DIAG_PATH = "diagnostico_pipeline_ia.json"
+ORIENTATION_RECHECK_S = 90.0
+ORIENTATION_FLIP_MIN_DELTA = 0.03
+HARD_GATE_MAX_GAP_HIGH_BINS = 0.10
+HARD_GATE_MIN_N_FOR_HIGH_THR = 200
+INCREMENTAL_DUP_SCAN_LINES = 6000
+
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
 AUDIO_IA53_THR = IA_ACTIVACION_REAL_THR
 
@@ -1076,6 +1084,43 @@ def _make_sig(row_dict):
         return hashlib.sha256(s.encode("utf-8")).hexdigest()
     except:
         return None
+
+_INCREMENTAL_SIG_CACHE = {"mtime": 0.0, "sigs": set()}
+
+def _load_incremental_signatures(ruta: str, feats: list, max_rows: int = INCREMENTAL_DUP_SCAN_LINES) -> set:
+    """Carga firmas recientes del incremental para bloquear duplicados exactos aunque reinicie el bot."""
+    try:
+        if not os.path.exists(ruta):
+            return set()
+        mtime = float(os.path.getmtime(ruta) or 0.0)
+        cache = _INCREMENTAL_SIG_CACHE
+        if cache.get("mtime") == mtime and cache.get("sigs"):
+            return set(cache.get("sigs") or set())
+
+        sigs = set()
+        with open(ruta, "r", encoding="utf-8", errors="replace", newline="") as f:
+            rows = list(csv.DictReader(f))
+        if max_rows > 0:
+            rows = rows[-int(max_rows):]
+        for r in rows:
+            try:
+                vals = [float(r.get(k, 0.0) or 0.0) for k in feats]
+                lab = int(float(r.get("result_bin", 0) or 0))
+                sigs.add(_firma_registro(feats, vals, lab))
+            except Exception:
+                continue
+        _INCREMENTAL_SIG_CACHE["mtime"] = mtime
+        _INCREMENTAL_SIG_CACHE["sigs"] = set(sigs)
+        return sigs
+    except Exception:
+        return set()
+
+def _incremental_signature_exists(ruta: str, sig: str, feats: list) -> bool:
+    try:
+        return sig in _load_incremental_signatures(ruta, feats, max_rows=INCREMENTAL_DUP_SCAN_LINES)
+    except Exception:
+        return False
+
 # Nueva: Validar fila para incremental (blindaje contra basura)
 def validar_fila_incremental(fila_dict, feature_names):
     # Asegura numericidad real
@@ -1154,8 +1199,10 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
         row_vals = [float(fila_dict[k]) for k in feats]
         sig = _firma_registro(feats, row_vals, label)
 
-        # Anti-duplicado persistente (últimas N)
+        # Anti-duplicado persistente (cache local + escaneo incremental reciente)
         if _sig_in_cache(bot, sig, max_keep=50):
+            return False
+        if _incremental_signature_exists(ruta, sig, feats):
             return False
 
         attempts = 8
@@ -1204,6 +1251,11 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
                         os.fsync(f.fileno())
 
                     _save_last_sig(bot, sig)
+                    try:
+                        _INCREMENTAL_SIG_CACHE.setdefault("sigs", set()).add(sig)
+                        _INCREMENTAL_SIG_CACHE["mtime"] = float(os.path.getmtime(ruta) or 0.0)
+                    except Exception:
+                        pass
                     return True
 
                 except PermissionError:
@@ -3221,6 +3273,91 @@ def _leer_base_rate_y_n70(ttl_s: float = 30.0):
         return 0.5, 0
 
 
+_IA_ORIENTATION_CACHE = {"ts": 0.0, "invert": False, "auc": None, "auc_flip": None, "source": "none"}
+_DIAG_RUNTIME_GATE_CACHE = {"ts": 0.0, "max_gap": 0.0, "n75": 0, "force_evidence": False}
+
+def _leer_gate_desde_diagnostico(ttl_s: float = 60.0) -> dict:
+    """Lee guardas operativas desde diagnostico_pipeline_ia.json."""
+    global _DIAG_RUNTIME_GATE_CACHE
+    now = time.time()
+    try:
+        if (now - float(_DIAG_RUNTIME_GATE_CACHE.get("ts", 0.0))) <= float(ttl_s):
+            return dict(_DIAG_RUNTIME_GATE_CACHE)
+
+        out = {"ts": now, "max_gap": 0.0, "n75": 0, "force_evidence": False}
+        if os.path.exists(DIAG_PATH):
+            with open(DIAG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                diag = json.load(f)
+            sig = (diag or {}).get("signals", {}) if isinstance(diag, dict) else {}
+            out["max_gap"] = float(sig.get("max_gap_abs_high_bins", 0.0) or 0.0)
+            out["n75"] = int((sig.get("by_threshold", {}).get("0.75", {}) or {}).get("n", 0) or 0)
+            out["force_evidence"] = (out["max_gap"] > float(HARD_GATE_MAX_GAP_HIGH_BINS)) or (out["n75"] < int(HARD_GATE_MIN_N_FOR_HIGH_THR))
+
+        _DIAG_RUNTIME_GATE_CACHE = out
+        return dict(out)
+    except Exception:
+        return {"ts": now, "max_gap": 0.0, "n75": 0, "force_evidence": False}
+
+
+def _resolver_orientacion_runtime(ttl_s: float = ORIENTATION_RECHECK_S) -> dict:
+    """
+    Determina si conviene invertir p->1-p con evidencia cerrada (mismo set p vs 1-p).
+    """
+    global _IA_ORIENTATION_CACHE
+    now = time.time()
+    try:
+        if (now - float(_IA_ORIENTATION_CACHE.get("ts", 0.0))) <= float(ttl_s):
+            return dict(_IA_ORIENTATION_CACHE)
+
+        inv = False
+        auc = None
+        auc_flip = None
+        source = "none"
+
+        _ensure_ia_signals_log()
+        df = _safe_read_csv_any_encoding(IA_SIGNALS_LOG)
+        if df is not None and not df.empty and {"prob", "y"}.issubset(df.columns):
+            y = pd.to_numeric(df["y"], errors="coerce")
+            p = pd.to_numeric(df["prob"], errors="coerce")
+            m = y.isin([0, 1]) & p.notna()
+            yy = y[m].astype(int)
+            pp = p[m].astype(float)
+            if len(yy) >= 30 and len(set(yy.tolist())) >= 2:
+                auc = float(roc_auc_score(yy, pp))
+                auc_flip = float(roc_auc_score(yy, 1.0 - pp))
+                if (auc_flip - auc) >= float(ORIENTATION_FLIP_MIN_DELTA):
+                    inv = True
+                source = "signals"
+
+        # fallback al meta si no hay evidencia suficiente
+        if source == "none":
+            meta = leer_model_meta() or {}
+            a = float(meta.get("auc", 0.0) or 0.0)
+            if a > 0:
+                auc = a
+                auc_flip = 1.0 - a
+                inv = (auc_flip - auc) >= float(ORIENTATION_FLIP_MIN_DELTA)
+                source = "model_meta"
+
+        _IA_ORIENTATION_CACHE = {"ts": now, "invert": bool(inv), "auc": auc, "auc_flip": auc_flip, "source": source}
+        return dict(_IA_ORIENTATION_CACHE)
+    except Exception:
+        return {"ts": now, "invert": False, "auc": None, "auc_flip": None, "source": "error"}
+
+
+def _aplicar_orientacion_prob(prob: float | None) -> float | None:
+    try:
+        if not isinstance(prob, (int, float)):
+            return prob
+        p = max(0.0, min(1.0, float(prob)))
+        ori = _resolver_orientacion_runtime()
+        if bool(ori.get("invert", False)):
+            return float(max(0.0, min(1.0, 1.0 - p)))
+        return p
+    except Exception:
+        return prob
+
+
 def _ajustar_prob_operativa(prob: float | None) -> float | None:
     """
     Shrinkage anti-sobreconfianza: p_ajustada = a*p + (1-a)*tasa_base_rolling.
@@ -4339,6 +4476,7 @@ def actualizar_prob_ia_bot(bot: str):
         p, err = predecir_prob_ia_bot(bot)
 
         if p is not None:
+            p = _aplicar_orientacion_prob(float(p))
             p = _ajustar_prob_operativa(float(p))
             estado_bots[bot]["prob_ia"] = float(p)
             estado_bots[bot]["ia_ready"] = True
@@ -4441,6 +4579,7 @@ def actualizar_prob_ia_bots_tick():
 
             # Guardar raw (modelo calibrado) y métricas SOLO como diagnóstico (NO ajustar prob_ia)
             prob_raw = float(prob)
+            prob_raw = float(_aplicar_orientacion_prob(prob_raw))
             estado_bots[bot]["prob_ia_raw"] = prob_raw
 
             # Auditoría/calibración: calcular UNA sola vez por tick (evita leer CSV 6 veces)
@@ -8761,6 +8900,7 @@ async def main():
 
                         # Candidatos: prob válida, reciente, IA activa (no OFF)
                         candidatos = []
+                        diag_gate = _leer_gate_desde_diagnostico(ttl_s=60.0)
                         if not lock_activo:
                             for b in BOT_NAMES:
                                 try:
@@ -8833,6 +8973,12 @@ async def main():
                                         thr_post = min(0.99, thr_post + float(EVIDENCE_LOW_N_EXTRA_MARGIN))
                                     if float(p_post) < float(thr_post):
                                         continue
+
+                                    # Candado anti-overconfidence global: si el diagnóstico reporta gap alto,
+                                    # solo promover con evidencia fuerte (LB + N) aunque p_post supere umbral.
+                                    if bool(diag_gate.get("force_evidence", False)):
+                                        if not ((ev_n >= int(EVIDENCE_MIN_N_HARD)) and (ev_lb >= float(EVIDENCE_MIN_LB_HARD))):
+                                            continue
 
                                     # 7) Ranking final (Capa B + régimen + evidencia)
                                     evidence_score = min(1.0, p_post + min(0.15, ev_n / 400.0))
