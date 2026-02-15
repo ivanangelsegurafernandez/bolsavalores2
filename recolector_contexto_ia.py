@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 import json
 from collections import Counter
+from math import isnan
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,35 @@ FEATURES_CORE = [
 TARGET_DUPLICATES_RATIO_MAX = 0.02
 TARGET_BIN_GAP_MAX = 0.10
 TARGET_HIGH_SAMPLE_MIN = 200
+
+
+def _auc_binary(y_true: list[int], y_score: list[float]) -> float | None:
+    """Calcula AUC ROC binaria sin dependencias externas."""
+    if len(y_true) != len(y_score) or not y_true:
+        return None
+    pos = sum(1 for y in y_true if y == 1)
+    neg = sum(1 for y in y_true if y == 0)
+    if pos == 0 or neg == 0:
+        return None
+    pairs = sorted(zip(y_score, y_true), key=lambda x: x[0])
+    rank = 1
+    sum_pos_ranks = 0.0
+    i = 0
+    n = len(pairs)
+    while i < n:
+        j = i
+        score = pairs[i][0]
+        while j < n and pairs[j][0] == score:
+            j += 1
+        avg_rank = (rank + (rank + (j - i) - 1)) / 2.0
+        pos_in_tie = sum(1 for k in range(i, j) if pairs[k][1] == 1)
+        sum_pos_ranks += pos_in_tie * avg_rank
+        rank += (j - i)
+        i = j
+    auc = (sum_pos_ranks - (pos * (pos + 1) / 2.0)) / (pos * neg)
+    if isnan(auc):
+        return None
+    return float(auc)
 
 
 def _safe_read_csv(path: Path) -> list[dict[str, str]]:
@@ -165,6 +195,12 @@ def summarize_signals() -> dict[str, Any]:
         "by_threshold": {},
         "bins": {},
         "max_gap_abs_high_bins": 0.0,
+        "orientation": {
+            "status": "unknown",
+            "auc": None,
+            "auc_if_flipped": None,
+            "message": "Sin datos suficientes para chequear orientación en señales cerradas.",
+        },
     }
     if not rows:
         return out
@@ -181,6 +217,8 @@ def summarize_signals() -> dict[str, Any]:
         parsed.append((p, yb))
 
     out["closed"] = len(parsed)
+    y_true = [y for _, y in parsed]
+    y_score = [p for p, _ in parsed]
 
     for thr in (0.65, 0.70, 0.75, 0.80):
         grp = [(p, y) for p, y in parsed if p >= thr]
@@ -210,6 +248,29 @@ def summarize_signals() -> dict[str, Any]:
             max_gap = max(max_gap, abs(avg_pred - avg_real))
 
     out["max_gap_abs_high_bins"] = round(max_gap, 6)
+
+    auc_signal = _auc_binary(y_true, y_score)
+    if auc_signal is None:
+        out["orientation"] = {
+            "status": "unknown",
+            "auc": None,
+            "auc_if_flipped": None,
+            "message": "Sin datos suficientes para AUC en señales cerradas.",
+        }
+    elif auc_signal < 0.50:
+        out["orientation"] = {
+            "status": "possible_inversion",
+            "auc": round(auc_signal, 6),
+            "auc_if_flipped": round(1.0 - auc_signal, 6),
+            "message": "AUC de señales <0.50: revisar orientación (p->1-p) o target invertido.",
+        }
+    else:
+        out["orientation"] = {
+            "status": "ok",
+            "auc": round(auc_signal, 6),
+            "auc_if_flipped": round(1.0 - auc_signal, 6),
+            "message": "Orientación de señales cerradas aparentemente correcta.",
+        }
 
     return out
 
@@ -270,6 +331,12 @@ def build_actions(diag: dict[str, Any]) -> list[str]:
             f"Revisar orientación del modelo: AUC={auc_check.get('auc')} (<0.50), AUC invertida estimada={auc_check.get('auc_if_flipped')}."
         )
 
+    sig_orientation = diag.get("signals", {}).get("orientation", {})
+    if str(sig_orientation.get("status")) == "possible_inversion":
+        actions.append(
+            f"Posible inversión en salida operativa: AUC señales={sig_orientation.get('auc')} (<0.50), invertida={sig_orientation.get('auc_if_flipped')}."
+        )
+
     fvol = inc.get("features", {}).get("volatilidad", {})
     fhb = inc.get("features", {}).get("hora_bucket", {})
     if fvol.get("uniq", 0) <= 1:
@@ -321,8 +388,18 @@ def build_checklist(diag: dict[str, Any]) -> list[dict[str, Any]]:
     gap = float(sig.get("max_gap_abs_high_bins", 0.0) or 0.0)
     n70 = int(sig.get("by_threshold", {}).get("0.7", {}).get("n", 0) or 0)
     wr70 = float(sig.get("by_threshold", {}).get("0.7", {}).get("win_rate", 0.0) or 0.0)
+    orientation_model_ok = str(diag.get("auc_orientation", {}).get("status", "unknown")) == "ok"
+    orientation_signal_ok = str(sig.get("orientation", {}).get("status", "unknown")) == "ok"
 
     return [
+        {
+            "metric": "orientación modelo/señal consistente (AUC>0.50)",
+            "ok": orientation_model_ok and orientation_signal_ok,
+            "detail": (
+                f"model={diag.get('auc_orientation', {}).get('status')}, "
+                f"signals={sig.get('orientation', {}).get('status')}"
+            ),
+        },
         {
             "metric": "volatilidad y hora_bucket dejan de ser ROTA",
             "ok": volatility_ok and hour_ok,
@@ -365,6 +442,13 @@ def build_markdown(diag: dict[str, Any]) -> str:
     md.append(f"- features activas: {meta.get('features')}")
     md.append(f"- chequeo orientación AUC: {auc_check.get('status')} | auc={auc_check.get('auc')} | auc_invertida={auc_check.get('auc_if_flipped')}")
     md.append(f"- nota AUC: {auc_check.get('message')}")
+
+    sig_orientation = diag.get("signals", {}).get("orientation", {})
+    md.append("\n## Orientación operativa (señales cerradas)")
+    md.append(
+        f"- estado: {sig_orientation.get('status')} | auc={sig_orientation.get('auc')} | auc_invertida={sig_orientation.get('auc_if_flipped')}"
+    )
+    md.append(f"- nota: {sig_orientation.get('message')}")
 
     inc = diag["incremental"]
     md.append("\n## Incremental")
@@ -409,6 +493,11 @@ def build_markdown(diag: dict[str, Any]) -> str:
     md.append("\n## Acciones sugeridas")
     for i, a in enumerate(diag["actions"], start=1):
         md.append(f"{i}. {a}")
+
+    md.append("\n## Fases recomendadas (orden de impacto)")
+    md.append("1. Fase A - Honestidad de señal: corregir orientación y mantener gate conservador por LB+N.")
+    md.append("2. Fase B - Sanidad de datos: revivir volatilidad/hora_bucket en origen y deduplicar incremental <2%.")
+    md.append("3. Fase C - Evidencia: acumular n>=200 en el umbral objetivo antes de endurecer gatillos.")
 
     return "\n".join(md) + "\n"
 
