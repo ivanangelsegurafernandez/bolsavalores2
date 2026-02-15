@@ -1,6 +1,6 @@
 # Reporte IA: Real vs Ficticia
 
-- Generado (UTC): 2026-02-15T22:45:20.458922+00:00
+- Generado (UTC): 2026-02-15T23:06:02.006047+00:00
 - Señales cerradas: 82
 
 ## Orientación
@@ -35,11 +35,19 @@
 | fulll49 | 20 | 80.90% | 30.00% | +50.90% | 14.55% |
 | fulll50 | 17 | 79.62% | 52.94% | +26.68% | 30.96% |
 
+## Calidad de datos (incremental/bots)
+- Filas incremental: 154
+- Duplicados exactos: 29 (18.83%)
+- Features rotas incremental: volatilidad, hora_bucket
+- Features rotas en bots: fulll45:volatilidad,hora_bucket; fulll46:volatilidad,hora_bucket; fulll47:volatilidad,hora_bucket; fulll48:volatilidad,hora_bucket; fulll49:volatilidad,hora_bucket; fulll50:volatilidad,hora_bucket
+
 ## ¿Vamos en buen camino?
 - Orientación ok: ✅
 - Gap bins altos <10pp: ❌
 - Evidencia n>=200 en >=70: ❌
 - Real >=70% arriba de 60%: ❌
+- Duplicados <2%: ❌
+- Volatilidad/hora_bucket vivas: ❌
 
 ## Resumen ejecutivo
 - Estado critico: orientación=OK, gap_max=44.4pp, n>=70=82, real>=70=45.1%

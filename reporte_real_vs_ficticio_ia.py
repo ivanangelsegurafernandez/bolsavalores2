@@ -99,6 +99,48 @@ def _load_closed() -> list[ClosedSignal]:
     return out
 
 
+
+def _diag_quality_snapshot() -> dict[str, Any]:
+    out = {
+        'available': DIAG.exists(),
+        'incremental_rows': 0,
+        'duplicates_exact': 0,
+        'duplicates_ratio': 0.0,
+        'dead_features_incremental': [],
+        'dead_features_bots': {},
+    }
+    if not DIAG.exists():
+        return out
+    try:
+        d = json.loads(DIAG.read_text(encoding='utf-8'))
+        inc = d.get('incremental', {}) if isinstance(d, dict) else {}
+        out['incremental_rows'] = int(inc.get('rows', 0) or 0)
+        out['duplicates_exact'] = int(inc.get('duplicates_exact', 0) or 0)
+        out['duplicates_ratio'] = float(inc.get('duplicates_ratio', 0.0) or 0.0)
+
+        feat_inc = inc.get('features', {}) if isinstance(inc.get('features', {}), dict) else {}
+        for f in ('volatilidad', 'hora_bucket'):
+            st = feat_inc.get(f, {}) if isinstance(feat_inc.get(f, {}), dict) else {}
+            if int(st.get('uniq', 0) or 0) <= 1:
+                out['dead_features_incremental'].append(f)
+
+        bots = d.get('bots', []) if isinstance(d, dict) else []
+        for b in bots:
+            bot = str(b.get('bot', '') or '')
+            dom = b.get('feature_dominance', {}) if isinstance(b.get('feature_dominance', {}), dict) else {}
+            dead = []
+            for f in ('volatilidad', 'hora_bucket'):
+                st = dom.get(f, {}) if isinstance(dom.get(f, {}), dict) else {}
+                if int(st.get('uniq', 0) or 0) <= 1:
+                    dead.append(f)
+            if dead:
+                out['dead_features_bots'][bot] = dead
+
+        return out
+    except Exception:
+        return out
+
+
 def build_report() -> dict[str, Any]:
     closed = _load_closed()
     report: dict[str, Any] = {
@@ -111,10 +153,13 @@ def build_report() -> dict[str, Any]:
         'orientation': {},
         'summary': {},
         'roadmap_status': {},
+        'data_quality': {},
     }
     if not closed:
         report['summary'] = {'status': 'sin_datos', 'message': 'No hay señales cerradas en ia_signals_log.csv'}
         return report
+
+    report['data_quality'] = _diag_quality_snapshot()
 
     y_true = [r.y for r in closed]
     y_pred = [r.prob for r in closed]
@@ -191,23 +236,22 @@ def build_report() -> dict[str, Any]:
         'max_abs_gap': round(max_gap, 6),
     }
 
+    q = report.get('data_quality', {}) or {}
+    dup_ratio = float(q.get('duplicates_ratio', 0.0) or 0.0)
+    dead_inc = list(q.get('dead_features_incremental', []) or [])
+    report['roadmap_status']['duplicates_ok'] = dup_ratio < 0.02
+    report['roadmap_status']['core_features_alive'] = len(dead_inc) == 0
     flags = report['roadmap_status']
-    score = sum(1 for k in ('orientation_ok', 'gap_high_bins_ok', 'n70_enough', 'wr70_progress') if flags.get(k))
-    status = 'bien_encaminado' if score >= 3 else ('en_riesgo' if score == 2 else 'critico')
+    score = sum(1 for k in ('orientation_ok', 'gap_high_bins_ok', 'n70_enough', 'wr70_progress', 'duplicates_ok', 'core_features_alive') if flags.get(k))
+    status = 'bien_encaminado' if score >= 5 else ('en_riesgo' if score >= 3 else 'critico')
     report['summary'] = {
         'status': status,
-        'score_ok_4': score,
+        'score_ok_6': score,
         'headline': (
             f"Estado {status}: orientación={'OK' if flags['orientation_ok'] else 'REVISAR'}, "
             f"gap_max={flags['max_abs_gap']*100:.1f}pp, n>=70={n70}, real>=70={wr70*100:.1f}%"
         ),
     }
-
-    if DIAG.exists():
-        try:
-            report['diagnostico_pipeline_ref'] = json.loads(DIAG.read_text(encoding='utf-8'))
-        except Exception:
-            report['diagnostico_pipeline_ref'] = {'error': 'no_parse'}
 
     return report
 
@@ -249,11 +293,24 @@ def render_md(rep: dict[str, Any]) -> str:
         )
 
     r = rep.get('roadmap_status', {})
+    q = rep.get('data_quality', {})
+    lines.append('\n## Calidad de datos (incremental/bots)')
+    lines.append(f"- Filas incremental: {q.get('incremental_rows', 0)}")
+    lines.append(f"- Duplicados exactos: {q.get('duplicates_exact', 0)} ({float(q.get('duplicates_ratio', 0.0) or 0.0):.2%})")
+    dead_inc = q.get('dead_features_incremental', []) or []
+    lines.append(f"- Features rotas incremental: {', '.join(dead_inc) if dead_inc else 'ninguna'}")
+    dead_bots = q.get('dead_features_bots', {}) or {}
+    if dead_bots:
+        bots_txt = '; '.join([f"{b}:{','.join(v)}" for b, v in sorted(dead_bots.items())])
+        lines.append(f"- Features rotas en bots: {bots_txt}")
+
     lines.append('\n## ¿Vamos en buen camino?')
     lines.append(f"- Orientación ok: {'✅' if r.get('orientation_ok') else '❌'}")
     lines.append(f"- Gap bins altos <10pp: {'✅' if r.get('gap_high_bins_ok') else '❌'}")
     lines.append(f"- Evidencia n>=200 en >=70: {'✅' if r.get('n70_enough') else '❌'}")
     lines.append(f"- Real >=70% arriba de 60%: {'✅' if r.get('wr70_progress') else '❌'}")
+    lines.append(f"- Duplicados <2%: {'✅' if r.get('duplicates_ok') else '❌'}")
+    lines.append(f"- Volatilidad/hora_bucket vivas: {'✅' if r.get('core_features_alive') else '❌'}")
 
     sm = rep.get('summary', {})
     lines.append('\n## Resumen ejecutivo')

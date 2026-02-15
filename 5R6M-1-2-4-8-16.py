@@ -2168,17 +2168,32 @@ def calcular_volatilidad_simple(row_dict: dict) -> float:
     """
     Proxy de volatilidad 0–1 menos saturante que el clip lineal.
 
-    Usa spread relativo SMA5/SMA20 y lo comprime con curva exponencial para
-    evitar que termine en 1.0 constante cuando el spread bruto se dispara.
+    Prioridad:
+    1) spread relativo SMA5/SMA20
+    2) fallback OHLC (high-low sobre close/open)
     """
     try:
         sma5 = float(row_dict.get("sma_5", 0.0) or 0.0)
         sma20 = float(row_dict.get("sma_20", 0.0) or 0.0)
     except Exception:
-        return 0.0
+        sma5 = 0.0
+        sma20 = 0.0
 
-    base = abs(sma20) if abs(sma20) > 1e-9 else 1.0
-    spread_pct = abs(sma5 - sma20) / base
+    base = abs(sma20) if abs(sma20) > 1e-9 else 0.0
+    spread_pct = (abs(sma5 - sma20) / base) if base > 0 else 0.0
+
+    # Fallback OHLC cuando SMA viene vacío/plano
+    if (not math.isfinite(spread_pct)) or spread_pct <= 0.0:
+        try:
+            hi = float(row_dict.get("high", row_dict.get("max", 0.0)) or 0.0)
+            lo = float(row_dict.get("low", row_dict.get("min", 0.0)) or 0.0)
+            c0 = float(row_dict.get("close", row_dict.get("precio_cierre", 0.0)) or 0.0)
+            o0 = float(row_dict.get("open", row_dict.get("precio_apertura", 0.0)) or 0.0)
+            base2 = max(abs(c0), abs(o0), 1e-9)
+            spread_pct = abs(hi - lo) / base2
+        except Exception:
+            spread_pct = 0.0
+
     if not math.isfinite(spread_pct) or spread_pct <= 0.0:
         return 0.0
 
@@ -2269,7 +2284,7 @@ def _parse_hora_bucket(row_dict) -> tuple[float, bool]:
         except Exception:
             pass
 
-    for k in ("epoch", "timestamp"):
+    for k in ("epoch", "timestamp", "open_epoch", "close_epoch", "entry_epoch", "ts_epoch", "server_time"):
         v = (row_dict or {}).get(k, None)
         if _missing(v):
             continue
@@ -5507,9 +5522,11 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
 
 def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = None):
     """
-    Builder ultra-robusto:
+    Builder robusto con limpieza de calidad:
     - label col canónica (o fallback a última)
     - y a {0,1} con coerción
+    - anti-duplicados exactos (features+label)
+    - filtro de filas con features críticas vacías (cuando hay suficiente muestra)
     - X con reindex => jamás KeyError
     - NaN/inf => 0.0
     Devuelve: X, y, label_col
@@ -5531,12 +5548,47 @@ def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = Non
     if int(mask.sum()) <= 0:
         return None, None, label_col
 
+    # Filtro de calidad para features críticas (volatilidad/hora_bucket)
+    # Solo se aplica si deja muestra suficiente para no bloquear entrenamiento.
+    quality_mask = pd.Series(True, index=df.index)
+    for crit in ("volatilidad", "hora_bucket"):
+        if crit in df.columns:
+            vv = pd.to_numeric(df[crit], errors="coerce")
+            quality_mask &= vv.notna()
+
+    if int((mask & quality_mask).sum()) >= int(max(60, 0.50 * int(mask.sum()))):
+        mask = mask & quality_mask
+
+    if int(mask.sum()) <= 0:
+        return None, None, label_col
+
     # X (reindex = blindaje)
     X = df.reindex(columns=feats, fill_value=0.0).loc[mask].copy()
     X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     # y final
     y = y01.loc[mask].astype(int)
+
+    # Anti-duplicados exactos (features+label) para reducir sobreconfianza artificial
+    # keep='last' favorece estado más reciente cuando hay repeticiones.
+    before_n = int(len(X))
+    try:
+        sig = X.round(6).astype(str).agg("|".join, axis=1) + "|" + y.astype(int).astype(str)
+        keep = ~sig.duplicated(keep="last")
+        X = X.loc[keep].copy()
+        y = y.loc[keep].copy()
+    except Exception:
+        pass
+
+    try:
+        globals()["_LAST_XY_QUALITY"] = {
+            "rows_before": before_n,
+            "rows_after": int(len(X)),
+            "duplicates_removed": max(0, before_n - int(len(X))),
+            "used_quality_mask": bool(int((quality_mask & y01.isin([0.0, 1.0])).sum()) >= int(max(60, 0.50 * int(y01.isin([0.0, 1.0]).sum())))),
+        }
+    except Exception:
+        pass
 
     return X, y, label_col
 
@@ -6805,6 +6857,17 @@ def maybe_retrain(force: bool = False):
         X, y, feats_used, label_col = _build_Xy_incremental(df, feature_names=feats_pref)
         if X is None or y is None or feats_used is None:
             return False
+
+        # Telemetría de limpieza (dedup + calidad mínima) para diagnóstico en vivo.
+        try:
+            q = globals().get("_LAST_XY_QUALITY", {}) or {}
+            dup_rm = int(q.get("duplicates_removed", 0) or 0)
+            rb = int(q.get("rows_before", len(X)) or len(X))
+            ra = int(q.get("rows_after", len(X)) or len(X))
+            if dup_rm > 0:
+                agregar_evento(f"🧹 IA train-clean: dedup {dup_rm} filas ({rb}->{ra}).")
+        except Exception:
+            pass
 
         # 4.1) Auditoría de salud (variación + dominancia) y descarte temporal
         health_before = _auditar_salud_features(X, feats_used)
