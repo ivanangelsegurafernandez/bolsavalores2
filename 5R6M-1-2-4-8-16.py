@@ -126,28 +126,31 @@ REMATE_SIN_TOPE = False      # Limitado por MAX_CICLOS
 HUD_LAYOUT = "bottom_center"  # Fijado en centro inferior
 HUD_VISIBLE = True       # Para ocultarlo con tecla
 
+# --- Objetivos / umbrales globales de IA ---
+IA_OBJETIVO_REAL_THR = 0.70   # objetivo de calidad REAL (meta: 70% aprox)
+IA_ACTIVACION_REAL_THR = 0.65 # mínimo operativo para activar señal REAL
+
 # --- Oráculo visual ---
-ORACULO_THR_MIN   = 0.75
+ORACULO_THR_MIN   = IA_ACTIVACION_REAL_THR
 ORACULO_N_MIN     = 40
 ORACULO_DELTA_PRE = 0.05
 
-# Umbral único (verde + aviso IA)  -> esto NO lo tocamos
-IA_VERDE_THR = 0.75
-AUTO_REAL_THR = 0.75  # umbral techo para auto-promoción a REAL
-AUTO_REAL_THR_MIN = 0.75  # piso rígido: no activar REAL por debajo de 75%
+# Umbral visual/alerta: alineado al mínimo operativo REAL
+IA_VERDE_THR = IA_ACTIVACION_REAL_THR
+AUTO_REAL_THR = IA_OBJETIVO_REAL_THR      # techo: mantener foco en acercarse al 70%
+AUTO_REAL_THR_MIN = IA_ACTIVACION_REAL_THR  # piso: permitir activación REAL desde 65%
 AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
 AUTO_REAL_MARGIN = 0.01   # pequeño margen para evitar quedar fuera por décimas
 AUTO_REAL_LOG_MAX_ROWS = 300  # máximo de señales históricas usadas en la calibración
 AUTO_REAL_LIVE_MIN_BOTS = 3   # mínimos bots con prob viva para calibración por tick
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
-# OJO: también se usa como piso en get_umbral_operativo(), así que NO lo bajamos para no cambiar conducta del bot.
-IA_METRIC_THRESHOLD = IA_VERDE_THR
+IA_METRIC_THRESHOLD = IA_ACTIVACION_REAL_THR
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
 IA_CALIB_THRESHOLD = 0.60
-IA_CALIB_GOAL_THRESHOLD = 0.70  # objetivo: medir cierres fuertes (≥70%)
+IA_CALIB_GOAL_THRESHOLD = IA_OBJETIVO_REAL_THR  # objetivo real: medir cierres fuertes cerca de 70%
 IA_CALIB_MIN_CLOSED = 200  # mínimo recomendado para considerar estable la auditoría
 
 # Recomendaciones operativas conservadoras (anti-sobreconfianza)
@@ -170,8 +173,17 @@ GATE_SEGMENTO_MIN_MUESTRA = 35
 GATE_SEGMENTO_MIN_WR = 0.50
 GATE_SEGMENTO_LOOKBACK = 240
 
+# Embudo IA en 2 capas: A=régimen (tradeable), B=prob fina (modelo)
+REGIME_GATE_MIN_SCORE = 0.52          # mínimo score de régimen para considerar señal
+REGIME_GATE_WEIGHT_PROB = 0.70        # peso de la prob del modelo en ranking final
+REGIME_GATE_WEIGHT_REGIME = 0.20      # peso de la calidad de régimen
+REGIME_GATE_WEIGHT_EVIDENCE = 0.10    # peso de evidencia histórica real (N + WR)
+EVIDENCE_MIN_N_HARD = 60              # si hay >=N evidencia fuerte, exigir WR mínimo
+EVIDENCE_MIN_WR_HARD = 0.70           # objetivo de calidad real por bot para habilitar auto-REAL
+EVIDENCE_CACHE_TTL_S = 20.0
+
 # Umbral del aviso de audio (archivo ia_scifi_02_ia53_dry.wav)
-AUDIO_IA53_THR = 0.75
+AUDIO_IA53_THR = IA_ACTIVACION_REAL_THR
 
 # Anti-spam + rearme
 AUDIO_IA53_COOLDOWN_S = 20     # no repetir más de 1 vez cada X segundos por bot
@@ -508,7 +520,10 @@ estado_bots = {
         "ia_aciertos": 0,
         "ia_fallos": 0,
         "ia_senal_pendiente": False,  # Flag para operación recomendada por IA
-        "ia_prob_senal": None         # NUEVO: prob IA en el momento de la señal
+        "ia_prob_senal": None,        # prob IA en el momento de la señal
+        "ia_regime_score": 0.0,       # capa A (régimen)
+        "ia_evidence_n": 0,           # soporte histórico en umbral objetivo
+        "ia_evidence_wr": 0.0         # win-rate real en umbral objetivo
     }
     for bot in BOT_NAMES
 }
@@ -2999,6 +3014,69 @@ def _ultimo_contexto_operativo_bot(bot: str) -> dict:
     return out
 
 
+
+def _score_regimen_contexto(ctx: dict) -> float:
+    """Capa A del embudo: score 0..1 de calidad de régimen actual."""
+    try:
+        racha = float(ctx.get("racha_actual", 0.0) or 0.0)
+        reb = float(ctx.get("es_rebote", 0.0) or 0.0)
+        seg_p = str(ctx.get("seg_payout", "") or "")
+        seg_h = str(ctx.get("seg_hora", "") or "")
+
+        score = 0.50
+        # racha positiva suma; racha muy negativa resta
+        score += max(-0.18, min(0.18, 0.03 * racha))
+        # rebote puede rescatar contextos negativos
+        score += 0.08 if reb >= 0.5 else 0.0
+        # payout bajo suele rendir peor
+        if seg_p == "bajo":
+            score -= 0.12
+        elif seg_p == "alto":
+            score += 0.04
+        # franjas horarias menos estables -> leve castigo
+        if seg_h in ("h00-05", "h18-23"):
+            score -= 0.04
+
+        return float(max(0.0, min(1.0, score)))
+    except Exception:
+        return 0.5
+
+
+def _evidencia_bot_umbral_objetivo(bot: str, force: bool = False) -> dict:
+    """Resumen por bot en umbral objetivo (N, WR, Brier/ECE) para no inflar señales."""
+    try:
+        now = time.time()
+        cache = globals().setdefault("_EVIDENCE_BOT_CACHE", {})
+        key = f"{bot}|{float(IA_CALIB_GOAL_THRESHOLD):.4f}"
+        c = cache.get(key)
+        if c and (not force) and ((now - float(c.get("ts", 0.0))) <= float(EVIDENCE_CACHE_TTL_S)):
+            return c
+
+        rep = auditar_calibracion_seniales_reales(min_prob=float(IA_CALIB_GOAL_THRESHOLD)) or {}
+        por_bot = rep.get("por_bot", {}) if isinstance(rep, dict) else {}
+        b = por_bot.get(str(bot), {}) if isinstance(por_bot, dict) else {}
+
+        n = int(b.get("n", 0) or 0)
+        wr = float(b.get("win_rate", 0.0) or 0.0) if n > 0 else 0.0
+        brier = b.get("brier", None)
+        ece = b.get("ece", None)
+        ok_hard = (n < int(EVIDENCE_MIN_N_HARD)) or (wr >= float(EVIDENCE_MIN_WR_HARD))
+
+        out = {
+            "ts": now,
+            "n": n,
+            "wr": wr,
+            "brier": brier,
+            "ece": ece,
+            "ok_hard": bool(ok_hard),
+            "goal": float(IA_CALIB_GOAL_THRESHOLD),
+        }
+        cache[key] = out
+        return out
+    except Exception:
+        return {"ts": time.time(), "n": 0, "wr": 0.0, "brier": None, "ece": None, "ok_hard": True, "goal": float(IA_CALIB_GOAL_THRESHOLD)}
+
+
 def _gate_regimen_activo_ok(bot: str, activo: str = "", ttl_s: float = 45.0):
     """Valida régimen por activo reciente (HZ10/HZ25/HZ50/HZ75) para no mezclar contextos."""
     try:
@@ -4420,7 +4498,7 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
     now = time.time()
     try:
         if (not force) and ((now - float(_AUTO_REAL_CACHE.get("ts", 0.0) or 0.0)) < 8.0):
-            return float(_AUTO_REAL_CACHE.get("thr", AUTO_REAL_THR))
+            return float(_AUTO_REAL_CACHE.get("thr", AUTO_REAL_THR_MIN))
 
         # 1) Histórico
         probs = _leer_probs_historicas_ia(AUTO_REAL_LOG_MAX_ROWS)
@@ -4429,7 +4507,7 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
             thr_hist = q_hist - float(AUTO_REAL_MARGIN)
             pmax_hist = float(max(probs))
         else:
-            thr_hist = float(AUTO_REAL_THR)
+            thr_hist = float(AUTO_REAL_THR_MIN)
             pmax_hist = float(max(probs)) if probs else 0.0
 
         # 2) Vivo (último tick): si el mercado/modelo se aplana, el gate también baja
@@ -4449,7 +4527,7 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
             thr_live = pmax_live - float(AUTO_REAL_MARGIN)
         else:
             pmax_live = 0.0
-            thr_live = float(AUTO_REAL_THR)
+            thr_live = float(AUTO_REAL_THR_MIN)
 
         thr_raw = min(float(thr_hist), float(thr_live))
         thr = max(float(AUTO_REAL_THR_MIN), min(float(AUTO_REAL_THR), float(thr_raw)))
@@ -4460,7 +4538,7 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
         _AUTO_REAL_CACHE["max"] = float(max(pmax_hist, pmax_live))
         return float(thr)
     except Exception:
-        return float(AUTO_REAL_THR)
+        return float(AUTO_REAL_THR_MIN)
 
 
 def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_real_token=False, expected_ciclo=None):
@@ -6038,7 +6116,7 @@ def get_umbral_operativo(meta: dict | None = None) -> float:
 # =========================================================
 # DISPARADOR ÚNICO DE ALERTA IA (AUDIO + FLAG)
 # Regla dura pedida:
-#   - SOLO dispara si prob >= 70% (o el umbral operativo si es más alto)
+#   - SOLO dispara si prob >= umbral operativo (65% mínimo)
 #   - Blindado contra prob en % (53) vs fracción (0.53)
 #   - Cooldown + rearme por histéresis
 # =========================================================
@@ -6050,7 +6128,7 @@ def _umbral_alerta_ia(meta: dict | None = None) -> float:
     try:
         thr = float(AUDIO_IA53_THR)
     except Exception:
-        thr = 0.75
+        thr = IA_ACTIVACION_REAL_THR
     if thr < 0.0:
         thr = 0.0
     if thr > 1.0:
@@ -6087,7 +6165,7 @@ def evaluar_alerta_ia_y_disparar(bot: str, prob_ia: float, meta: dict | None = N
     except Exception:
         pass
 # =========================================================
-# UMBRAL VISUAL (HUD) — 70% = VERDE SIEMPRE
+# UMBRAL VISUAL (HUD) — usa umbral operativo (65% por configuración)
 # No depende de AUC/reliable/n_samples (eso solo bloquea "operar", no pintar).
 # Evita fallos por redondeo: 0.699999 -> lo tratamos como 0.70.
 # =========================================================
@@ -6095,14 +6173,14 @@ def _thr_visual_verde() -> float:
     try:
         return float(IA_VERDE_THR)
     except Exception:
-        return 0.75
+        return IA_ACTIVACION_REAL_THR
 
 def _thr_visual_amarillo() -> float:
-    # Amarillo: zona previa (por defecto 65% si verde es 70%)
+    # Amarillo: zona previa (verde - 5pp)
     try:
         return max(0.0, float(_thr_visual_verde()) - 0.05)
     except Exception:
-        return 0.75
+        return IA_ACTIVACION_REAL_THR
 
 # =========================================================
 # NORMALIZADOR ÚNICO DE PROBABILIDAD
@@ -7315,7 +7393,7 @@ def mostrar_panel():
             modo_str = (modo.upper() if modo != "off" else "OFF")
 
             if modo != "off":
-                if confianza >= 0.75:
+                if confianza >= IA_ACTIVACION_REAL_THR:
                     modo_color = Fore.GREEN
                 elif confianza >= 0.55:
                     modo_color = Fore.YELLOW
@@ -7419,7 +7497,7 @@ def mostrar_panel():
 
     # Contadores IA ≥70% por bot
         # HISTÓRICO: señales IA (>=70%) que llegaron a ejecutarse y cerraron con resultado
-    print(Fore.YELLOW + " IA HISTÓRICO (señales cerradas, ≥70%):")
+    print(Fore.YELLOW + f" IA HISTÓRICO (señales cerradas, ≥{IA_METRIC_THRESHOLD*100:.0f}%):")
     has_hist = False
     for bot in BOT_NAMES:
         stats = IA90_stats.get(bot)
@@ -7427,9 +7505,9 @@ def mostrar_panel():
             has_hist = True
             print(Fore.YELLOW + f"   {bot}: {stats['ok']}/{stats['n']} ({stats['pct']:.1f}%)")
     if not has_hist:
-        print(Fore.YELLOW + "   (Aún no hay operaciones cerradas con señal IA ≥70%.)")
+        print(Fore.YELLOW + f"   (Aún no hay operaciones cerradas con señal IA ≥{IA_METRIC_THRESHOLD*100:.0f}%.)")
 
-    # ACTUAL: quién está >=70% ahora mismo (tick actual)
+    # ACTUAL: quién está >= umbral operativo ahora mismo (tick actual)
     print(Fore.YELLOW + f"\nIA SEÑALES ACTUALES (≥{IA_METRIC_THRESHOLD*100:.0f}% ahora):")
     now = []
     for bot in BOT_NAMES:
@@ -7477,9 +7555,11 @@ def mostrar_panel():
         n_goal = int(rep_goal.get("n", 0) or 0)
         wr_goal = rep_goal.get("win_rate", None)
         if n_goal > 0 and isinstance(wr_goal, (int, float)):
-            print(Fore.MAGENTA + f"   Meta 70%: n={n_goal} cierres con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}% | Real={float(wr_goal)*100:.1f}%")
+            print(Fore.MAGENTA + f"   Meta {IA_CALIB_GOAL_THRESHOLD*100:.0f}%: n={n_goal} cierres con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}% | Real={float(wr_goal)*100:.1f}%")
+            estado_ev = "🟢" if (n_goal >= EVIDENCE_MIN_N_HARD and float(wr_goal) >= IA_CALIB_GOAL_THRESHOLD) else ("🟡" if n_goal >= max(20, EVIDENCE_MIN_N_HARD//2) else "🔴")
+            print(Fore.MAGENTA + f"   Índice evidencia: {estado_ev} N={n_goal} | WR_real={float(wr_goal)*100:.1f}% | Gate duro={IA_CALIB_GOAL_THRESHOLD*100:.0f}%")
         else:
-            print(Fore.MAGENTA + f"   Meta 70%: aún sin cierres suficientes con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}%.")
+            print(Fore.MAGENTA + f"   Meta {IA_CALIB_GOAL_THRESHOLD*100:.0f}%: aún sin cierres suficientes con Prob IA ≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}%.")
         if n <= 0:
             print(Fore.MAGENTA + "   (Aún no hay cierres suficientes para medir calibración.)")
         else:
@@ -8128,7 +8208,7 @@ def set_etapa(codigo, detalle_extra=None, anunciar=False):
 # Nueva constante para watchdog de REAL - Bajado para más reactividad
 REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme
 REAL_STUCK_FORCE_RELEASE_S = 90  # segundos extra tras aviso para liberar REAL si no hay cierre
-REAL_TRIGGER_MIN = 0.75  # regla operativa: entrada REAL desde 75% o mayor
+REAL_TRIGGER_MIN = IA_ACTIVACION_REAL_THR  # regla operativa: entrada REAL desde 65% o mayor
 
 # Cargar datos bot
 # Cargar datos bot
@@ -8665,13 +8745,40 @@ async def main():
                                         )
                                         continue
 
-                                    candidatos.append((float(p), b))
+                                    # 4) Capa A del embudo: score de régimen
+                                    regime_score = _score_regimen_contexto(ctx)
+                                    if regime_score < float(REGIME_GATE_MIN_SCORE):
+                                        continue
+
+                                    # 5) Índice de evidencia por bot en umbral objetivo (evita inflar 0.70+ sin soporte)
+                                    ev = _evidencia_bot_umbral_objetivo(b)
+                                    ev_n = int(ev.get("n", 0) or 0)
+                                    ev_wr = float(ev.get("wr", 0.0) or 0.0)
+                                    if (ev_n >= int(EVIDENCE_MIN_N_HARD)) and (not bool(ev.get("ok_hard", True))):
+                                        agregar_evento(
+                                            f"🧪 Evidencia: {b} bloqueado (n={ev_n}, WR={ev_wr*100:.1f}% < {EVIDENCE_MIN_WR_HARD*100:.1f}% @≥{IA_CALIB_GOAL_THRESHOLD*100:.0f}%)."
+                                        )
+                                        continue
+
+                                    # 6) Ranking final (Capa B + régimen + evidencia)
+                                    evidence_score = min(1.0, ev_wr + min(0.20, ev_n / 300.0))
+                                    score_final = (
+                                        float(REGIME_GATE_WEIGHT_PROB) * float(p)
+                                        + float(REGIME_GATE_WEIGHT_REGIME) * float(regime_score)
+                                        + float(REGIME_GATE_WEIGHT_EVIDENCE) * float(evidence_score)
+                                    )
+
+                                    estado_bots[b]["ia_regime_score"] = float(regime_score)
+                                    estado_bots[b]["ia_evidence_n"] = int(ev_n)
+                                    estado_bots[b]["ia_evidence_wr"] = float(ev_wr)
+
+                                    candidatos.append((float(score_final), b, float(p), float(regime_score), int(ev_n), float(ev_wr)))
                                 except Exception:
                                     continue
 
                             candidatos.sort(key=lambda x: x[0], reverse=True)
 
-                            # Selección automática: tomar la mejor señal elegible >= 75%.
+                            # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
 
                         # Si hay señal pero saldo insuficiente -> avisar y NO abrir ventana
                         if candidatos and saldo_val < costo_ciclo1:
@@ -8695,7 +8802,8 @@ async def main():
                             owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
                             if candidatos and (PENDIENTE_FORZAR_BOT is None) and (owner in (None, "none")):
                                 candidatos.sort(reverse=True)
-                                prob, mejor_bot = candidatos[0]
+                                score_top, mejor_bot, prob, reg_score, ev_n, ev_wr = candidatos[0]
+                                agregar_evento(f"🧠 Embudo IA: {mejor_bot} score={score_top*100:.1f}% | p={prob*100:.1f}% | reg={reg_score*100:.1f}% | ev={ev_wr*100:.1f}% (n={ev_n})")
                                 PENDIENTE_FORZAR_BOT = mejor_bot
                                 PENDIENTE_FORZAR_INICIO = ahora
                                 PENDIENTE_FORZAR_EXPIRA = ahora + VENTANA_DECISION_IA_S
@@ -8712,7 +8820,8 @@ async def main():
 
                         if candidatos and not MODO_REAL_MANUAL:
                             candidatos.sort(reverse=True)
-                            prob, mejor_bot = candidatos[0]
+                            score_top, mejor_bot, prob, reg_score, ev_n, ev_wr = candidatos[0]
+                            agregar_evento(f"⚙️ IA AUTO: {mejor_bot} score={score_top*100:.1f}% | p={prob*100:.1f}% | reg={reg_score*100:.1f}% | ev={ev_wr*100:.1f}% (n={ev_n})")
                             ciclo_auto = ciclo_martingala_siguiente()
                             monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
                             val = obtener_valor_saldo()
