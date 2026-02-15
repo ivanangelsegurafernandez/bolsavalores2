@@ -144,9 +144,9 @@ PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado
 VENTANA_DECISION_IA_S = 60        # segundos
 VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
 # === Filtro avanzado (sin cambiar 13 features) ===
-SCORE_MIN = 2.80            # score mínimo para aceptar un setup
-SCORE_DROP_MAX = 0.70       # caída máxima tolerada al revalidar pre-buy
-REVALIDAR_VELAS_N = 8       # velas mínimas para revalidación rápida
+SCORE_MIN = 3.05            # más calidad: exigir score más alto antes de operar
+SCORE_DROP_MAX = 0.45       # más calidad: tolerar menos degradación pre-buy
+REVALIDAR_VELAS_N = 10      # más calidad: revalidación con ventana ligeramente mayor
 resultado_global = {"demo": 0.0, "real": 0.0}
 ultimo_token = None
 reinicio_forzado = asyncio.Event()
@@ -1028,7 +1028,7 @@ def puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, c
 def setup_pasa_filtro(score: float, condiciones: int) -> bool:
     """Gate de calidad: mantiene >=2/3 y exige score mínimo."""
     try:
-        return (int(condiciones) >= 2) and (float(score) >= float(SCORE_MIN))
+        return (int(condiciones) >= 3) and (float(score) >= float(SCORE_MIN))
     except Exception:
         return False
 # ==================== WS HELPERS ====================
