@@ -275,6 +275,7 @@ MIN_NEW_ROWS_FOR_TIME = 20      # al menos 20 filas nuevas para reentrenar por t
 MAX_DATASET_ROWS = 10000
 last_retrain_count = 0
 last_retrain_ts    = time.time()  # Inicializado al boot para arranque en frío
+AUTO_RETRAIN_TICK_S = 20.0  # reintento periódico para no quedarse sin modelo tras warmup
 _entrenando_lock = threading.Lock()  # Lock para antireentradas en maybe_retrain
 
 # === MODO ENTRENAMIENTO CON POCA DATA (no toca la lógica de IA) ===
@@ -4684,6 +4685,7 @@ IA_PRED_MIN_INTERVAL_S = 2.0   # anti-spam de predicción
 _last_pred_ts = {b: 0.0 for b in BOT_NAMES}
 _IA_CLONED_PROB_TICKS = 0
 _IA_INPUT_DUP_INFO = {"signature": "", "ts": 0.0, "bots": []}
+_LAST_AUTO_RETRAIN_TICK = 0.0
 
 def actualizar_prob_ia_bot(bot: str):
     """
@@ -4863,8 +4865,8 @@ def actualizar_prob_ia_todos():
                         )
                     else:
                         agregar_evento(
-                            "⚠️ IA redundante (features iguales entre bots; NO se invalida predicción) "
-                            f"[{sig}] | cols_iguales={same_cols[:8]} | src={src_brief}"
+                            "⚠️ IA redundante (NO invalida) "
+                            f"[{sig}] | cols={same_cols[:4]}"
                         )
                     _IA_INPUT_DUP_INFO = {"signature": msg_sig, "ts": now, "bots": list(bots)}
     except Exception:
@@ -7219,6 +7221,95 @@ def _diagnosticar_inputs_duplicados(rows_by_bot: dict, dup_bots: list[str], feat
     }
 
 
+def _maybe_retrain_fallback_sklearn(force: bool = False):
+    """Fallback cuando XGBoost no está disponible: entrena LogisticRegression calibrada."""
+    try:
+        ruta = "dataset_incremental.csv"
+        if not os.path.exists(ruta):
+            agregar_evento("⚠️ IA fallback: dataset_incremental.csv no existe aún.")
+            return False
+        df = pd.read_csv(ruta, sep=",", encoding="utf-8", engine="python", on_bad_lines="skip")
+        if df is None or df.empty:
+            agregar_evento("⚠️ IA fallback: dataset incremental vacío.")
+            return False
+
+        if "result_bin" not in df.columns:
+            agregar_evento("⚠️ IA fallback: falta result_bin en incremental.")
+            return False
+
+        y = pd.to_numeric(df["result_bin"], errors="coerce")
+        mask = y.isin([0, 1])
+        if int(mask.sum()) < int(MIN_FIT_ROWS_LOW):
+            agregar_evento(f"⚠️ IA fallback: poca data útil ({int(mask.sum())}).")
+            return False
+
+        feats = [f for f in FEATURE_NAMES_DEFAULT if f in df.columns]
+        if not feats:
+            agregar_evento("⚠️ IA fallback: no hay features compatibles en incremental.")
+            return False
+
+        X = df.loc[mask, feats].copy()
+        yb = y.loc[mask].astype(int).values
+        X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+        # Si solo hay una clase, no se puede entrenar
+        if len(set(list(yb))) < 2:
+            agregar_evento("⚠️ IA fallback: una sola clase útil; esperando más cierres.")
+            return False
+
+        scaler = StandardScaler()
+        Xs = scaler.fit_transform(X)
+
+        clf = LogisticRegression(max_iter=800, class_weight="balanced")
+        clf.fit(Xs, yb)
+
+        try:
+            p = clf.predict_proba(Xs)[:, 1]
+            auc = float(roc_auc_score(yb, p)) if len(set(yb)) > 1 else 0.0
+            brier = float(brier_score_loss(yb, p))
+        except Exception:
+            auc = 0.0
+            brier = 0.0
+
+        meta = {
+            "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "n_samples": int(len(X)),
+            "pos": int(np.sum(yb == 1)),
+            "neg": int(np.sum(yb == 0)),
+            "auc": float(auc),
+            "brier": float(brier),
+            "threshold": float(THR_DEFAULT),
+            "reliable": bool(len(X) >= int(MIN_FIT_ROWS_PROD)),
+            "warmup_mode": bool(len(X) < int(TRAIN_WARMUP_MIN_ROWS)),
+            "feature_names": list(feats),
+            "model_family": "sklearn_logreg_fallback",
+        }
+
+        ok_save = False
+        if "guardar_oracle_assets_atomico" in globals() and callable(guardar_oracle_assets_atomico):
+            ok_save = bool(guardar_oracle_assets_atomico(clf, scaler, list(feats), meta))
+        else:
+            model_path = globals().get("_MODEL_PATH", "modelo_xgb.pkl")
+            scaler_path = globals().get("_SCALER_PATH", "scaler.pkl")
+            feats_path = globals().get("_FEATURES_PATH", "feature_names.pkl")
+            meta_path = globals().get("_META_PATH", "model_meta.json")
+            joblib.dump(clf, model_path)
+            joblib.dump(scaler, scaler_path)
+            joblib.dump(list(feats), feats_path)
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            ok_save = True
+
+        if ok_save:
+            _IA_ASSETS_CACHE["loaded"] = False
+            agregar_evento(f"✅ IA fallback entrenada (LogReg) n={len(X)} AUC={auc:.3f}")
+            return True
+        return False
+    except Exception as e:
+        agregar_evento(f"⚠️ IA fallback falló: {type(e).__name__}")
+        return False
+
+
 def maybe_retrain(force: bool = False):
     """
     Reentreno IA HONESTO (sin fuga temporal) + uso REAL de TimeSeriesSplit.
@@ -7234,10 +7325,10 @@ def maybe_retrain(force: bool = False):
     # 0) XGBoost disponible
     if not _XGBOOST_OK or xgb is None:
         try:
-            agregar_evento("⚠️ IA: xgboost no disponible. No se reentrena.")
+            agregar_evento("⚠️ IA: xgboost no disponible. Activando fallback sklearn.")
         except Exception:
             pass
-        return False
+        return _maybe_retrain_fallback_sklearn(force=force)
 
     # 1) Anti re-entrada
     if not _entrenando_lock.acquire(blocking=False):
@@ -9440,6 +9531,15 @@ async def main():
                     except Exception as e_bot:
                         agregar_evento(f"⚠️ Error en {bot}: {e_bot}")
                 else:
+                    # Reentreno periódico no bloqueante (evita quedarse en OFF si boot ocurrió con pocos datos)
+                    try:
+                        now_rt = time.time()
+                        if (now_rt - float(globals().get("_LAST_AUTO_RETRAIN_TICK", 0.0) or 0.0)) >= float(AUTO_RETRAIN_TICK_S):
+                            globals()["_LAST_AUTO_RETRAIN_TICK"] = now_rt
+                            maybe_retrain(force=False)
+                    except Exception:
+                        pass
+
                     set_etapa("TICK_02")
                     # Watchdog para REAL pegado
                     ahora = time.time()
