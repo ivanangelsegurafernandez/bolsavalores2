@@ -5339,7 +5339,7 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
 
 def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_real_token=False, expected_ciclo=None):
     """
-    Devuelve: (resultado_norm, monto, ciclo, payout_total)
+    Devuelve: (resultado_norm, monto, ciclo, payout_total, cierre_id)
     - min_fila: solo acepta filas con número > min_fila (evita cierres viejos)
               Nota: min_fila se interpreta como "cantidad de filas de datos" (sin header),
               y cuadra con contar_filas_csv().
@@ -5385,6 +5385,7 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
         return None
 
     i_res = _col("resultado", "result", "outcome")
+    i_epoch = _col("epoch", "ts", "timestamp")
     i_status = _col("trade_status", "status")
     i_monto = _col("monto", "stake", "buy_price", "amount")
     i_ciclo = _col("ciclo", "ciclo_martingala", "ciclo_actual", "marti_ciclo", "martingale_step")
@@ -5509,7 +5510,21 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
         except Exception:
             monto_out = None
 
-        return (res_norm, monto_out, ciclo, payout_total)
+        cierre_id = None
+        try:
+            ep = row[i_epoch] if (i_epoch is not None and i_epoch < len(row)) else None
+            epf = _safe_float_local(ep)
+            if epf is not None:
+                cierre_id = f"ep:{int(epf)}"
+        except Exception:
+            cierre_id = None
+        if not cierre_id:
+            try:
+                cierre_id = f"fila:{int(fila_num)}"
+            except Exception:
+                cierre_id = f"fila:{ridx}"
+
+        return (res_norm, monto_out, ciclo, payout_total, cierre_id)
 
     return None
 
@@ -10004,8 +10019,14 @@ async def main():
 
                             # Cierre inmediato: en REAL siempre 1 operación y vuelve a DEMO (gane o pierda)
                             if cierre_info and isinstance(cierre_info, tuple) and len(cierre_info) >= 4:
-                                res, monto, ciclo, payout_total = cierre_info
-                                sig = (res, round(float(monto or 0.0), 2), int(ciclo or 0), round(float(payout_total or 0.0), 4))
+                                res, monto, ciclo, payout_total = cierre_info[:4]
+                                cierre_id = cierre_info[4] if len(cierre_info) >= 5 else None
+                                # Dedup robusto: usa id de fila/epoch para no saltar cierres distintos
+                                # que coinciden en firma económica (mismo ciclo/monto/payout/resultado).
+                                if cierre_id:
+                                    sig = (str(cierre_id),)
+                                else:
+                                    sig = (res, round(float(monto or 0.0), 2), int(ciclo or 0), round(float(payout_total or 0.0), 4))
 
                                 # Evita reprocesar el mismo cierre en ticks consecutivos
                                 if sig == LAST_REAL_CLOSE_SIG.get(bot):
