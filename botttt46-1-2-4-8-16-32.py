@@ -160,6 +160,7 @@ estado_bot = {
     "modo_manual": False,
     "barra_activa": False,
     "score_senal": None,
+    "ciclo_actual": 1,
 }  # Added modo_manual and barra_activa
 racha_actual_bot = 0  # racha del bot: >0 = racha de GANANCIAS, <0 = racha de PÉRDIDAS
 
@@ -1103,6 +1104,19 @@ _symbol_cooldown = {}  # symbol -> epoch hasta el que está en pausa
 _ws_fail_streak = 0  # cuántas 1006/errores seguidos en esta pasada
 ws_reset_needed = asyncio.Event()  # señal para que el loop principal reabra WS
 
+def _es_error_transitorio_ws(exc: Exception) -> bool:
+    """Errores de red/WS que deben reintentarse sin tumbar el ciclo."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, websockets.exceptions.ConnectionClosed, OSError)):
+        return True
+    msg = str(exc).lower()
+    return (
+        "connectionclosed" in msg
+        or "timeout" in msg
+        or "timed out" in msg
+        or "se agotó el tiempo" in msg
+        or "winerror 121" in msg
+    )
+
 async def obtener_velas(ws, symbol, token, reintentos=4):
     global _ws_fail_streak
     # respeta cooldown por símbolo
@@ -1896,10 +1910,23 @@ async def ejecutar_panel():
         except Exception:
             pass
 
-    async def _abrir_ws(token: str):
-        _ws = await websockets.connect(DERIV_WS_URL, **WS_KW)
-        await authorize_ws(_ws, token)
-        return _ws
+    async def _abrir_ws(token: str, tries: int = 4):
+        last = None
+        for intento in range(1, tries + 1):
+            try:
+                _ws = await websockets.connect(DERIV_WS_URL, **WS_KW)
+                await authorize_ws(_ws, token)
+                return _ws
+            except Exception as e:
+                last = e
+                if _es_error_transitorio_ws(e):
+                    espera = min(6.0, 0.8 * intento + random.uniform(0.0, 0.6))
+                    if _print_once(f"ws-open-retry-{intento}", ttl=2):
+                        print(Fore.YELLOW + f"WS/NET inestable al abrir sesión ({type(e).__name__}). Reintento {intento}/{tries} en {espera:.1f}s...")
+                    await asyncio.sleep(espera)
+                    continue
+                raise
+        raise last
 
     ws = None
     try:
@@ -1964,6 +1991,7 @@ async def ejecutar_panel():
             while ciclo <= N and (not stop_event.is_set()):
 
                 monto = martingala[ciclo - 1]
+                estado_bot["ciclo_actual"] = int(ciclo)
 
                 # Sync token/WS con el maestro (sin perder ciclo)
                 ws, current_token = await check_token_and_reconnect(ws, current_token)
@@ -2083,6 +2111,15 @@ async def ejecutar_panel():
                     estado_bot["token_msg_mostrado"] = False
                     await asyncio.sleep(8 + random.uniform(0.0, 0.5))
                     continue
+                except Exception as e:
+                    if _es_error_transitorio_ws(e):
+                        if _print_once("proposal-transient", ttl=8):
+                            print(Fore.YELLOW + Style.BRIGHT + f"[WARN] Propuesta inestable ({type(e).__name__}). Reabro WS y mantengo ciclo #{ciclo}.")
+                        await _cerrar_ws(ws)
+                        ws = await _abrir_ws(current_token)
+                        await asyncio.sleep(0.6 + random.uniform(0.0, 0.4))
+                        continue
+                    raise
 
                 # Si token cambió DURANTE proposal → NO compramos, reinicio limpio
                 if reinicio_forzado.is_set():
@@ -2216,6 +2253,15 @@ async def ejecutar_panel():
                     estado_bot["token_msg_mostrado"] = False
                     await asyncio.sleep(10 + random.uniform(0.0, 0.5))
                     continue
+                except Exception as e:
+                    if _es_error_transitorio_ws(e):
+                        if _print_once("buy-transient", ttl=8):
+                            print(Fore.YELLOW + Style.BRIGHT + f"[WARN] Compra inestable ({type(e).__name__}). Reabro WS y mantengo ciclo #{ciclo}.")
+                        await _cerrar_ws(ws)
+                        ws = await _abrir_ws(current_token)
+                        await asyncio.sleep(0.6 + random.uniform(0.0, 0.4))
+                        continue
+                    raise
 
                 contract_id = data_buy["buy"]["contract_id"]
 
@@ -2318,8 +2364,15 @@ async def ejecutar_panel():
                 break
 
     except Exception as e:
-        print(Fore.RED + Style.BRIGHT + f"[ERROR] Fallo general: {type(e).__name__}: {e!r}")
-        await asyncio.sleep(10 + random.uniform(0.0, 0.5))
+        if _es_error_transitorio_ws(e):
+            ciclo_ref = int(estado_bot.get("ciclo_actual", 1) or 1)
+            estado_bot["ciclo_forzado"] = max(1, ciclo_ref)
+            reinicio_forzado.set()
+            print(Fore.YELLOW + Style.BRIGHT + f"[WARN] WS/NET transitorio ({type(e).__name__}). Blindaje activo: reintento en ciclo #{estado_bot['ciclo_forzado']}.")
+            await asyncio.sleep(1.2 + random.uniform(0.0, 0.5))
+        else:
+            print(Fore.RED + Style.BRIGHT + f"[ERROR] Fallo general: {type(e).__name__}: {e!r}")
+            await asyncio.sleep(10 + random.uniform(0.0, 0.5))
     finally:
         try:
             await _cerrar_ws(ws)

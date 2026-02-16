@@ -13,6 +13,7 @@ import pandas as pd
 import time  # Added for timestamps in orden_real and BLOQUE 5
 import random  # Added for jitter in BLOQUE 1.3
 import itertools  # For req_counter in api_call
+import socket
 
 # === BLINDAJE: señales limpias ===
 import signal
@@ -144,9 +145,9 @@ PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado
 VENTANA_DECISION_IA_S = 60        # segundos
 VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
 # === Filtro avanzado (sin cambiar 13 features) ===
-SCORE_MIN = 2.80            # score mínimo para aceptar un setup
-SCORE_DROP_MAX = 0.70       # caída máxima tolerada al revalidar pre-buy
-REVALIDAR_VELAS_N = 8       # velas mínimas para revalidación rápida
+SCORE_MIN = 2.85            # equilibrio: más entradas válidas sin relajar demasiado la calidad
+SCORE_DROP_MAX = 0.65       # tolerancia un poco mayor para no perder señales por micro-ruido
+REVALIDAR_VELAS_N = 7       # revalidación más rápida para evitar quedarse colgado buscando chance
 resultado_global = {"demo": 0.0, "real": 0.0}
 ultimo_token = None
 reinicio_forzado = asyncio.Event()
@@ -249,7 +250,7 @@ def leer_orden_real(bot: str):
 # <<< PATCH 1
 
 # >>> PATCH: WS robusto
-WS_KW = dict(ping_interval=15, ping_timeout=10, close_timeout=5, max_queue=None)
+WS_KW = dict(ping_interval=20, ping_timeout=20, close_timeout=8, max_queue=None)
 # <<< PATCH
 
 # >>> PATCH (cerca de tus globals) BLOQUE 10
@@ -1026,7 +1027,7 @@ def puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, c
 
 
 def setup_pasa_filtro(score: float, condiciones: int) -> bool:
-    """Gate de calidad: mantiene >=2/3 y exige score mínimo."""
+    """Gate de calidad: exige al menos 2 confirmaciones y score mínimo."""
     try:
         return (int(condiciones) >= 2) and (float(score) >= float(SCORE_MIN))
     except Exception:
@@ -1340,7 +1341,7 @@ async def consultar_saldo_real(ws):
 # ==================== LÓGICA DE OPERACIÓN ====================
 async def buscar_estrategia(ws, ciclo, token):
     print(Fore.MAGENTA + Style.BRIGHT + f"\nBuscando señal válida para Martingala #{ciclo}")
-    for intento in range(1, 11):
+    for intento in range(1, 9):
         if reinicio_forzado.is_set():
             return "REINTENTAR", None, None, None, None, None, None, None, None, None
         if MODO_SILENCIOSO and estado_bot.get("modo_manual"):
@@ -1385,9 +1386,9 @@ async def buscar_estrategia(ws, ciclo, token):
         if activos_invalidos:
             msg_sil = (MODO_SILENCIOSO and estado_bot.get("modo_manual"))
             if not msg_sil:
-                print(Fore.YELLOW + f"Ningún activo válido en intento #{intento}. Esperando 15s...")
-            elif intento in (1, 5, 10):
-                print(Fore.YELLOW + f"Sin activo válido (intento #{intento}, silencioso). Esperando 15s...")
+                print(Fore.YELLOW + f"Ningún activo válido en intento #{intento}. Esperando 12s...")
+            elif intento in (1, 4, 8):
+                print(Fore.YELLOW + f"Sin activo válido (intento #{intento}, silencioso). Esperando 12s...")
         # Nueva lógica: si todos salieron inválidos y la racha de 1006 es alta, pide reconexión
         if len(activos_invalidos) == len(ACTIVOS) and _ws_fail_streak >= len(ACTIVOS):
             if _print_once("ws-reopen-needed", ttl=15):
@@ -1395,13 +1396,13 @@ async def buscar_estrategia(ws, ciclo, token):
             ws_reset_needed.set()
             # No seguimos martillando: pequeño respiro
             await asyncio.sleep(1.0 + random.uniform(0.0, 0.5))  # Jitter
-        await asyncio.sleep(15 + random.uniform(0.0, 0.5))  # Jitter para pausas
-    print(Fore.RED + Style.BRIGHT + f"No se encontró activo válido tras 10 intentos para Martingala #{ciclo}. Reintentando MISMO ciclo...")
+        await asyncio.sleep(12 + random.uniform(0.0, 0.5))  # Jitter para pausas (más ágil)
+    print(Fore.RED + Style.BRIGHT + f"No se encontró activo válido tras 8 intentos para Martingala #{ciclo}. Reintentando MISMO ciclo...")
     try:
         play_sfx("REINTENTA", vol=0.8)
     except Exception:
         pass
-    await asyncio.sleep(30)
+    await asyncio.sleep(20)
     return "REINTENTAR", None, None, None, None, None, None, None, None, None
 
 async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, ciclo, payout, condiciones, token_usado_buy, epoch_pretrade=None):
@@ -1602,12 +1603,28 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
             if _print_once("no-close-frame", ttl=15):
                 print(Fore.YELLOW + "WS cerrado sin close frame (resolverá en background). Mismo ciclo.")
             try:
+                asyncio.create_task(finalizar_contrato_bg(
+                    contract_id, 0, symbol, direccion, monto,
+                    rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
+                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade
+                ))
+            except Exception:
+                pass
+            try:
                 play_sfx("REINTENTA", vol=0.8)
             except Exception:
                 pass
             return "INDEFINIDO", 0.0
         except Exception as e:
             print(Fore.RED + Style.BRIGHT + f"[ERROR] Resultado INDEFINIDO: {e}. Reintentando mismo ciclo...")
+            try:
+                asyncio.create_task(finalizar_contrato_bg(
+                    contract_id, 0, symbol, direccion, monto,
+                    rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
+                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade
+                ))
+            except Exception:
+                pass
             try:
                 play_sfx("REINTENTA", vol=0.8)
             except Exception:
@@ -1896,10 +1913,23 @@ async def ejecutar_panel():
         except Exception:
             pass
 
-    async def _abrir_ws(token: str):
-        _ws = await websockets.connect(DERIV_WS_URL, **WS_KW)
-        await authorize_ws(_ws, token)
-        return _ws
+    async def _abrir_ws(token: str, tries: int = 4):
+        last = None
+        for i in range(max(1, int(tries))):
+            try:
+                _ws = await websockets.connect(DERIV_WS_URL, **WS_KW)
+                await authorize_ws(_ws, token)
+                return _ws
+            except (websockets.exceptions.WebSocketException, asyncio.TimeoutError, TimeoutError, OSError, socket.gaierror) as e:
+                last = e
+                wait_s = min(8.0, 1.0 + (i * 1.5)) + random.uniform(0.0, 0.5)
+                if _print_once(f"ws-open-retry-{type(e).__name__}", ttl=6):
+                    print(Fore.YELLOW + f"WS/NET inestable al abrir sesión ({type(e).__name__}). Reintento {i+1}/{tries} en {wait_s:.1f}s...")
+                await asyncio.sleep(wait_s)
+            except Exception as e:
+                last = e
+                await asyncio.sleep(0.8 + random.uniform(0.0, 0.3))
+        raise last if last else RuntimeError("No se pudo abrir WS")
 
     ws = None
     try:

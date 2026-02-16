@@ -1,0 +1,58 @@
+{
+  "generated_at": "2026-02-16T00:35:09.828302+00:00",
+  "source": "ia_signals_log.csv",
+  "closed_total": 0,
+  "session": {
+    "session_mode": "debug",
+    "session_start_epoch": 1771202109.112859,
+    "rows_total_log": 82,
+    "rows_kept_after_session_filter": 0,
+    "source_path": "ia_signals_log.csv",
+    "using_live_session_log": false
+  },
+  "thresholds": {},
+  "bins": {},
+  "per_bot": {},
+  "orientation": {},
+  "summary": {
+    "status": "sin_datos",
+    "message": "No hay señales cerradas para el filtro actual (all/debug)."
+  },
+  "roadmap_status": {},
+  "data_quality": {
+    "available": true,
+    "incremental_rows": 154,
+    "duplicates_exact": 29,
+    "duplicates_ratio": 0.188312,
+    "dead_features_incremental": [
+      "volatilidad",
+      "hora_bucket"
+    ],
+    "dead_features_bots": {
+      "fulll45": [
+        "volatilidad",
+        "hora_bucket"
+      ],
+      "fulll46": [
+        "volatilidad",
+        "hora_bucket"
+      ],
+      "fulll47": [
+        "volatilidad",
+        "hora_bucket"
+      ],
+      "fulll48": [
+        "volatilidad",
+        "hora_bucket"
+      ],
+      "fulll49": [
+        "volatilidad",
+        "hora_bucket"
+      ],
+      "fulll50": [
+        "volatilidad",
+        "hora_bucket"
+      ]
+    }
+  }
+}
