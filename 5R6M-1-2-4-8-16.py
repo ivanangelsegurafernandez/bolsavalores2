@@ -4442,6 +4442,7 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
         row["__src_path"] = str(ruta)
         row["__src_epoch"] = row.get("epoch", None)
         row["__src_ts"] = row.get("ts", row.get("timestamp", row.get("fecha", None)))
+        row["__src_symbol"] = row.get("symbol", row.get("activo", row.get("market", row.get("underlying", ""))))
     except Exception:
         pass
 
@@ -4812,25 +4813,33 @@ def actualizar_prob_ia_todos():
                 expected = diag.get("expected_diff", [])
                 src_info = diag.get("source_info", {}) if isinstance(diag, dict) else {}
 
-                # Clon real: misma fuente + misma fila/hash/epoch entre bots.
-                source_keys = []
+                # Clon real SOLO si hay evidencia fuerte de misma lectura/fila (no por features iguales).
+                clone_real = False
+                source_keys_full = []
+                source_keys_hash_ts_sym = []
                 for bb in bots:
                     inf = src_info.get(bb, {}) if isinstance(src_info, dict) else {}
                     path = str(inf.get("path", "") or "")
                     hsh = str(inf.get("hash", "") or "")
                     tsv = str(inf.get("ts", "") or "")
-                    source_keys.append((path, hsh, tsv))
+                    sym = str(inf.get("symbol", "") or "")
+                    source_keys_full.append((path, hsh, tsv))
+                    source_keys_hash_ts_sym.append((hsh, tsv, sym))
 
-                clone_real = False
-                if source_keys:
-                    unique_keys = set(source_keys)
-                    if len(unique_keys) == 1 and all(any(x for x in k) for k in unique_keys):
+                if source_keys_full:
+                    ufull = set(source_keys_full)
+                    uhash = set(source_keys_hash_ts_sym)
+                    # Caso 1: misma fuente exacta (path/hash/ts) entre bots.
+                    if len(ufull) == 1 and all(any(x for x in k) for k in ufull):
+                        clone_real = True
+                    # Caso 2: paths distintos pero misma fila/hash+timestamp+símbolo (clon probable por wiring).
+                    elif len(uhash) == 1 and all(any(x for x in k) for k in uhash):
                         clone_real = True
 
                 src_brief = []
                 for bb in bots[:3]:
                     inf = src_info.get(bb, {}) if isinstance(src_info, dict) else {}
-                    src_brief.append(f"{bb}:{inf.get('path','')}/{inf.get('hash','')}/{inf.get('ts','')}")
+                    src_brief.append(f"{bb}:{inf.get('symbol','')}/{inf.get('hash','')}/{inf.get('ts','')}")
 
                 msg_sig = f"{sig}|{','.join(same_cols[:6])}|clone={int(clone_real)}"
                 should_emit = (
@@ -7200,6 +7209,7 @@ def _diagnosticar_inputs_duplicados(rows_by_bot: dict, dup_bots: list[str], feat
             "path": str(rv.get("__src_path", "")),
             "ts": str(rv.get("__src_ts", rv.get("__src_epoch", ""))),
             "hash": str(rv.get("__src_row_hash", "")),
+            "symbol": str(rv.get("__src_symbol", "")),
         }
     return {
         "same_cols": same_cols,
@@ -8200,6 +8210,9 @@ def mostrar_panel():
         print(Fore.CYAN + f" IA ▶ modelo XGBoost entrenado: n={n} (GAN={pos}, PERD={neg})")
         print(Fore.CYAN + f"      AUC={auc_txt}  | Thr={thr:.2f}  | Modo={modo_txt}")
         datos_utiles = int(max(0, pos + neg))
+        mismatch = int(max(0, n - datos_utiles))
+        if mismatch > 0:
+            print(Fore.YELLOW + f"      ⚠️ Data quality IA: n-meta={n} pero cierres útiles={datos_utiles} (delta={mismatch}).")
         if warmup_mode:
             print(Fore.CYAN + f"      Confianza IA: BAJA (Warmup n={n}<{int(TRAIN_WARMUP_MIN_ROWS)} | cierres útiles={datos_utiles}).")
             print(Fore.CYAN + f"      Warmup activo: n={n}<{int(TRAIN_WARMUP_MIN_ROWS)} (solo monitoreo/calibración).")
@@ -9219,6 +9232,44 @@ def _log_exception(tag: str, exc: Exception | None = None):
 
 
 
+def _auditar_saturacion_features_bot(bot: str, lookback: int = 800) -> dict:
+    """Diagnóstico ligero de features casi-constantes en CERRADO."""
+    out = {"ok": False, "bot": bot, "n": 0, "dominance": {}}
+    ruta = f"registro_enriquecido_{bot}.csv"
+    if not os.path.exists(ruta):
+        return out
+    try:
+        df = pd.read_csv(ruta, sep=",", encoding="utf-8", engine="python", on_bad_lines="skip")
+    except Exception:
+        return out
+    if df is None or df.empty:
+        return out
+    try:
+        if "resultado" in df.columns:
+            rr = df["resultado"].astype(str).str.upper().str.strip()
+            df = df[rr.isin(["GANANCIA", "PÉRDIDA", "PERDIDA"])].copy()
+    except Exception:
+        pass
+    if df.empty:
+        return out
+    if int(lookback) > 0 and len(df) > int(lookback):
+        df = df.tail(int(lookback)).copy()
+
+    cols = ["cruce_sma", "breakout", "rsi_reversion", "puntaje_estrategia"]
+    out["n"] = int(len(df))
+    out["ok"] = True
+    for c in cols:
+        if c not in df.columns:
+            continue
+        s = pd.to_numeric(df[c], errors="coerce").dropna()
+        if s.empty:
+            continue
+        vc = s.value_counts(dropna=False)
+        dom = float(vc.iloc[0]) / float(max(1, len(s)))
+        out["dominance"][c] = float(dom)
+    return out
+
+
 def _boot_health_check():
     msgs = []
     try:
@@ -9231,6 +9282,14 @@ def _boot_health_check():
             msgs.append("⚠️ No hay CSV enriquecidos de bots todavía; esperando generación de datos.")
         if not os.access(os.getcwd(), os.W_OK):
             msgs.append("⚠️ Sin permisos de escritura en cwd (no se podrán persistir logs/modelos).")
+
+        # Señales congeladas: diagnóstico operativo rápido (no bloqueante)
+        sat = _auditar_saturacion_features_bot("fulll45", lookback=900)
+        if sat.get("ok", False) and int(sat.get("n", 0)) >= 120:
+            dom = sat.get("dominance", {}) if isinstance(sat.get("dominance", {}), dict) else {}
+            hot = [f"{k}={v*100:.1f}%" for k, v in dom.items() if isinstance(v, (int, float)) and v >= 0.90]
+            if hot:
+                msgs.append("⚠️ Features saturadas detectadas en fulll45 (últimos cierres): " + ", ".join(hot))
     except Exception as e:
         msgs.append(f"⚠️ Health-check parcial con error: {e}")
     return msgs
