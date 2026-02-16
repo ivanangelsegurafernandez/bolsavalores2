@@ -172,7 +172,7 @@ HUD_VISIBLE = True       # Para ocultarlo con tecla
 
 # --- Objetivos / umbrales globales de IA ---
 IA_OBJETIVO_REAL_THR = 0.70   # objetivo de calidad REAL (meta: 70% aprox)
-IA_ACTIVACION_REAL_THR = 0.65 # mínimo operativo para activar señal REAL
+IA_ACTIVACION_REAL_THR = 0.85 # mínimo operativo para activar señal REAL
 
 # --- Oráculo visual ---
 ORACULO_THR_MIN   = IA_ACTIVACION_REAL_THR
@@ -182,7 +182,7 @@ ORACULO_DELTA_PRE = 0.05
 # Umbral visual/alerta: alineado al mínimo operativo REAL
 IA_VERDE_THR = IA_ACTIVACION_REAL_THR
 AUTO_REAL_THR = IA_OBJETIVO_REAL_THR      # techo: mantener foco en acercarse al 70%
-AUTO_REAL_THR_MIN = IA_ACTIVACION_REAL_THR  # piso: permitir activación REAL desde 65%
+AUTO_REAL_THR_MIN = IA_ACTIVACION_REAL_THR  # piso: permitir activación REAL desde 85%
 AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
 AUTO_REAL_MARGIN = 0.01   # pequeño margen para evitar quedar fuera por décimas
 AUTO_REAL_LOG_MAX_ROWS = 300  # máximo de señales históricas usadas en la calibración
@@ -190,7 +190,7 @@ AUTO_REAL_LIVE_MIN_BOTS = 3   # mínimos bots con prob viva para calibración po
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
 IA_METRIC_THRESHOLD = IA_ACTIVACION_REAL_THR
-# Modo clásico solicitado: activación REAL inmediata con prob IA >= 65%.
+# Modo clásico solicitado: activación REAL inmediata con prob IA >= 85%.
 # Mantiene lock de un solo bot en REAL y ciclo martingala global en HUD.
 REAL_CLASSIC_GATE = True
 
@@ -6763,7 +6763,7 @@ def get_umbral_operativo(meta: dict | None = None) -> float:
 # =========================================================
 # DISPARADOR ÚNICO DE ALERTA IA (AUDIO + FLAG)
 # Regla dura pedida:
-#   - SOLO dispara si prob >= umbral operativo (65% mínimo)
+#   - SOLO dispara si prob >= umbral operativo (85% mínimo)
 #   - Blindado contra prob en % (53) vs fracción (0.53)
 #   - Cooldown + rearme por histéresis
 # =========================================================
@@ -6812,7 +6812,7 @@ def evaluar_alerta_ia_y_disparar(bot: str, prob_ia: float, meta: dict | None = N
     except Exception:
         pass
 # =========================================================
-# UMBRAL VISUAL (HUD) — usa umbral operativo (65% por configuración)
+# UMBRAL VISUAL (HUD) — usa umbral operativo (85% por configuración)
 # No depende de AUC/reliable/n_samples (eso solo bloquea "operar", no pintar).
 # Evita fallos por redondeo: 0.699999 -> lo tratamos como 0.70.
 # =========================================================
@@ -6865,7 +6865,7 @@ def color_prob_ia(prob: float) -> str:
     """
     Colores SOLO para HUD:
       - VERDE si prob >= 0.70
-      - AMARILLO si prob >= 0.65
+      - AMARILLO si prob >= umbral operativo
       - ROJO si menor
     Blindado: si llega 53, lo convierte a 0.53.
     """
@@ -9143,7 +9143,7 @@ def set_etapa(codigo, detalle_extra=None, anunciar=False):
 # Nueva constante para watchdog de REAL - Bajado para más reactividad
 REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme
 REAL_STUCK_FORCE_RELEASE_S = 90  # segundos extra tras aviso para liberar REAL si no hay cierre
-REAL_TRIGGER_MIN = IA_ACTIVACION_REAL_THR  # regla operativa: entrada REAL desde 65% o mayor
+REAL_TRIGGER_MIN = IA_ACTIVACION_REAL_THR  # regla operativa: entrada REAL desde 85% o mayor
 
 # Cargar datos bot
 # Cargar datos bot
@@ -9313,7 +9313,7 @@ async def cargar_datos_bot(bot, token_actual):
                     elif resultado == "PÉRDIDA":
                         estado_bots[bot]["ia_fallos"] += 1
 
-                if prob_senal is not None and prob_senal >= 0.65:
+                if prob_senal is not None and prob_senal >= float(IA_ACTIVACION_REAL_THR):
                     IA90_stats[bot]["n"] += 1
                     if resultado == "GANANCIA":
                         IA90_stats[bot]["ok"] += 1
@@ -9829,7 +9829,7 @@ async def main():
                                     if float(p) < float(IA_ACTIVACION_REAL_THR):
                                         continue
 
-                                    # Modo clásico: si hay 65% o más, el bot es elegible sin gates extra.
+                                    # Modo clásico: si hay 85% o más, el bot es elegible sin gates extra.
                                     # Mantiene el lock de un único bot REAL a la vez en el flujo superior.
                                     if REAL_CLASSIC_GATE:
                                         regime_score = _score_regimen_contexto(_ultimo_contexto_operativo_bot(b))
