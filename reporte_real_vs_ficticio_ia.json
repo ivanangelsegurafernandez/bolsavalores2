@@ -1,7 +1,13 @@
 {
-  "generated_at": "2026-02-15T23:06:02.006047+00:00",
+  "generated_at": "2026-02-16T00:22:56.414374+00:00",
   "source": "ia_signals_log.csv",
   "closed_total": 82,
+  "session": {
+    "session_mode": "all",
+    "session_start_epoch": null,
+    "rows_total_log": 82,
+    "rows_kept_after_session_filter": 82
+  },
   "thresholds": {
     "0.60": {
       "n": 82,

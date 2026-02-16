@@ -7793,7 +7793,7 @@ def mostrar_panel():
             print(Fore.YELLOW + f"  {b}: {p*100:.1f}%")
 
         # Calibración detallada movida a reporte externo (menos ruido en HUD principal)
-    print(Fore.MAGENTA + "\nℹ️ Calibración IA detallada desactivada en HUD (usar: python reporte_real_vs_ficticio_ia.py).")
+    print(Fore.MAGENTA + "\nℹ️ Calibración IA detallada desactivada en HUD (usar: python reporte_real_vs_ficticio_ia.py --session debug).")
 
     panel_lines = [
         "┌────────────────────────────────────────────┐",

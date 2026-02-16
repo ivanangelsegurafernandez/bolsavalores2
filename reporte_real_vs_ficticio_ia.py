@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
 Reporte standalone de calibración IA (Real vs Ficticia) para operación.
-Genera:
+
+Genera por defecto:
 - reporte_real_vs_ficticio_ia.json
 - reporte_real_vs_ficticio_ia.md
+
+Modo sesión (debug):
+- Lee solo cierres de la sesión actual (desde marcador local).
+- Útil para validar cambios recientes sin contaminar con histórico viejo.
 """
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 from collections import defaultdict
@@ -20,8 +26,40 @@ LOG = ROOT / 'ia_signals_log.csv'
 DIAG = ROOT / 'diagnostico_pipeline_ia.json'
 OUT_JSON = ROOT / 'reporte_real_vs_ficticio_ia.json'
 OUT_MD = ROOT / 'reporte_real_vs_ficticio_ia.md'
+OUT_JSON_SESSION = ROOT / 'reporte_real_vs_ficticio_ia_session.json'
+OUT_MD_SESSION = ROOT / 'reporte_real_vs_ficticio_ia_session.md'
+SESSION_MARKER = ROOT / '.reporte_ia_session_debug.json'
+
 THRESHOLDS = (0.60, 0.65, 0.70, 0.75, 0.80)
 BINS = ((0.60, 0.70), (0.70, 0.80), (0.80, 0.90), (0.90, 1.01))
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description='Reporte IA real-vs-ficticia')
+    p.add_argument(
+        '--session',
+        choices=('all', 'debug'),
+        default='all',
+        help='all=histórico completo, debug=solo sesión actual',
+    )
+    p.add_argument(
+        '--session-reset',
+        action='store_true',
+        help='Reinicia marcador de sesión debug usando UTC actual.',
+    )
+    p.add_argument(
+        '--session-start-epoch',
+        type=float,
+        default=None,
+        help='Epoch UTC explícito para inicio de sesión debug.',
+    )
+    p.add_argument(
+        '--session-start-ts',
+        type=str,
+        default='',
+        help='Timestamp ISO para inicio de sesión debug (ej: 2026-02-15T17:00:00Z).',
+    )
+    return p.parse_args()
 
 
 def _safe_csv(path: Path) -> list[dict[str, str]]:
@@ -46,6 +84,38 @@ def _to_float(v: Any) -> float | None:
         return float(s)
     except Exception:
         return None
+
+
+def _to_epoch_from_any(raw: Any) -> float | None:
+    if raw is None:
+        return None
+    # numérico directo
+    fv = _to_float(raw)
+    if fv is not None:
+        if fv > 1e12:
+            fv = fv / 1000.0
+        if fv > 1e9:
+            return float(fv)
+    # timestamp textual
+    try:
+        s = str(raw).strip()
+        if not s:
+            return None
+        s = s.replace('Z', '+00:00')
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return float(dt.timestamp())
+    except Exception:
+        return None
+
+
+def _row_epoch(r: dict[str, str]) -> float | None:
+    for k in ('epoch', 'ts_epoch', 'timestamp', 'ts'):
+        ev = _to_epoch_from_any(r.get(k))
+        if ev is not None:
+            return ev
+    return None
 
 
 def _wilson_lb(hits: int, n: int, z: float = 1.96) -> float:
@@ -81,6 +151,42 @@ def _auc(y_true: list[int], y_score: list[float]) -> float | None:
     return (pos_rank_sum - pos * (pos + 1) / 2.0) / (pos * neg)
 
 
+def _load_or_init_session_start(args: argparse.Namespace) -> float:
+    # 1) explícito por epoch
+    if args.session_start_epoch is not None:
+        ep = float(args.session_start_epoch)
+        SESSION_MARKER.write_text(json.dumps({'session_start_epoch': ep}, ensure_ascii=False, indent=2), encoding='utf-8')
+        return ep
+
+    # 2) explícito por ts
+    if args.session_start_ts:
+        ep_ts = _to_epoch_from_any(args.session_start_ts)
+        if ep_ts is not None:
+            SESSION_MARKER.write_text(json.dumps({'session_start_epoch': ep_ts}, ensure_ascii=False, indent=2), encoding='utf-8')
+            return ep_ts
+
+    # 3) reset manual
+    if args.session_reset:
+        ep = float(datetime.now(timezone.utc).timestamp())
+        SESSION_MARKER.write_text(json.dumps({'session_start_epoch': ep}, ensure_ascii=False, indent=2), encoding='utf-8')
+        return ep
+
+    # 4) marker existente
+    if SESSION_MARKER.exists():
+        try:
+            d = json.loads(SESSION_MARKER.read_text(encoding='utf-8'))
+            ep = _to_float(d.get('session_start_epoch'))
+            if ep is not None:
+                return float(ep)
+        except Exception:
+            pass
+
+    # 5) fallback: crear ahora
+    ep = float(datetime.now(timezone.utc).timestamp())
+    SESSION_MARKER.write_text(json.dumps({'session_start_epoch': ep}, ensure_ascii=False, indent=2), encoding='utf-8')
+    return ep
+
+
 @dataclass
 class ClosedSignal:
     bot: str
@@ -88,16 +194,34 @@ class ClosedSignal:
     y: int
 
 
-def _load_closed() -> list[ClosedSignal]:
+def _load_closed(session_mode: str, session_start_epoch: float | None) -> tuple[list[ClosedSignal], dict[str, Any]]:
     out: list[ClosedSignal] = []
-    for r in _safe_csv(LOG):
+    rows = _safe_csv(LOG)
+    total_rows = len(rows)
+    kept_rows = 0
+
+    for r in rows:
+        # filtro sesión debug (sin tocar lógica de trading)
+        if session_mode == 'debug' and isinstance(session_start_epoch, (int, float)):
+            ep = _row_epoch(r)
+            if ep is None or ep < float(session_start_epoch):
+                continue
+
         p = _to_float(r.get('prob'))
         y = _to_float(r.get('y'))
         if p is None or y is None:
             continue
-        out.append(ClosedSignal(bot=str(r.get('bot') or '').strip(), prob=max(0.0, min(1.0, p)), y=1 if y >= 0.5 else 0))
-    return out
 
+        kept_rows += 1
+        out.append(ClosedSignal(bot=str(r.get('bot') or '').strip(), prob=max(0.0, min(1.0, p)), y=1 if y >= 0.5 else 0))
+
+    meta = {
+        'session_mode': session_mode,
+        'session_start_epoch': session_start_epoch,
+        'rows_total_log': total_rows,
+        'rows_kept_after_session_filter': kept_rows,
+    }
+    return out, meta
 
 
 def _diag_quality_snapshot() -> dict[str, Any]:
@@ -135,31 +259,33 @@ def _diag_quality_snapshot() -> dict[str, Any]:
                     dead.append(f)
             if dead:
                 out['dead_features_bots'][bot] = dead
-
         return out
     except Exception:
         return out
 
 
-def build_report() -> dict[str, Any]:
-    closed = _load_closed()
+def build_report(session_mode: str = 'all', session_start_epoch: float | None = None) -> dict[str, Any]:
+    closed, session_meta = _load_closed(session_mode=session_mode, session_start_epoch=session_start_epoch)
+
     report: dict[str, Any] = {
         'generated_at': datetime.now(timezone.utc).isoformat(),
         'source': str(LOG),
         'closed_total': len(closed),
+        'session': session_meta,
         'thresholds': {},
         'bins': {},
         'per_bot': {},
         'orientation': {},
         'summary': {},
         'roadmap_status': {},
-        'data_quality': {},
+        'data_quality': _diag_quality_snapshot(),
     }
     if not closed:
-        report['summary'] = {'status': 'sin_datos', 'message': 'No hay señales cerradas en ia_signals_log.csv'}
+        report['summary'] = {
+            'status': 'sin_datos',
+            'message': 'No hay señales cerradas para el filtro actual (all/debug).',
+        }
         return report
-
-    report['data_quality'] = _diag_quality_snapshot()
 
     y_true = [r.y for r in closed]
     y_pred = [r.prob for r in closed]
@@ -241,9 +367,14 @@ def build_report() -> dict[str, Any]:
     dead_inc = list(q.get('dead_features_incremental', []) or [])
     report['roadmap_status']['duplicates_ok'] = dup_ratio < 0.02
     report['roadmap_status']['core_features_alive'] = len(dead_inc) == 0
+
     flags = report['roadmap_status']
-    score = sum(1 for k in ('orientation_ok', 'gap_high_bins_ok', 'n70_enough', 'wr70_progress', 'duplicates_ok', 'core_features_alive') if flags.get(k))
+    score = sum(1 for k in (
+        'orientation_ok', 'gap_high_bins_ok', 'n70_enough',
+        'wr70_progress', 'duplicates_ok', 'core_features_alive'
+    ) if flags.get(k))
     status = 'bien_encaminado' if score >= 5 else ('en_riesgo' if score >= 3 else 'critico')
+
     report['summary'] = {
         'status': status,
         'score_ok_6': score,
@@ -252,7 +383,6 @@ def build_report() -> dict[str, Any]:
             f"gap_max={flags['max_abs_gap']*100:.1f}pp, n>=70={n70}, real>=70={wr70*100:.1f}%"
         ),
     }
-
     return report
 
 
@@ -261,6 +391,14 @@ def render_md(rep: dict[str, Any]) -> str:
     lines.append('# Reporte IA: Real vs Ficticia\n')
     lines.append(f"- Generado (UTC): {rep.get('generated_at')}")
     lines.append(f"- Señales cerradas: {rep.get('closed_total', 0)}")
+
+    sess = rep.get('session', {})
+    lines.append('\n## Modo de lectura')
+    lines.append(f"- Modo: {sess.get('session_mode', 'all')}")
+    lines.append(f"- Filas log totales: {sess.get('rows_total_log', 0)}")
+    lines.append(f"- Filas tras filtro sesión: {sess.get('rows_kept_after_session_filter', 0)}")
+    sse = sess.get('session_start_epoch', None)
+    lines.append(f"- Session start epoch: {sse if sse is not None else '--'}")
 
     ori = rep.get('orientation', {})
     lines.append('\n## Orientación')
@@ -314,18 +452,32 @@ def render_md(rep: dict[str, Any]) -> str:
 
     sm = rep.get('summary', {})
     lines.append('\n## Resumen ejecutivo')
-    lines.append(f"- {sm.get('headline','sin datos')}")
+    lines.append(f"- {sm.get('headline', 'sin datos')}")
     return '\n'.join(lines) + '\n'
 
 
 def main() -> int:
-    rep = build_report()
-    OUT_JSON.write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding='utf-8')
-    md = render_md(rep)
-    OUT_MD.write_text(md, encoding='utf-8')
-    print(f'Generado: {OUT_JSON}')
-    print(f'Generado: {OUT_MD}')
+    args = parse_args()
+    session_mode = str(args.session or 'all').strip().lower()
+    session_start = None
+    out_json = OUT_JSON
+    out_md = OUT_MD
+
+    if session_mode == 'debug':
+        session_start = _load_or_init_session_start(args)
+        out_json = OUT_JSON_SESSION
+        out_md = OUT_MD_SESSION
+
+    rep = build_report(session_mode=session_mode, session_start_epoch=session_start)
+    out_json.write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding='utf-8')
+    out_md.write_text(render_md(rep), encoding='utf-8')
+
+    print(f'Generado: {out_json}')
+    print(f'Generado: {out_md}')
     print(rep.get('summary', {}).get('headline', 'sin resumen'))
+    if session_mode == 'debug':
+        print(f"Session debug start epoch: {session_start}")
+        print("Tip: usa --session-reset para empezar una sesión limpia desde ahora.")
     return 0
 
 
