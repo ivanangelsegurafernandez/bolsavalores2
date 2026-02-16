@@ -23,6 +23,7 @@ from typing import Any
 
 ROOT = Path('.')
 LOG = ROOT / 'ia_signals_log.csv'
+LOG_SESSION_CURRENT = ROOT / 'ia_signals_log_session_current.csv'
 DIAG = ROOT / 'diagnostico_pipeline_ia.json'
 OUT_JSON = ROOT / 'reporte_real_vs_ficticio_ia.json'
 OUT_MD = ROOT / 'reporte_real_vs_ficticio_ia.md'
@@ -196,13 +197,20 @@ class ClosedSignal:
 
 def _load_closed(session_mode: str, session_start_epoch: float | None) -> tuple[list[ClosedSignal], dict[str, Any]]:
     out: list[ClosedSignal] = []
-    rows = _safe_csv(LOG)
+
+    source_path = LOG
+    using_live_session_log = False
+    if session_mode == 'debug' and LOG_SESSION_CURRENT.exists():
+        source_path = LOG_SESSION_CURRENT
+        using_live_session_log = True
+
+    rows = _safe_csv(source_path)
     total_rows = len(rows)
     kept_rows = 0
 
     for r in rows:
-        # filtro sesión debug (sin tocar lógica de trading)
-        if session_mode == 'debug' and isinstance(session_start_epoch, (int, float)):
+        # filtro sesión debug por epoch SOLO cuando no existe log por sesión
+        if (session_mode == 'debug') and (not using_live_session_log) and isinstance(session_start_epoch, (int, float)):
             ep = _row_epoch(r)
             if ep is None or ep < float(session_start_epoch):
                 continue
@@ -217,9 +225,11 @@ def _load_closed(session_mode: str, session_start_epoch: float | None) -> tuple[
 
     meta = {
         'session_mode': session_mode,
-        'session_start_epoch': session_start_epoch,
+        'session_start_epoch': None if using_live_session_log else session_start_epoch,
         'rows_total_log': total_rows,
         'rows_kept_after_session_filter': kept_rows,
+        'source_path': str(source_path),
+        'using_live_session_log': using_live_session_log,
     }
     return out, meta
 
@@ -395,6 +405,8 @@ def render_md(rep: dict[str, Any]) -> str:
     sess = rep.get('session', {})
     lines.append('\n## Modo de lectura')
     lines.append(f"- Modo: {sess.get('session_mode', 'all')}")
+    lines.append(f"- Fuente: {sess.get('source_path', str(LOG))}")
+    lines.append(f"- Log de sesión en vivo: {'sí' if sess.get('using_live_session_log') else 'no'}")
     lines.append(f"- Filas log totales: {sess.get('rows_total_log', 0)}")
     lines.append(f"- Filas tras filtro sesión: {sess.get('rows_kept_after_session_filter', 0)}")
     sse = sess.get('session_start_epoch', None)

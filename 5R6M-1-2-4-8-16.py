@@ -2882,6 +2882,9 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
 # ==========================================================
 
 IA_SIGNALS_LOG = "ia_signals_log.csv"
+IA_SESSION_START_EPOCH = float(time.time())
+IA_SIGNALS_LOG_SESSION_CURRENT = "ia_signals_log_session_current.csv"
+IA_SIGNALS_LOG_SESSION = f"ia_signals_log_session_{int(IA_SESSION_START_EPOCH)}.csv"
 
 # Blindaje: evita crash si threading aún no estaba importado (aunque tú sí lo tienes)
 try:
@@ -3413,18 +3416,64 @@ def _ajustar_prob_operativa(prob: float | None) -> float | None:
     except Exception:
         return prob
 
-def _ensure_ia_signals_log():
-    """Crea el archivo con header si no existe."""
-    if os.path.exists(IA_SIGNALS_LOG):
-        return
+def _refresh_ia_session_log_from_main() -> None:
+    """
+    Sin tocar lógica de trading:
+    - refleja en archivos de sesión SOLO filas de IA_SIGNALS_LOG con epoch >= arranque actual.
+    - mantiene un alias estable (current) y uno versionado por sesión.
+    """
     try:
-        with open(IA_SIGNALS_LOG, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["ts", "bot", "epoch", "prob", "thr", "modo", "y"])
-            f.flush()
-            os.fsync(f.fileno())
+        if not os.path.exists(IA_SIGNALS_LOG):
+            return
+        df = _safe_read_csv_any_encoding(IA_SIGNALS_LOG)
+        if df is None:
+            return
+        if "epoch" in df.columns:
+            ep = pd.to_numeric(df.get("epoch"), errors="coerce")
+            d = df.loc[ep >= float(IA_SESSION_START_EPOCH)].copy()
+        else:
+            d = df.copy()
+
+        txt = d.to_csv(index=False, lineterminator="\n")
+        _atomic_write_text(IA_SIGNALS_LOG_SESSION_CURRENT, txt)
+        _atomic_write_text(IA_SIGNALS_LOG_SESSION, txt)
     except Exception:
         pass
+
+
+def _ensure_ia_signals_log():
+    """Crea el archivo con header si no existe y prepara logs de sesión."""
+    created = False
+    if not os.path.exists(IA_SIGNALS_LOG):
+        try:
+            with open(IA_SIGNALS_LOG, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["ts", "bot", "epoch", "prob", "thr", "modo", "y"])
+                f.flush()
+                os.fsync(f.fileno())
+            created = True
+        except Exception:
+            pass
+
+    # sesión actual (archivo estable + archivo versionado)
+    try:
+        if created or (not os.path.exists(IA_SIGNALS_LOG_SESSION_CURRENT)):
+            with open(IA_SIGNALS_LOG_SESSION_CURRENT, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["ts", "bot", "epoch", "prob", "thr", "modo", "y"])
+                f.flush()
+                os.fsync(f.fileno())
+        if created or (not os.path.exists(IA_SIGNALS_LOG_SESSION)):
+            with open(IA_SIGNALS_LOG_SESSION, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["ts", "bot", "epoch", "prob", "thr", "modo", "y"])
+                f.flush()
+                os.fsync(f.fileno())
+    except Exception:
+        pass
+
+    _refresh_ia_session_log_from_main()
+
 
 def _atomic_write_text(path: str, text: str) -> bool:
     tmp = path + ".tmp"
@@ -3434,6 +3483,8 @@ def _atomic_write_text(path: str, text: str) -> bool:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        if str(path) == str(IA_SIGNALS_LOG):
+            _refresh_ia_session_log_from_main()
         return True
     except Exception:
         try:

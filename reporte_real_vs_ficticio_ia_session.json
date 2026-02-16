@@ -1,12 +1,14 @@
 {
-  "generated_at": "2026-02-16T00:22:57.860875+00:00",
+  "generated_at": "2026-02-16T00:35:09.828302+00:00",
   "source": "ia_signals_log.csv",
   "closed_total": 0,
   "session": {
     "session_mode": "debug",
-    "session_start_epoch": 1771201377.146737,
+    "session_start_epoch": 1771202109.112859,
     "rows_total_log": 82,
-    "rows_kept_after_session_filter": 0
+    "rows_kept_after_session_filter": 0,
+    "source_path": "ia_signals_log.csv",
+    "using_live_session_log": false
   },
   "thresholds": {},
   "bins": {},

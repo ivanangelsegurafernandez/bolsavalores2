@@ -1,10 +1,12 @@
 # Reporte IA: Real vs Ficticia
 
-- Generado (UTC): 2026-02-16T00:22:56.414374+00:00
+- Generado (UTC): 2026-02-16T00:35:08.390003+00:00
 - Señales cerradas: 82
 
 ## Modo de lectura
 - Modo: all
+- Fuente: ia_signals_log.csv
+- Log de sesión en vivo: no
 - Filas log totales: 82
 - Filas tras filtro sesión: 82
 - Session start epoch: --
