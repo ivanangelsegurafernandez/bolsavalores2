@@ -309,6 +309,8 @@ FEATURE_DYNAMIC_SELECTION = True
 TRAIN_WARMUP_MIN_ROWS = 300
 CRITICAL_FEATURES_DATA_QUALITY = ["volatilidad", "hora_bucket"]
 CLONED_PROB_TICKS_ALERT = 6
+INPUT_DUP_DIAG_COOLDOWN_S = 20.0
+INPUT_DUP_FINGERPRINT_DECIMALS = 6
 
 # Meta objetivo (calidad real en señales fuertes)
 IA_TARGET_PRECISION = 0.70
@@ -4480,6 +4482,7 @@ IA_PRED_TTL_S = 180.0          # si falla por mucho tiempo, recién se limpia a 
 IA_PRED_MIN_INTERVAL_S = 2.0   # anti-spam de predicción
 _last_pred_ts = {b: 0.0 for b in BOT_NAMES}
 _IA_CLONED_PROB_TICKS = 0
+_IA_INPUT_DUP_INFO = {"signature": "", "ts": 0.0, "bots": []}
 
 def actualizar_prob_ia_bot(bot: str):
     """
@@ -4493,6 +4496,15 @@ def actualizar_prob_ia_bot(bot: str):
         if (now - last) < IA_PRED_MIN_INTERVAL_S:
             return
         _last_pred_ts[bot] = now
+
+        # Guardrail duro: no confiar en predicción si el input del bot está duplicado en este tick.
+        if bool(estado_bots.get(bot, {}).get("ia_input_duplicado", False)):
+            estado_bots[bot]["ia_ready"] = False
+            estado_bots[bot]["ia_last_err"] = "INPUT_DUPLICADO"
+            estado_bots[bot]["modo_ia"] = "input_dup"
+            estado_bots[bot]["ia_senal_pendiente"] = False
+            estado_bots[bot]["ia_prob_senal"] = None
+            return
 
         p, err = predecir_prob_ia_bot(bot)
 
@@ -4549,11 +4561,21 @@ def actualizar_prob_ia_todos():
     """
     Tick único para el panel:
       1) Cierra señales en IA_SIGNALS_LOG (Real vs Ficción) usando los cierres del CSV del bot.
-      2) Actualiza Prob IA por bot (sin tocar la lógica de trading).
-    Nota: esto arregla el caso clásico "Aún no hay cierres suficientes" cuando el cierre nunca se ejecuta.
+      2) Detecta input duplicado por fingerprint de features por bot.
+      3) Actualiza Prob IA por bot (sin tocar la lógica de trading).
     """
+    global _IA_CLONED_PROB_TICKS, _IA_INPUT_DUP_INFO
+
+    # 0) Estado default por tick
     for b in BOT_NAMES:
-        # 1) Backfill / cierre de señales (más profundo solo en el primer tick tras arrancar)
+        try:
+            estado_bots[b]["ia_input_duplicado"] = False
+            estado_bots[b]["ia_input_dup_group"] = ""
+        except Exception:
+            pass
+
+    # 1) Backfill / cierre de señales
+    for b in BOT_NAMES:
         try:
             last = IA_AUDIT_LAST_CLOSE_EPOCH.get(b, None)
             tail_lines = 25000 if last is None else 6000
@@ -4562,14 +4584,56 @@ def actualizar_prob_ia_todos():
         except Exception:
             pass
 
-        # 2) Predicción / estado IA del bot
+    # 2) Fingerprints por bot para cortar input duplicado en origen
+    rows_by_bot = {}
+    fp_map = {}
+    try:
+        for b in BOT_NAMES:
+            row = leer_ultima_fila_features_para_pred(b)
+            if row is None:
+                continue
+            rows_by_bot[b] = row
+            fp = _fingerprint_features_row(row, feats=list(INCREMENTAL_FEATURES_V2))
+            fp_map.setdefault(fp, []).append(b)
+
+        dup_groups = [bots for bots in fp_map.values() if len(bots) >= 2]
+        if dup_groups:
+            now = time.time()
+            for bots in dup_groups:
+                sig = "+".join(sorted(bots))
+                for b in bots:
+                    try:
+                        estado_bots[b]["ia_input_duplicado"] = True
+                        estado_bots[b]["ia_input_dup_group"] = sig
+                    except Exception:
+                        pass
+
+                diag = _diagnosticar_inputs_duplicados(rows_by_bot, bots, feats=list(INCREMENTAL_FEATURES_V2))
+                same_cols = diag.get("same_cols", [])
+                expected = diag.get("expected_diff", [])
+                msg_sig = f"{sig}|{','.join(same_cols[:6])}"
+
+                should_emit = (
+                    msg_sig != str(_IA_INPUT_DUP_INFO.get("signature", "")) or
+                    (now - float(_IA_INPUT_DUP_INFO.get("ts", 0.0) or 0.0)) >= float(INPUT_DUP_DIAG_COOLDOWN_S)
+                )
+                if should_emit:
+                    agregar_evento(
+                        "🛑 IA inválida por INPUT DUPLICADO "
+                        f"[{sig}] | cols_iguales={same_cols[:8]} | esperadas_diferir={expected}"
+                    )
+                    _IA_INPUT_DUP_INFO = {"signature": msg_sig, "ts": now, "bots": list(bots)}
+    except Exception:
+        pass
+
+    # 3) Predicción / estado IA del bot
+    for b in BOT_NAMES:
         try:
             actualizar_prob_ia_bot(b)
         except Exception:
             pass
 
-    # 3) Guardrail anti-clonado de probabilidades (6/6 iguales por varios ticks)
-    global _IA_CLONED_PROB_TICKS
+    # 4) Guardrail anti-clonado de probabilidades (síntoma downstream)
     try:
         div = _calcular_diversidad_prob_tick()
         if div.get("all_equal", False) and int(div.get("n_live", 0)) >= 2:
@@ -4584,6 +4648,7 @@ def actualizar_prob_ia_todos():
             _IA_CLONED_PROB_TICKS = 0
     except Exception:
         pass
+
 def actualizar_prob_ia_bots_tick():
     """
     Actualiza estado_bots[*].prob_ia con la prob REAL (aunque sea < 0.70).
@@ -6542,16 +6607,25 @@ def anexar_incremental_desde_bot(bot: str):
         row_dict_full = dict(fila_dict)
         row_dict_full["result_bin"] = label
         try:
-            row_dict_full["volatilidad"] = float(calcular_volatilidad_simple(row_dict_full))
+            vol_calc = float(calcular_volatilidad_simple(row_dict_full))
         except Exception:
-            row_dict_full["volatilidad"] = 0.0
+            vol_calc = float("nan")
+        if (not math.isfinite(vol_calc)) or (vol_calc <= 0.0):
+            agregar_evento(f"⚠️ Incremental: fila descartada ({bot}) => volatilidad inválida ({vol_calc}).")
+            return
+        row_dict_full["volatilidad"] = float(max(0.0, min(vol_calc, 1.0)))
+
         try:
             hb, hm = calcular_hora_features(row_dict_full)
-            row_dict_full["hora_bucket"] = float(hb)
-            row_dict_full["hora_missing"] = float(hm)
+            hb = float(hb)
+            hm = float(hm)
         except Exception:
-            row_dict_full["hora_bucket"] = 0.0
-            row_dict_full["hora_missing"] = 1.0
+            hb, hm = 0.0, 1.0
+        if (not math.isfinite(hb)) or hm >= 1.0:
+            agregar_evento(f"⚠️ Incremental: fila descartada ({bot}) => hora_bucket inválida (missing={hm}).")
+            return
+        row_dict_full["hora_bucket"] = float(max(0.0, min(hb, 1.0)))
+        row_dict_full["hora_missing"] = float(hm)
 
         # Clip + validar
         row_dict_full = clip_feature_values(row_dict_full, feature_names)
@@ -6842,6 +6916,48 @@ def _auditar_salud_features(X_df: pd.DataFrame, feats: list[str]):
     except Exception:
         return {}
     return out
+
+
+def _fingerprint_features_row(row: dict, feats: list[str] | None = None, decimals: int = INPUT_DUP_FINGERPRINT_DECIMALS) -> str:
+    """Huella estable por bot/tick para detectar inputs duplicados entre bots."""
+    base_feats = list(feats) if feats else list(INCREMENTAL_FEATURES_V2)
+    parts = []
+    for k in base_feats:
+        v = (row or {}).get(k, 0.0)
+        try:
+            vf = float(v)
+            if not np.isfinite(vf):
+                vf = 0.0
+        except Exception:
+            vf = 0.0
+        parts.append(f"{k}={round(vf, int(decimals))}")
+    return "|".join(parts)
+
+
+def _diagnosticar_inputs_duplicados(rows_by_bot: dict, dup_bots: list[str], feats: list[str] | None = None) -> dict:
+    """Diagnóstico compacto de columnas idénticas/variables en grupos duplicados."""
+    base_feats = list(feats) if feats else list(INCREMENTAL_FEATURES_V2)
+    same_cols, diff_cols = [], []
+
+    for c in base_feats:
+        vals = []
+        for b in dup_bots:
+            rv = rows_by_bot.get(b, {}) or {}
+            try:
+                vals.append(round(float(rv.get(c, 0.0) or 0.0), int(INPUT_DUP_FINGERPRINT_DECIMALS)))
+            except Exception:
+                vals.append(0.0)
+        if len(set(vals)) <= 1:
+            same_cols.append(c)
+        else:
+            diff_cols.append(c)
+
+    expected_diff = [c for c in ("payout", "rsi_9", "rsi_14", "sma_5", "sma_spread") if c in base_feats]
+    return {
+        "same_cols": same_cols,
+        "diff_cols": diff_cols,
+        "expected_diff": expected_diff,
+    }
 
 
 def maybe_retrain(force: bool = False):
@@ -8411,7 +8527,10 @@ def backfill_incremental(ultimas=500):
                 # nuevas features: rebote y hora (0–1)
                 # ==========================
                 fila["es_rebote"]   = float(max(0.0, min(1.0, _safe_float_local(row_dict_full.get("es_rebote")) or calcular_es_rebote(row_dict_full))))
-                fila["hora_bucket"] = calcular_hora_bucket(row_dict_full)
+                hb, hm = calcular_hora_features(row_dict_full)
+                if float(hm) >= 1.0:
+                    continue
+                fila["hora_bucket"] = float(max(0.0, min(1.0, float(hb))))
 
                 # ==========================
                 # label final (GANANCIA / PÉRDIDA)
