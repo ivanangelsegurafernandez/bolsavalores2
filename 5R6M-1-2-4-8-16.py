@@ -763,7 +763,14 @@ def dyn_roof_snapshot() -> dict:
 
 
 def dyn_roof_best_candidate() -> tuple[str | None, float, dict]:
-    """Compuerta REAL con confirmación 2 ticks seguidos y GAP vs 2º."""
+    """
+    "TECHO DINÁMICO + COMPUERTA REAL"
+    Reglas de autorización REAL:
+    - p_best >= roof_eff(bot)  (roof + penalización si n<30)
+    - p_best >= floor
+    - GAP vs segundo bot (si existe; si no, no aplica)
+    - confirmación por ticks consecutivos del MISMO bot
+    """
     snap = dyn_roof_snapshot()
     best_bot = snap["best_bot"]
     p_best = float(snap["best_prob"])
@@ -3844,24 +3851,15 @@ def _tail_rows_dict(path: str, max_lines: int = 1200) -> list[dict]:
     except Exception:
         pass
 
-    # Fallback defensivo (si el parser por bytes falla): aún limitado por deque.
-    for enc in ("utf-8", "latin-1", "windows-1252"):
-        try:
-            from collections import deque as _dq
-            with open(path, "r", encoding=enc, errors="replace", newline="") as f:
-                header = f.readline()
-                if not header:
-                    return []
-                dq = _dq(f, maxlen=n)
-            lines = [header] + list(dq)
-            reader = csv.DictReader(lines)
-            out = []
-            for r in reader:
-                if isinstance(r, dict) and r:
-                    out.append(r)
-            return out
-        except Exception:
-            continue
+    # Fallback defensivo: intentar nuevamente con presupuesto más amplio,
+    # pero SIEMPRE por bytes (nunca recorrer archivo completo).
+    try:
+        rows = _tail_rows_csv(path, n_rows=n, max_bytes=int(min(12_000_000, max_bytes * 2)))
+        if rows:
+            return rows
+    except Exception:
+        pass
+
     return []
 
 def ia_audit_get_last_pre_epoch(bot: str) -> int | None:
