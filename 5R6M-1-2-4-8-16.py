@@ -5070,7 +5070,7 @@ def ia_prob_valida(bot: str, max_age_s: float = 10.0) -> bool:
     except Exception:
         return False
                                               
-_AUTO_REAL_CACHE = {"ts": 0.0, "thr": float(AUTO_REAL_THR), "n": 0, "max": 0.0}
+_AUTO_REAL_CACHE = {"ts": 0.0, "thr": float(IA_ACTIVACION_REAL_THR), "n": 0, "max": 0.0}
 
 
 def _leer_probs_historicas_ia(max_rows: int = AUTO_REAL_LOG_MAX_ROWS) -> list[float]:
@@ -5107,6 +5107,13 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
     """
     now = time.time()
     try:
+        # En modo clásico, el umbral REAL debe mantenerse fijo al operativo (85%).
+        if bool(REAL_CLASSIC_GATE):
+            thr_fixed = float(IA_ACTIVACION_REAL_THR)
+            _AUTO_REAL_CACHE["ts"] = now
+            _AUTO_REAL_CACHE["thr"] = thr_fixed
+            return thr_fixed
+
         if (not force) and ((now - float(_AUTO_REAL_CACHE.get("ts", 0.0) or 0.0)) < 8.0):
             return float(_AUTO_REAL_CACHE.get("thr", AUTO_REAL_THR_MIN))
 
