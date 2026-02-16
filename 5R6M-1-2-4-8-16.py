@@ -3432,12 +3432,29 @@ def _aplicar_orientacion_prob(prob: float | None) -> float | None:
 def _ajustar_prob_operativa(prob: float | None) -> float | None:
     """
     Shrinkage anti-sobreconfianza: p_ajustada = a*p + (1-a)*tasa_base_rolling.
+    Regla anti-aplastamiento:
+      - En warmup o con pocas señales cerradas, NO se aplica shrink para evitar
+        colapsar todo alrededor de la tasa base (síntoma típico: 32.x% repetido).
     """
     try:
         if not isinstance(prob, (int, float)):
             return prob
         p = max(0.0, min(1.0, float(prob)))
-        base_rate, _ = _leer_base_rate_y_n70(ttl_s=30.0)
+
+        base_rate, n70 = _leer_base_rate_y_n70(ttl_s=30.0)
+
+        # Si aún no hay suficiente evidencia cerrada o el modelo sigue en warmup,
+        # devolvemos p cruda calibrada (sin shrink).
+        try:
+            meta = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+            n_samples = int(meta.get("n_samples", meta.get("n", 0)) or 0)
+            warmup = bool(meta.get("warmup_mode", n_samples < int(TRAIN_WARMUP_MIN_ROWS)))
+        except Exception:
+            n_samples = 0
+            warmup = True
+
+        if warmup or int(n70) < int(max(MIN_IA_SENIALES_CONF, 12)):
+            return p
 
         # Alpha adaptativo por calibración reciente:
         # - sube un poco cuando el modelo está estable y bien calibrado
@@ -3450,14 +3467,11 @@ def _ajustar_prob_operativa(prob: float | None) -> float | None:
             pred_mean = float(rep.get("avg_pred", 0.0) or 0.0)
             win_rate = float(rep.get("win_rate", 0.0) or 0.0)
 
-            # Señal todavía inmadura: no confiar demasiado en p puntual
             if n < int(MIN_IA_SENIALES_CONF):
                 a -= 0.10
             else:
-                # Sobreestimación fuerte: más shrink para estabilizar
                 if infl_pp > float(SEM_CAL_INFL_WARN_PP) and pred_mean > win_rate:
                     a -= 0.12
-                # Buena calibración y muestra suficiente: permitir más sensibilidad
                 elif (abs(infl_pp) <= float(SEM_CAL_INFL_OK_PP)) and (n >= int(max(50, IA_CALIB_MIN_CLOSED // 2))):
                     a += 0.08
         except Exception:
@@ -6667,32 +6681,73 @@ def anexar_incremental_desde_bot(bot: str):
         # Construir row completo + features derivadas (volatilidad/hora_bucket)
         row_dict_full = dict(fila_dict)
         row_dict_full["result_bin"] = label
+
+        # 1) Volatilidad: prioriza valor ya enriquecido; recalcula solo si falta/inválido.
+        vol_calc = None
         try:
-            vol_calc = float(calcular_volatilidad_simple(row_dict_full))
+            v0 = row_dict_full.get("volatilidad", None)
+            if v0 not in (None, ""):
+                v0 = float(v0)
+                if math.isfinite(v0) and v0 >= 0.0:
+                    vol_calc = float(v0)
         except Exception:
-            vol_calc = float("nan")
+            vol_calc = None
 
-        # Fallback por historial real del bot cuando la fila puntual viene plana.
-        if (not math.isfinite(vol_calc)) or (vol_calc <= 0.0):
-            vol_hist = calcular_volatilidad_por_bot(bot, lookback=50)
-            if vol_hist is not None and math.isfinite(float(vol_hist)) and float(vol_hist) > 0.0:
-                vol_calc = float(vol_hist)
+        if vol_calc is None:
+            try:
+                v1 = float(calcular_volatilidad_simple(row_dict_full))
+                if math.isfinite(v1) and v1 >= 0.0:
+                    vol_calc = float(v1)
+            except Exception:
+                vol_calc = None
 
-        if (not math.isfinite(vol_calc)) or (vol_calc <= 0.0):
-            agregar_evento(f"⚠️ Incremental: fila descartada ({bot}) => volatilidad inválida ({vol_calc}).")
-            return
-        row_dict_full["volatilidad"] = float(max(0.0, min(vol_calc, 1.0)))
+        if vol_calc is None or vol_calc <= 0.0:
+            try:
+                vol_hist = calcular_volatilidad_por_bot(bot, lookback=50)
+                if vol_hist is not None and math.isfinite(float(vol_hist)) and float(vol_hist) >= 0.0:
+                    vol_calc = float(vol_hist)
+            except Exception:
+                pass
 
+        # No matar incremental por vol no disponible: conservar fila y dejar traza.
+        if (vol_calc is None) or (not math.isfinite(float(vol_calc))):
+            vol_calc = 0.0
+            agregar_evento(f"⚠️ Incremental: volatilidad no disponible ({bot}); se guarda fila con vol=0.0")
+        row_dict_full["volatilidad"] = float(max(0.0, min(float(vol_calc), 1.0)))
+
+        # 2) Hora bucket: prioriza valor ya enriquecido; fallback a parseo y luego hora actual.
+        hb = None
+        hm = 0.0
         try:
-            hb, hm = calcular_hora_features(row_dict_full)
-            hb = float(hb)
-            hm = float(hm)
+            hb0 = row_dict_full.get("hora_bucket", None)
+            if hb0 not in (None, ""):
+                hb0 = float(hb0)
+                if math.isfinite(hb0):
+                    hb = float(max(0.0, min(1.0, hb0)))
+                    hm = 0.0
         except Exception:
-            hb, hm = 0.0, 1.0
-        if (not math.isfinite(hb)) or hm >= 1.0:
-            agregar_evento(f"⚠️ Incremental: fila descartada ({bot}) => hora_bucket inválida (missing={hm}).")
-            return
-        row_dict_full["hora_bucket"] = float(max(0.0, min(hb, 1.0)))
+            hb = None
+
+        if hb is None:
+            try:
+                hb1, hm1 = calcular_hora_features(row_dict_full)
+                hb1 = float(hb1)
+                hm1 = float(hm1)
+                if math.isfinite(hb1) and hm1 < 1.0:
+                    hb = float(max(0.0, min(1.0, hb1)))
+                    hm = float(hm1)
+            except Exception:
+                hb = None
+
+        if hb is None:
+            # fallback final: hora local actual (no descartar fila por timestamp faltante)
+            lt = time.localtime()
+            idx48 = int(lt.tm_hour * 2 + (1 if lt.tm_min >= 30 else 0))
+            hb = float(max(0, min(47, idx48))) / 47.0
+            hm = 1.0
+            agregar_evento(f"⚠️ Incremental: hora no parseable ({bot}); fallback hora actual aplicado")
+
+        row_dict_full["hora_bucket"] = float(max(0.0, min(1.0, float(hb))))
         row_dict_full["hora_missing"] = float(hm)
 
         # Clip + validar
@@ -8596,8 +8651,8 @@ def backfill_incremental(ultimas=500):
                     vol_hist = calcular_volatilidad_por_bot(bot, lookback=50)
                     if vol_hist is not None:
                         vol_f = float(vol_hist)
-                if (not math.isfinite(vol_f)) or vol_f <= 0.0:
-                    continue
+                if (not math.isfinite(vol_f)):
+                    vol_f = 0.0
 
                 fila["volatilidad"] = max(0.0, min(float(vol_f), 1.0))
 
@@ -8607,7 +8662,9 @@ def backfill_incremental(ultimas=500):
                 fila["es_rebote"]   = float(max(0.0, min(1.0, _safe_float_local(row_dict_full.get("es_rebote")) or calcular_es_rebote(row_dict_full))))
                 hb, hm = calcular_hora_features(row_dict_full)
                 if float(hm) >= 1.0:
-                    continue
+                    lt = time.localtime()
+                    idx48 = int(lt.tm_hour * 2 + (1 if lt.tm_min >= 30 else 0))
+                    hb = float(max(0, min(47, idx48))) / 47.0
                 fila["hora_bucket"] = float(max(0.0, min(1.0, float(hb))))
 
                 # ==========================
