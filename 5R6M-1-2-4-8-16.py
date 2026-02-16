@@ -576,6 +576,7 @@ BOOT_FAST_UI = True
 BOOT_INIT_SYNC_TAIL_ROWS = 220     # en BOOT_04, sincroniza cola reciente en vez de historial completo
 BOOT_BACKFILL_ROWS = 500           # backfill inicial más liviano para entrar rápido al HUD
 BOOT_BG_TRAIN_DELAY_S = 0.8        # deja renderizar HUD y luego entrena en segundo plano
+BOOT_CLEANUP_VISUAL_S = 1.2      # evita pantalla "vacía" larga antes de mostrar interfaz
 MAX_CICLOS = len(MARTI_ESCALADO)
 huellas_usadas = {bot: set() for bot in BOT_NAMES}
 SNAPSHOT_FILAS = {bot: 0 for bot in BOT_NAMES}
@@ -5595,7 +5596,7 @@ def detectar_martingala_perdida_completa(bot):
     return all(x == "PÉRDIDA" for x in ult)
 
 # Reinicio completo - Corregido para no resetear métricas en modo suave
-def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True):
+def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True, quick_snapshot=False):
     global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos, ultimo_bot_real, REAL_OWNER_LOCK
     with file_lock():
         write_token_atomic(TOKEN_FILE, "REAL:none")
@@ -5643,7 +5644,11 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
             "ia_senal_pendiente": False,
             "ia_prob_senal": None
         })
-        SNAPSHOT_FILAS[bot] = contar_filas_csv(bot)
+        if quick_snapshot:
+            # Arranque rápido: evita escanear todos los CSV antes de mostrar HUD.
+            SNAPSHOT_FILAS[bot] = int(max(0, SNAPSHOT_FILAS.get(bot, 0) or 0))
+        else:
+            SNAPSHOT_FILAS[bot] = contar_filas_csv(bot)
         OCULTAR_HASTA_NUEVO[bot] = False  # Cambiado para no ocultar
         IA53_TRIGGERED[bot] = False
         IA90_stats[bot] = {"n": 0, "ok": 0, "pct": 0.0}
@@ -9911,7 +9916,7 @@ async def main():
             resetear_incremental_y_modelos(borrar_modelos=True)
             resetear_estado_hud(estado_bots)
             print("🧼 Sesión limpia: CSVs de bots, dataset incremental y estado HUD reiniciados.")
-        reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True)
+        reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=(BOOT_CLEANUP_VISUAL_S if BOOT_FAST_UI else 15), modo_suave=True, quick_snapshot=BOOT_FAST_UI)
         loop = asyncio.get_running_loop()
         set_main_loop(loop)
         await refresh_saldo_real_safe(forzado=True, timeout_s=SALDO_BOOT_TIMEOUT_S)
@@ -9958,7 +9963,7 @@ async def main():
                 continue
             if reinicio_manual:
                 reinicio_manual = False
-                reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True)
+                reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=(BOOT_CLEANUP_VISUAL_S if BOOT_FAST_UI else 15), modo_suave=True, quick_snapshot=BOOT_FAST_UI)
                 await refresh_saldo_real_safe(forzado=True, timeout_s=SALDO_BOOT_TIMEOUT_S)
 
             try:  
