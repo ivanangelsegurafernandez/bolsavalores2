@@ -276,6 +276,7 @@ MAX_DATASET_ROWS = 10000
 last_retrain_count = 0
 last_retrain_ts    = time.time()  # Inicializado al boot para arranque en frío
 AUTO_RETRAIN_TICK_S = 20.0  # reintento periódico para no quedarse sin modelo tras warmup
+IA_NO_MODEL_LOG_COOLDOWN_S = 30.0  # evita spam cuando aún no hay modelo
 _entrenando_lock = threading.Lock()  # Lock para antireentradas en maybe_retrain
 
 # === MODO ENTRENAMIENTO CON POCA DATA (no toca la lógica de IA) ===
@@ -4561,6 +4562,33 @@ def _coerce_float_default(v, default=0.0) -> float:
     except Exception:
         return float(default)
 
+def _predict_prob_low_data_from_row(row: dict) -> float:
+    """Heurística estable para mostrar Prob IA en LOW_DATA cuando no hay modelo."""
+    try:
+        racha = float(row.get("racha_actual", 0.0) or 0.0)
+    except Exception:
+        racha = 0.0
+    try:
+        rsi9 = float(row.get("rsi_9", 50.0) or 50.0)
+    except Exception:
+        rsi9 = 50.0
+    try:
+        rev = float(row.get("rsi_reversion", 0.0) or 0.0)
+    except Exception:
+        rev = 0.0
+    try:
+        vol = float(row.get("volatilidad", 0.5) or 0.5)
+    except Exception:
+        vol = 0.5
+
+    score = 0.50
+    score += max(-0.08, min(0.10, 0.018 * racha))
+    score += 0.06 if rev >= 0.5 else 0.0
+    score += 0.04 if rsi9 <= 30 else (-0.03 if rsi9 >= 70 else 0.0)
+    score += 0.02 if vol <= 0.35 else (-0.02 if vol >= 0.8 else 0.0)
+    return float(max(0.20, min(0.80, score)))
+
+
 def predecir_prob_ia_bot(bot: str) -> tuple[float | None, str | None]:
     """
     Retorna (prob, err). prob en 0..1.
@@ -4577,13 +4605,23 @@ def predecir_prob_ia_bot(bot: str) -> tuple[float | None, str | None]:
             model = _IA_ASSETS_CACHE.get("model")
             scaler = _IA_ASSETS_CACHE.get("scaler")
 
-        if model is None:
-            return None, "NO_MODELO"
-
         # 2) Leer fila de features para pred (sin label)
         row = leer_ultima_fila_features_para_pred(bot)
         if row is None:
             return None, "NO_FEATURE_ROW"
+
+        if model is None:
+            # Modo LOW_DATA: aún sin modelo, pero entrega prob heurística para no quedar en OFF.
+            try:
+                global _IA_NO_MODEL_LOG_TS
+                now_nm = time.time()
+                if (now_nm - float(_IA_NO_MODEL_LOG_TS or 0.0)) >= float(IA_NO_MODEL_LOG_COOLDOWN_S):
+                    _IA_NO_MODEL_LOG_TS = now_nm
+                    agregar_evento("ℹ️ IA LOW_DATA activa: aún sin modelo; mostrando prob heurística temporal.")
+            except Exception:
+                pass
+            p0 = _predict_prob_low_data_from_row(row)
+            return float(p0), "LOW_DATA"
 
         # 3) Lista de features esperadas por el modelo (features.pkl si existe)
         feats = _features_model_list()
@@ -4687,6 +4725,7 @@ _IA_CLONED_PROB_TICKS = 0
 _IA_INPUT_DUP_INFO = {"signature": "", "ts": 0.0, "bots": []}
 _LAST_AUTO_RETRAIN_TICK = 0.0
 _IA_TRAIN_CLEAN_LOG = {"ts": 0.0, "sig": ""}
+_IA_NO_MODEL_LOG_TS = 0.0
 
 def actualizar_prob_ia_bot(bot: str):
     """
@@ -4724,18 +4763,21 @@ def actualizar_prob_ia_bot(bot: str):
 
             # FIX UI/AUTO: garantizar modo_ia distinto de OFF cuando hay predicción.
             try:
-                meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
-                reliable = bool(meta_local.get("reliable", False))
-                n_samples = int(meta_local.get("n_samples", meta_local.get("n", 0)) or 0)
-                if reliable:
-                    modo = "confiable"
-                elif n_samples >= int(MIN_FIT_ROWS_LOW):
-                    modo = "modelo"
+                if str(err or "").upper().startswith("LOW_DATA"):
+                    estado_bots[bot]["modo_ia"] = "low_data"
                 else:
-                    modo = "low_data"
-                estado_bots[bot]["modo_ia"] = modo
+                    meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+                    reliable = bool(meta_local.get("reliable", False))
+                    n_samples = int(meta_local.get("n_samples", meta_local.get("n", 0)) or 0)
+                    if reliable:
+                        modo = "confiable"
+                    elif n_samples >= int(MIN_FIT_ROWS_LOW):
+                        modo = "modelo"
+                    else:
+                        modo = "low_data"
+                    estado_bots[bot]["modo_ia"] = modo
             except Exception:
-                estado_bots[bot]["modo_ia"] = "modelo"
+                estado_bots[bot]["modo_ia"] = "low_data" if str(err or "").upper().startswith("LOW_DATA") else "modelo"
             return
 
         # fallo: no mates la última prob, solo marca error
@@ -7261,7 +7303,22 @@ def _maybe_retrain_fallback_sklearn(force: bool = False):
 
         feats = [f for f in FEATURE_NAMES_DEFAULT if f in df.columns]
         if not feats:
-            agregar_evento("⚠️ IA fallback: no hay features compatibles en incremental.")
+            feats = [f for f in INCREMENTAL_FEATURES_V2 if f in df.columns]
+        if not feats:
+            reserved = {"result_bin", "resultado", "resultado_norm", "trade_status", "trade_status_norm"}
+            cand = []
+            for c in df.columns:
+                if c in reserved:
+                    continue
+                try:
+                    sc = pd.to_numeric(df[c], errors="coerce")
+                    if int(sc.notna().sum()) >= max(6, int(len(df) * 0.20)):
+                        cand.append(c)
+                except Exception:
+                    continue
+            feats = cand[:20]
+        if not feats:
+            agregar_evento("⚠️ IA fallback: no hay features numéricas utilizables en incremental.")
             return False
 
         X = df.loc[mask, feats].copy()
@@ -8310,7 +8367,9 @@ def mostrar_panel():
         print(Fore.CYAN + f"      Faltan {faltan} filas para el primer entrenamiento.")
     elif not meta:
         print(Fore.CYAN + f" IA ▶ dataset listo (n={dataset_rows}), pero sin modelo entrenado todavía.")
-        print(Fore.CYAN + "      Se entrenará automáticamente cuando se llame al oráculo / maybe_retrain().")
+        print(Fore.CYAN + "      Se entrenará automáticamente por tick o al usar [E].")
+        print(Fore.CYAN + f"      Requisitos mínimos: filas útiles >= {MIN_FIT_ROWS_LOW}, 2 clases (GAN/PERD), y features válidas.")
+        print(Fore.CYAN + f"      Modo confiable recomendado desde n >= {TRAIN_WARMUP_MIN_ROWS}.")
     else:
         pos = int(meta.get("pos", meta.get("n_pos", 0)) or 0)
         neg = int(meta.get("neg", meta.get("n_neg", 0)) or 0)
