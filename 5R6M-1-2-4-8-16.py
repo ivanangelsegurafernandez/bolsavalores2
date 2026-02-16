@@ -566,6 +566,10 @@ reinicio_manual = False
 LIMPIEZA_PANEL_HASTA = 0
 ULTIMA_ACT_SALDO = 0
 REFRESCO_SALDO = 12
+SALDO_BOOT_TIMEOUT_S = 4.0
+SALDO_REFRESH_TIMEOUT_S = 3.0
+WS_OPEN_TIMEOUT_S = 3.0
+WS_REPLY_TIMEOUT_S = 3.0
 MAX_CICLOS = len(MARTI_ESCALADO)
 huellas_usadas = {bot: set() for bot in BOT_NAMES}
 SNAPSHOT_FILAS = {bot: 0 for bot in BOT_NAMES}
@@ -8848,8 +8852,8 @@ def mostrar_advertencia_meta():
                             pass
                 try:
                     if MAIN_LOOP:
-                        fut = asyncio.run_coroutine_threadsafe(refresh_saldo_real(forzado=True), MAIN_LOOP)
-                        fut.result(timeout=15)
+                        fut = asyncio.run_coroutine_threadsafe(refresh_saldo_real_safe(forzado=True, timeout_s=SALDO_BOOT_TIMEOUT_S), MAIN_LOOP)
+                        fut.result(timeout=6)
                     valor = obtener_valor_saldo()
                     if valor is not None:
                         SALDO_INICIAL = round(valor, 2)
@@ -9530,22 +9534,30 @@ async def obtener_saldo_real():
     if not WEBSOCKETS_OK:
         return
     try:
-        async with websockets.connect(DERIV_WS_URL) as ws:
+        async with websockets.connect(
+            DERIV_WS_URL,
+            open_timeout=float(WS_OPEN_TIMEOUT_S),
+            close_timeout=1.0,
+            ping_interval=20,
+            ping_timeout=10,
+        ) as ws:
             auth_msg = json.dumps({"authorize": token_real})
             await ws.send(auth_msg)
-            resp = json.loads(await ws.recv())
+            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=float(WS_REPLY_TIMEOUT_S)))
             if "error" in resp:
                 print(f"⚠️ Error en auth: {resp['error']['message']}")
                 return
             bal_msg = json.dumps({"balance": 1, "subscribe": 1})
             await ws.send(bal_msg)
-            resp = json.loads(await ws.recv())
+            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=float(WS_REPLY_TIMEOUT_S)))
             if "error" in resp:
                 print(f"⚠️ Error en balance: {resp['error']['message']}")
                 return
             if "balance" in resp:
                 saldo_real = f"{resp['balance']['balance']:.2f}"
                 ULTIMA_ACT_SALDO = time.time()
+    except asyncio.TimeoutError:
+        print("⚠️ Timeout obteniendo saldo REAL (WS). Continúo sin bloquear HUD.")
     except Exception as e:
         print(f"⚠️ Error obteniendo saldo: {e}")
 
@@ -9553,6 +9565,16 @@ async def refresh_saldo_real(forzado=False):
     global ULTIMA_ACT_SALDO
     if forzado or time.time() - ULTIMA_ACT_SALDO > REFRESCO_SALDO:
         await obtener_saldo_real()
+
+
+async def refresh_saldo_real_safe(forzado=False, timeout_s: float = SALDO_REFRESH_TIMEOUT_S):
+    """Wrapper anti-bloqueo: nunca deja clavado el loop/HUD por saldo WS."""
+    try:
+        await asyncio.wait_for(refresh_saldo_real(forzado=forzado), timeout=float(max(0.5, timeout_s)))
+    except asyncio.TimeoutError:
+        agregar_evento("⏱️ Saldo WS demoró demasiado; continúo sin bloquear interfaz.")
+    except Exception as e:
+        agregar_evento(f"⚠️ Refresh saldo omitido: {e}")
 
 def obtener_valor_saldo():
     global saldo_real
@@ -9852,7 +9874,7 @@ async def main():
         reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True)
         loop = asyncio.get_running_loop()
         set_main_loop(loop)
-        await refresh_saldo_real(forzado=True)
+        await refresh_saldo_real_safe(forzado=True, timeout_s=SALDO_BOOT_TIMEOUT_S)
         valor = obtener_valor_saldo()
         if valor is not None:
             inicializar_saldo_real(valor)
@@ -9886,7 +9908,7 @@ async def main():
             if reinicio_manual:
                 reinicio_manual = False
                 reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True)
-                await refresh_saldo_real(forzado=True)
+                await refresh_saldo_real_safe(forzado=True, timeout_s=SALDO_BOOT_TIMEOUT_S)
 
             try:  
                 set_etapa("TICK_01")
@@ -10232,7 +10254,7 @@ async def main():
                                 pass
 
                     set_etapa("TICK_04")
-                    await refresh_saldo_real()
+                    await refresh_saldo_real_safe()
                     if meta_mostrada and not pausado and not MODAL_ACTIVO:
                         mostrar_advertencia_meta()
                     if not MODAL_ACTIVO:
