@@ -305,13 +305,6 @@ FEATURE_MIN_AUC_DELTA = 0.015      # aporte mínimo (|AUC_uni - 0.5|)
 FEATURE_MAX_DOMINANCE_GATE = 0.965 # evita casi-constantes
 FEATURE_DYNAMIC_SELECTION = True
 
-# Calidad mínima de datos antes de confiar en probas altas
-TRAIN_WARMUP_MIN_ROWS = 300
-CRITICAL_FEATURES_DATA_QUALITY = ["volatilidad", "hora_bucket"]
-CLONED_PROB_TICKS_ALERT = 6
-INPUT_DUP_DIAG_COOLDOWN_S = 20.0
-INPUT_DUP_FINGERPRINT_DECIMALS = 6
-
 # Meta objetivo (calidad real en señales fuertes)
 IA_TARGET_PRECISION = 0.70
 IA_TARGET_PRECISION_FLOOR = 0.65   # piso mínimo para declarar confiable
@@ -7065,49 +7058,6 @@ def _seleccionar_features_calidad(X_df: pd.DataFrame, y_arr: np.ndarray, feats: 
         return list(feats), []
 
 
-def _dataset_quality_gate_for_training(X_df: pd.DataFrame, feats_used: list[str]):
-    """
-    Control de calidad de datos previo al entrenamiento.
-    Bloquea entrenamiento cuando features críticas están muertas/constantes.
-    """
-    reasons = []
-    health = _auditar_salud_features(X_df, feats_used)
-
-    for f in CRITICAL_FEATURES_DATA_QUALITY:
-        st = str((health.get(f, {}) or {}).get("status", "MISSING"))
-        nun = int((health.get(f, {}) or {}).get("nunique", 0) or 0)
-        dom = float((health.get(f, {}) or {}).get("dominance", 1.0) or 1.0)
-        if st in ("ROTA", "MISSING") or nun <= 1:
-            reasons.append(f"{f}:muerta(nunique={nun})")
-        elif dom >= 0.995:
-            reasons.append(f"{f}:dominante(dom={dom:.3f})")
-
-    ok = (len(reasons) == 0)
-    return ok, reasons, health
-
-
-def _calcular_diversidad_prob_tick() -> dict:
-    """Detecta si las probas IA están clonadas entre bots por varios ticks."""
-    vals = []
-    for b in BOT_NAMES:
-        p = estado_bots.get(b, {}).get("prob_ia", None)
-        if p is None:
-            continue
-        try:
-            pf = float(p)
-            if np.isfinite(pf):
-                vals.append(round(pf, 4))
-        except Exception:
-            continue
-
-    out = {
-        "n_live": len(vals),
-        "unique": len(set(vals)) if vals else 0,
-        "all_equal": bool(len(vals) >= 2 and len(set(vals)) == 1),
-    }
-    return out
-
-
 def _auditar_salud_features(X_df: pd.DataFrame, feats: list[str]):
     """Audita variación/dominancia por feature para decidir si entrena o se congela."""
     out = {}
@@ -7684,8 +7634,6 @@ def maybe_retrain(force: bool = False):
             "calib_n_at_thr": int(calib_n_at_thr),
             "test_precision_at_thr": float(test_prec_at_thr),
             "test_n_at_thr": int(test_n_at_thr),
-            "auc_applicable": bool(auc_applicable),
-            "warmup_mode": bool(int(n_total) < int(TRAIN_WARMUP_MIN_ROWS)),
             "feature_names": list(feats_used),
             "label_col": str(label_col),
             "feature_health": health_before,

@@ -1,8 +1,8 @@
 # Estado IA y avance al objetivo
 
-- Actualizado (UTC): 2026-02-15T20:56:00.741200+00:00
+- Actualizado (UTC): 2026-02-14T19:02:47.240988+00:00
 - Objetivo principal (Prob IA real): 70%
-- Efectividad real global de cierres (bots 45-50): 49.55% (15457/31197)
+- Efectividad real global de cierres (bots 45-50): 49.55% (15210/30698)
 - Brecha vs objetivo: -20.45%
 
 ## Señales IA cerradas (log)
@@ -18,7 +18,7 @@
 3. Umbral operativo sugerido temporal: >= 80% (hit=50.00%, IC95%=[34.85%,65.15%], n=38).
 4. Hay sobreconfianza en bins de probabilidad (gap pred-real >10 pts). Aplicar shrinkage recomendado: p_ajustada = 0.6*p_calibrada + 0.4*tasa_base_rolling.
 5. Bots a intervenir primero (impacto ponderado): fulll49(+50.9%, n=20, prioridad=0.34), fulll46(+54.7%, n=11, prioridad=0.20). Aplicar beta_bot y reducción de stake según semáforo.
-6. Meta de modelo actual: reliable=False, auc=0.5666666666666667, brier=0.2586050223219748. Monitorear semanalmente ECE/Brier y recalibrar más frecuente que reentrenar base.
+6. Meta de modelo actual: reliable=False, auc=0.65, brier=0.2878518440395761. Monitorear semanalmente ECE/Brier y recalibrar más frecuente que reentrenar base.
 
 ## Riesgo de calibración por bot (log IA)
 | Bot | n | Madurez | %Real | %Pred media | Inflación | beta_bot | Prioridad | Semáforo | Acción sugerida |
@@ -33,7 +33,7 @@
 ## Resumen por bot (cierres)
 | Bot | Cerrados | Ganancias | Pérdidas | % Éxito |
 |---|---:|---:|---:|---:|
-| fulll45 | 5868 | 2883 | 2985 | 49.13% |
+| fulll45 | 5369 | 2636 | 2733 | 49.10% |
 | fulll46 | 5065 | 2541 | 2524 | 50.17% |
 | fulll47 | 5066 | 2537 | 2529 | 50.08% |
 | fulll48 | 5058 | 2514 | 2544 | 49.70% |
