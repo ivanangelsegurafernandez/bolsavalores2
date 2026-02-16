@@ -4686,6 +4686,7 @@ _last_pred_ts = {b: 0.0 for b in BOT_NAMES}
 _IA_CLONED_PROB_TICKS = 0
 _IA_INPUT_DUP_INFO = {"signature": "", "ts": 0.0, "bots": []}
 _LAST_AUTO_RETRAIN_TICK = 0.0
+_IA_TRAIN_CLEAN_LOG = {"ts": 0.0, "sig": ""}
 
 def actualizar_prob_ia_bot(bot: str):
     """
@@ -7221,6 +7222,21 @@ def _diagnosticar_inputs_duplicados(rows_by_bot: dict, dup_bots: list[str], feat
     }
 
 
+def _hay_modelo_ia_disponible() -> bool:
+    """Chequea si hay modelo utilizable en cache o disco."""
+    try:
+        _load_ia_assets_once(force=False)
+        if _IA_ASSETS_CACHE.get("model") is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        mfile = globals().get("_MODEL_PATH", "modelo_xgb.pkl")
+        return bool(os.path.exists(mfile))
+    except Exception:
+        return False
+
+
 def _maybe_retrain_fallback_sklearn(force: bool = False):
     """Fallback cuando XGBoost no está disponible: entrena LogisticRegression calibrada."""
     try:
@@ -7343,14 +7359,17 @@ def maybe_retrain(force: bool = False):
         if not force:
             new_rows = max(0, int(filas) - int(last_retrain_count or 0))
             mins = (now - float(last_retrain_ts or 0.0)) / 60.0
+            modelo_presente = _hay_modelo_ia_disponible()
 
-            if new_rows >= int(RETRAIN_INTERVAL_ROWS):
-                pass
-            else:
-                if mins >= float(RETRAIN_INTERVAL_MIN) and new_rows >= int(MIN_NEW_ROWS_FOR_TIME):
+            # Si no hay modelo aún, reintentar entrenamiento aunque no se cumplan gatillos de filas/tiempo.
+            if modelo_presente:
+                if new_rows >= int(RETRAIN_INTERVAL_ROWS):
                     pass
                 else:
-                    return False
+                    if mins >= float(RETRAIN_INTERVAL_MIN) and new_rows >= int(MIN_NEW_ROWS_FOR_TIME):
+                        pass
+                    else:
+                        return False
 
         # 3) Reparar incremental si quedó “mutante” + leer incremental (con LOCK)
         ruta_inc = "dataset_incremental.csv"
@@ -7397,7 +7416,16 @@ def maybe_retrain(force: bool = False):
             rb = int(q.get("rows_before", len(X)) or len(X))
             ra = int(q.get("rows_after", len(X)) or len(X))
             if dup_rm > 0:
-                agregar_evento(f"🧹 IA train-clean: dedup {dup_rm} filas ({rb}->{ra}).")
+                sig_clean = f"{dup_rm}:{rb}->{ra}"
+                last_clean = globals().get("_IA_TRAIN_CLEAN_LOG", {}) or {}
+                now_clean = time.time()
+                should_clean_log = (
+                    sig_clean != str(last_clean.get("sig", "")) or
+                    (now_clean - float(last_clean.get("ts", 0.0) or 0.0)) >= 25.0
+                )
+                if should_clean_log:
+                    agregar_evento(f"🧹 IA train-clean: dedup {dup_rm} filas ({rb}->{ra}).")
+                    globals()["_IA_TRAIN_CLEAN_LOG"] = {"sig": sig_clean, "ts": now_clean}
         except Exception:
             pass
 
@@ -7412,6 +7440,9 @@ def maybe_retrain(force: bool = False):
                 agregar_evento(f"🛑 IA DATA QUALITY: entrenamiento bloqueado ({'; '.join(dq_reasons)}).")
             except Exception:
                 pass
+            # Si no existe ningún modelo, intentar fallback simple para salir de OFF.
+            if not _hay_modelo_ia_disponible():
+                return _maybe_retrain_fallback_sklearn(force=True)
             return False
 
         # 4.2) Reducir features casi constantes/redundantes para subir eficiencia real
