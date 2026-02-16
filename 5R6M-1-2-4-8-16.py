@@ -2208,6 +2208,55 @@ def calcular_volatilidad_simple(row_dict: dict) -> float:
     vol = 1.0 - math.exp(-40.0 * min(spread_pct, 0.25))
     return float(max(0.0, min(vol, 1.0)))
     
+
+def calcular_volatilidad_por_bot(bot: str, lookback: int = 40) -> float | None:
+    """
+    Estima volatilidad 0..1 desde historial real del bot (retornos absolutos en close).
+    Sirve como fallback cuando la fila puntual viene plana (vol=0 por falta de SMA/OHLC).
+    """
+    try:
+        ruta = f"registro_enriquecido_{bot}.csv"
+        if not os.path.exists(ruta):
+            return None
+
+        df = None
+        for enc in ("utf-8", "utf-8-sig", "latin-1", "windows-1252"):
+            try:
+                df = pd.read_csv(ruta, encoding=enc, engine="python", on_bad_lines="skip")
+                break
+            except Exception:
+                continue
+        if df is None or df.empty:
+            return None
+
+        close_col = None
+        for c in ("close", "precio_cierre", "price", "spot", "last_price"):
+            if c in df.columns:
+                close_col = c
+                break
+        if close_col is None:
+            return None
+
+        sclose = pd.to_numeric(df[close_col], errors="coerce").dropna()
+        if len(sclose) < 6:
+            return None
+
+        sclose = sclose.tail(int(max(8, lookback)))
+        rets = sclose.pct_change().replace([np.inf, -np.inf], np.nan).dropna().abs()
+        if len(rets) < 4:
+            return None
+
+        # Mediana robusta de retorno absoluto + compresión suave a [0,1]
+        med = float(rets.median())
+        if (not math.isfinite(med)) or med <= 0.0:
+            return None
+
+        vol = 1.0 - math.exp(-120.0 * min(med, 0.20))
+        return float(max(0.0, min(vol, 1.0)))
+    except Exception:
+        return None
+
+
 # --- Helper: detectar rebote tras racha larga negativa --- 
 def calcular_es_rebote(row_dict):
     """
@@ -4328,7 +4377,17 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
         vol = _safe_float(row.get("volatilidad"))
         if vol is None:
             vol = calcular_volatilidad_simple(row)
-        row["volatilidad"] = float(max(0.0, min(float(vol), 1.0)))
+        try:
+            volf = float(vol)
+        except Exception:
+            volf = float("nan")
+        if (not math.isfinite(volf)) or volf <= 0.0:
+            vol_hist = calcular_volatilidad_por_bot(bot, lookback=50)
+            if vol_hist is not None:
+                volf = float(vol_hist)
+        if (not math.isfinite(volf)):
+            return None
+        row["volatilidad"] = float(max(0.0, min(float(volf), 1.0)))
     except Exception:
         return None
 
@@ -4504,6 +4563,8 @@ def actualizar_prob_ia_bot(bot: str):
             estado_bots[bot]["modo_ia"] = "input_dup"
             estado_bots[bot]["ia_senal_pendiente"] = False
             estado_bots[bot]["ia_prob_senal"] = None
+            # Evita mostrar probabilidad stale (ej. 32.4% clonada) cuando la entrada es inválida.
+            estado_bots[bot]["prob_ia"] = None
             return
 
         p, err = predecir_prob_ia_bot(bot)
@@ -6610,6 +6671,13 @@ def anexar_incremental_desde_bot(bot: str):
             vol_calc = float(calcular_volatilidad_simple(row_dict_full))
         except Exception:
             vol_calc = float("nan")
+
+        # Fallback por historial real del bot cuando la fila puntual viene plana.
+        if (not math.isfinite(vol_calc)) or (vol_calc <= 0.0):
+            vol_hist = calcular_volatilidad_por_bot(bot, lookback=50)
+            if vol_hist is not None and math.isfinite(float(vol_hist)) and float(vol_hist) > 0.0:
+                vol_calc = float(vol_hist)
+
         if (not math.isfinite(vol_calc)) or (vol_calc <= 0.0):
             agregar_evento(f"⚠️ Incremental: fila descartada ({bot}) => volatilidad inválida ({vol_calc}).")
             return
@@ -8520,8 +8588,18 @@ def backfill_incremental(ultimas=500):
                     vol = np.nan
                 if pd.isna(vol):
                     vol = calcular_volatilidad_simple(row_dict_full)
+                try:
+                    vol_f = float(vol)
+                except Exception:
+                    vol_f = float("nan")
+                if (not math.isfinite(vol_f)) or vol_f <= 0.0:
+                    vol_hist = calcular_volatilidad_por_bot(bot, lookback=50)
+                    if vol_hist is not None:
+                        vol_f = float(vol_hist)
+                if (not math.isfinite(vol_f)) or vol_f <= 0.0:
+                    continue
 
-                fila["volatilidad"] = max(0.0, min(float(vol), 1.0))
+                fila["volatilidad"] = max(0.0, min(float(vol_f), 1.0))
 
                 # ==========================
                 # nuevas features: rebote y hora (0–1)
