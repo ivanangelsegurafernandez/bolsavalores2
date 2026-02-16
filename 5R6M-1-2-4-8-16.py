@@ -558,6 +558,8 @@ t_inicio_indef = {bot: None for bot in BOT_NAMES}
 last_update_time = {bot: time.time() for bot in BOT_NAMES}
 LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mismo cierre REAL varias veces
 REAL_OWNER_LOCK = None  # owner REAL en memoria (evita carreras de lectura de archivo)
+REAL_LOCK_MISMATCH_SINCE = 0.0
+REAL_LOCK_RECONCILE_S = 6.0
 
 try:
     last_sig_por_bot
@@ -1814,6 +1816,26 @@ def leer_token_actual():
         if fallback in BOT_NAMES:
             _enforce_single_real_standby(fallback)
         return fallback
+
+
+def leer_token_archivo_raw():
+    """
+    Lee token_actual.txt SIN priorizar REAL_OWNER_LOCK (para reconciliar desincronías).
+    Retorna bot owner REAL o None.
+    """
+    if not os.path.exists(TOKEN_FILE):
+        return None
+    try:
+        with open(TOKEN_FILE, encoding="utf-8", errors="replace") as f:
+            linea = (f.read() or "").strip()
+        if not linea.startswith("REAL:"):
+            return None
+        bot_name = linea.split(":", 1)[1].strip()
+        if bot_name in BOT_NAMES:
+            return bot_name
+        return None
+    except Exception:
+        return None
 
 # Escribir token actual
 async def escribir_token_actual(bot):
@@ -9582,6 +9604,7 @@ def _boot_health_check():
 async def main():
     global salir, pausado, reinicio_manual, SALDO_INICIAL
     global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA, REAL_OWNER_LOCK
+    global REAL_LOCK_MISMATCH_SINCE
 
     try:
         set_etapa("BOOT_01", "Inicializando main()", anunciar=True)
@@ -9650,6 +9673,26 @@ async def main():
             try:  
                 set_etapa("TICK_01")
                 token_actual_loop = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else (leer_token_actual() or next((b for b in BOT_NAMES if estado_bots.get(b, {}).get("token") == "REAL"), None))
+
+                # Reconciliación anti-desincronía maestro↔bots:
+                # si memoria dice REAL pero token_actual.txt ya está en none por varios segundos,
+                # liberamos lock fantasma para permitir nuevas asignaciones REAL correctas.
+                owner_mem_now = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+                owner_file_now = leer_token_archivo_raw()
+                if owner_mem_now and (owner_file_now is None):
+                    if REAL_LOCK_MISMATCH_SINCE <= 0.0:
+                        REAL_LOCK_MISMATCH_SINCE = time.time()
+                    elif (time.time() - REAL_LOCK_MISMATCH_SINCE) >= float(REAL_LOCK_RECONCILE_S):
+                        agregar_evento(f"🩹 Reconciliación lock REAL: liberando owner fantasma {owner_mem_now.upper()} (archivo token ya está en none).")
+                        try:
+                            _set_ui_token_holder(None)
+                        except Exception:
+                            pass
+                        REAL_OWNER_LOCK = None
+                        REAL_LOCK_MISMATCH_SINCE = 0.0
+                        token_actual_loop = leer_token_actual() or None
+                else:
+                    REAL_LOCK_MISMATCH_SINCE = 0.0
                 # Heartbeat: mantiene ACK alineado al HUD aunque no entren filas nuevas ese tick.
                 refrescar_ia_ack_desde_hud(intervalo_s=1.0)
                 owner_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
