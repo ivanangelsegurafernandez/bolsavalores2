@@ -4194,7 +4194,9 @@ def _load_ia_assets_once(force: bool = False):
 
     # 2) Fallback: disco (tus “4 artefactos”)
     if model is None:
-        mfile = _find_first_pickle([r"modelo", r"model", r"xgb"])
+        mfile = globals().get("_MODEL_PATH", "modelo_xgb.pkl")
+        if not os.path.exists(mfile):
+            mfile = _find_first_pickle([r"modelo", r"model", r"xgb"])
         if mfile:
             try:
                 model = joblib.load(mfile)
@@ -4202,7 +4204,9 @@ def _load_ia_assets_once(force: bool = False):
                 model = None
 
     if scaler is None:
-        sfile = _find_first_pickle([r"scaler"])
+        sfile = globals().get("_SCALER_PATH", "scaler.pkl")
+        if not os.path.exists(sfile):
+            sfile = _find_first_pickle([r"scaler"])
         if sfile:
             try:
                 scaler = joblib.load(sfile)
@@ -4210,7 +4214,9 @@ def _load_ia_assets_once(force: bool = False):
                 scaler = None
 
     if feats is None:
-        ffile = _find_first_pickle([r"features", r"feature_names"])
+        ffile = globals().get("_FEATURES_PATH", "feature_names.pkl")
+        if not os.path.exists(ffile):
+            ffile = _find_first_pickle([r"features", r"feature_names"])
         if ffile:
             try:
                 feats = joblib.load(ffile)
@@ -4369,6 +4375,14 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
 
     row = dict(pre)
 
+    # Meta trazable del origen (diagnóstico anti-clonado por bot/tick)
+    try:
+        row["__src_path"] = str(ruta)
+        row["__src_epoch"] = row.get("epoch", None)
+        row["__src_ts"] = row.get("ts", row.get("timestamp", row.get("fecha", None)))
+    except Exception:
+        pass
+
     # 🔒 Anti-leakage duro
     for k in ("payout_total", "ganancia_perdida", "profit", "resultado", "resultado_norm"):
         try:
@@ -4449,6 +4463,23 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
     except Exception:
         pass
 
+    # Huella de fila para trazabilidad de lectura por bot
+    try:
+        core = ["rsi_9", "rsi_14", "sma_5", "sma_spread", "payout", "volatilidad", "hora_bucket"]
+        parts = []
+        for k in core:
+            vv = row.get(k, None)
+            try:
+                vv = float(vv)
+                if not math.isfinite(vv):
+                    vv = 0.0
+            except Exception:
+                vv = 0.0
+            parts.append(f"{k}={round(vv, 6)}")
+        row["__src_row_hash"] = hashlib.sha1("|".join(parts).encode("utf-8", errors="ignore")).hexdigest()[:12]
+    except Exception:
+        row["__src_row_hash"] = ""
+
     return row
 
 def _coerce_float_default(v, default=0.0) -> float:
@@ -4495,18 +4526,48 @@ def predecir_prob_ia_bot(bot: str) -> tuple[float | None, str | None]:
         if not feats:
             return None, "NO_FEATS"
 
-        # 4) Armar X con orden exacto + rellenar faltantes con 0.0 + NaN→0.0
+        # 4) Armar X con orden exacto + detectar faltantes reales (evitar vector plano silencioso)
         values = []
+        missing_feats = []
+        present_feats = 0
         for k in feats:
             v = row.get(k, None)
-            # si clip_feature_values metió NaN, lo volvemos 0.0 para no romper scaler
-            if v is not None:
+            is_missing = False
+            if v is None:
+                is_missing = True
+            else:
                 try:
                     if isinstance(v, float) and np.isnan(v):
-                        v = 0.0
+                        is_missing = True
                 except Exception:
                     pass
+                if isinstance(v, str) and v.strip() in ("", "--", "None", "nan", "NaN"):
+                    is_missing = True
+
+            if is_missing:
+                missing_feats.append(k)
+            else:
+                present_feats += 1
+
             values.append(_coerce_float_default(v, default=0.0))
+
+        total_feats = max(1, len(feats))
+        present_ratio = float(present_feats) / float(total_feats)
+
+        # Guardar snapshot técnico por bot para depuración de pipeline
+        try:
+            estado_bots[bot]["ia_debug_src_path"] = str(row.get("__src_path", ""))
+            estado_bots[bot]["ia_debug_src_epoch"] = str(row.get("__src_epoch", ""))
+            estado_bots[bot]["ia_debug_src_ts"] = str(row.get("__src_ts", ""))
+            estado_bots[bot]["ia_debug_row_hash"] = str(row.get("__src_row_hash", ""))
+            estado_bots[bot]["ia_debug_missing_feats"] = int(len(missing_feats))
+            estado_bots[bot]["ia_debug_present_ratio"] = float(present_ratio)
+        except Exception:
+            pass
+
+        # Si faltan demasiadas features esperadas, no inventar probabilidad.
+        if present_ratio < 0.60:
+            return None, f"FEAT_MISMATCH:{present_feats}/{total_feats}"
 
         X = pd.DataFrame([values], columns=list(feats))
 
@@ -4545,6 +4606,10 @@ def predecir_prob_ia_bot(bot: str) -> tuple[float | None, str | None]:
 
         # clamp
         p = max(0.0, min(1.0, p))
+        try:
+            estado_bots[bot]["ia_prob_raw_model"] = float(p)
+        except Exception:
+            pass
         return p, None
 
     except Exception as e:
@@ -4614,7 +4679,10 @@ def actualizar_prob_ia_bot(bot: str):
         last_ok = float(estado_bots[bot].get("ia_last_prob_ts", 0.0) or 0.0)
         age = (now - last_ok) if last_ok > 0 else 10**9
 
-        if age <= IA_PRED_TTL_S and estado_bots[bot].get("prob_ia") is not None:
+        err_txt = str(err or "")
+        hard_invalid = err_txt.startswith("FEAT_MISMATCH") or err_txt.startswith("NO_FEATURE_ROW") or err_txt.startswith("SCALER_FAIL")
+
+        if (not hard_invalid) and age <= IA_PRED_TTL_S and estado_bots[bot].get("prob_ia") is not None:
             # Mantener último dato útil para que la UI no quede en '--'.
             estado_bots[bot]["ia_ready"] = True
             if str(estado_bots[bot].get("modo_ia", "")).strip().lower() in ("", "off"):
@@ -4671,6 +4739,25 @@ def actualizar_prob_ia_todos():
             fp = _fingerprint_features_row(row, feats=list(INCREMENTAL_FEATURES_V2))
             fp_map.setdefault(fp, []).append(b)
 
+        # Diagnóstico de lectura: misma fila/hash/ts entre bots => probable causa A (lectura clónica)
+        try:
+            hash_map = {}
+            ts_map = {}
+            for b, rr in rows_by_bot.items():
+                hh = str(rr.get("__src_row_hash", ""))
+                tt = str(rr.get("__src_ts", rr.get("__src_epoch", "")))
+                if hh:
+                    hash_map.setdefault(hh, []).append(b)
+                if tt:
+                    ts_map.setdefault(tt, []).append(b)
+
+            same_hash_groups = [bb for bb in hash_map.values() if len(bb) >= 2]
+            if same_hash_groups:
+                g = "+".join(sorted(same_hash_groups[0]))
+                agregar_evento(f"🧭 DIAG LECTURA: misma fila/hash detectada en [{g}] (revisar source path/timestamp por bot)")
+        except Exception:
+            pass
+
         dup_groups = [bots for bots in fp_map.values() if len(bots) >= 2]
         if dup_groups:
             now = time.time()
@@ -4686,6 +4773,11 @@ def actualizar_prob_ia_todos():
                 diag = _diagnosticar_inputs_duplicados(rows_by_bot, bots, feats=list(INCREMENTAL_FEATURES_V2))
                 same_cols = diag.get("same_cols", [])
                 expected = diag.get("expected_diff", [])
+                src_info = diag.get("source_info", {}) if isinstance(diag, dict) else {}
+                src_brief = []
+                for bb in bots[:3]:
+                    inf = src_info.get(bb, {}) if isinstance(src_info, dict) else {}
+                    src_brief.append(f"{bb}:{inf.get('hash','')}/{inf.get('ts','')}")
                 msg_sig = f"{sig}|{','.join(same_cols[:6])}"
 
                 should_emit = (
@@ -4695,7 +4787,7 @@ def actualizar_prob_ia_todos():
                 if should_emit:
                     agregar_evento(
                         "🛑 IA inválida por INPUT DUPLICADO "
-                        f"[{sig}] | cols_iguales={same_cols[:8]} | esperadas_diferir={expected}"
+                        f"[{sig}] | cols_iguales={same_cols[:8]} | esperadas_diferir={expected} | src={src_brief}"
                     )
                     _IA_INPUT_DUP_INFO = {"signature": msg_sig, "ts": now, "bots": list(bots)}
     except Exception:
@@ -7076,10 +7168,19 @@ def _diagnosticar_inputs_duplicados(rows_by_bot: dict, dup_bots: list[str], feat
             diff_cols.append(c)
 
     expected_diff = [c for c in ("payout", "rsi_9", "rsi_14", "sma_5", "sma_spread") if c in base_feats]
+    source_info = {}
+    for b in dup_bots:
+        rv = rows_by_bot.get(b, {}) or {}
+        source_info[b] = {
+            "path": str(rv.get("__src_path", "")),
+            "ts": str(rv.get("__src_ts", rv.get("__src_epoch", ""))),
+            "hash": str(rv.get("__src_row_hash", "")),
+        }
     return {
         "same_cols": same_cols,
         "diff_cols": diff_cols,
         "expected_diff": expected_diff,
+        "source_info": source_info,
     }
 
 
