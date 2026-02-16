@@ -596,6 +596,20 @@ estado_bots = {
     for bot in BOT_NAMES
 }
 IA90_stats = {bot: {"n": 0, "ok": 0, "pct": 0.0} for bot in BOT_NAMES}
+
+EVENTO_MAX_CHARS = 220
+
+def _normalizar_evento_texto(msg: str, max_chars: int = EVENTO_MAX_CHARS) -> str:
+    try:
+        txt = str(msg if msg is not None else "")
+    except Exception:
+        txt = ""
+    for ch in ("\r", "\n", "\t"):
+        txt = txt.replace(ch, " ")
+    txt = " ".join(txt.split())
+    if len(txt) > int(max_chars):
+        txt = txt[: max(0, int(max_chars) - 1)] + "…"
+    return txt
 # --- BLINDAJE: asegurar símbolos críticos si faltan (no pisa definiciones reales) ---
 if "RENDER_LOCK" not in globals():
     RENDER_LOCK = threading.Lock()
@@ -604,10 +618,11 @@ if "agregar_evento" not in globals():
     def agregar_evento(msg: str):
         try:
             ts = time.strftime("%H:%M:%S")
-            eventos_recentes.appendleft(f"{ts} {msg}")
+            limpio = _normalizar_evento_texto(msg)
+            eventos_recentes.appendleft(f"{ts} {limpio}")
         except Exception:
             try:
-                print(msg)
+                print(_normalizar_evento_texto(msg))
             except Exception:
                 pass
 # --- /BLINDAJE ---
@@ -4354,7 +4369,7 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
     Lee features para PREDICCIÓN (sin label):
     - Prefiere trade_status PRE_TRADE/PENDIENTE/OPEN/ABIERTO
     - Fallback: última fila “no cierre” antes del último cierre
-    - Anti-leakage: elimina payout_total/ganancia_perdida/resultado del dict final
+    - Anti-leakage: elimina campos de cierre (ganancia/profit/resultado) del dict final
     """
     ruta = f"registro_enriquecido_{bot}.csv"
     if not os.path.exists(ruta):
@@ -4431,7 +4446,7 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
         pass
 
     # 🔒 Anti-leakage duro
-    for k in ("payout_total", "ganancia_perdida", "profit", "resultado", "resultado_norm"):
+    for k in ("ganancia_perdida", "profit", "resultado", "resultado_norm"):
         try:
             row.pop(k, None)
         except Exception:
@@ -4682,7 +4697,7 @@ def actualizar_prob_ia_bot(bot: str):
             return
         _last_pred_ts[bot] = now
 
-        # Guardrail duro: no confiar en predicción si el input del bot está duplicado en este tick.
+        # Guardrail duro: solo invalidar cuando se detecta CLON REAL de origen en este tick.
         if bool(estado_bots.get(bot, {}).get("ia_input_duplicado", False)):
             estado_bots[bot]["ia_ready"] = False
             estado_bots[bot]["ia_last_err"] = "INPUT_DUPLICADO"
@@ -4760,6 +4775,7 @@ def actualizar_prob_ia_todos():
     for b in BOT_NAMES:
         try:
             estado_bots[b]["ia_input_duplicado"] = False
+            estado_bots[b]["ia_input_redundante"] = False
             estado_bots[b]["ia_input_dup_group"] = ""
         except Exception:
             pass
@@ -4774,7 +4790,7 @@ def actualizar_prob_ia_todos():
         except Exception:
             pass
 
-    # 2) Fingerprints por bot para cortar input duplicado en origen
+    # 2) Fingerprints por bot: detectar redundancia y SOLO invalidar si hay clon real de origen
     rows_by_bot = {}
     fp_map = {}
     try:
@@ -4786,56 +4802,61 @@ def actualizar_prob_ia_todos():
             fp = _fingerprint_features_row(row, feats=list(INCREMENTAL_FEATURES_V2))
             fp_map.setdefault(fp, []).append(b)
 
-        # Diagnóstico de lectura: misma fila/hash/ts entre bots => probable causa A (lectura clónica)
-        try:
-            hash_map = {}
-            ts_map = {}
-            for b, rr in rows_by_bot.items():
-                hh = str(rr.get("__src_row_hash", ""))
-                tt = str(rr.get("__src_ts", rr.get("__src_epoch", "")))
-                if hh:
-                    hash_map.setdefault(hh, []).append(b)
-                if tt:
-                    ts_map.setdefault(tt, []).append(b)
-
-            same_hash_groups = [bb for bb in hash_map.values() if len(bb) >= 2]
-            if same_hash_groups:
-                g = "+".join(sorted(same_hash_groups[0]))
-                agregar_evento(f"🧭 DIAG LECTURA: misma fila/hash detectada en [{g}] (revisar source path/timestamp por bot)")
-        except Exception:
-            pass
-
         dup_groups = [bots for bots in fp_map.values() if len(bots) >= 2]
         if dup_groups:
             now = time.time()
             for bots in dup_groups:
                 sig = "+".join(sorted(bots))
-                for b in bots:
-                    try:
-                        estado_bots[b]["ia_input_duplicado"] = True
-                        estado_bots[b]["ia_input_dup_group"] = sig
-                    except Exception:
-                        pass
-
                 diag = _diagnosticar_inputs_duplicados(rows_by_bot, bots, feats=list(INCREMENTAL_FEATURES_V2))
                 same_cols = diag.get("same_cols", [])
                 expected = diag.get("expected_diff", [])
                 src_info = diag.get("source_info", {}) if isinstance(diag, dict) else {}
+
+                # Clon real: misma fuente + misma fila/hash/epoch entre bots.
+                source_keys = []
+                for bb in bots:
+                    inf = src_info.get(bb, {}) if isinstance(src_info, dict) else {}
+                    path = str(inf.get("path", "") or "")
+                    hsh = str(inf.get("hash", "") or "")
+                    tsv = str(inf.get("ts", "") or "")
+                    source_keys.append((path, hsh, tsv))
+
+                clone_real = False
+                if source_keys:
+                    unique_keys = set(source_keys)
+                    if len(unique_keys) == 1 and all(any(x for x in k) for k in unique_keys):
+                        clone_real = True
+
                 src_brief = []
                 for bb in bots[:3]:
                     inf = src_info.get(bb, {}) if isinstance(src_info, dict) else {}
-                    src_brief.append(f"{bb}:{inf.get('hash','')}/{inf.get('ts','')}")
-                msg_sig = f"{sig}|{','.join(same_cols[:6])}"
+                    src_brief.append(f"{bb}:{inf.get('path','')}/{inf.get('hash','')}/{inf.get('ts','')}")
 
+                msg_sig = f"{sig}|{','.join(same_cols[:6])}|clone={int(clone_real)}"
                 should_emit = (
                     msg_sig != str(_IA_INPUT_DUP_INFO.get("signature", "")) or
                     (now - float(_IA_INPUT_DUP_INFO.get("ts", 0.0) or 0.0)) >= float(INPUT_DUP_DIAG_COOLDOWN_S)
                 )
+
+                for b in bots:
+                    try:
+                        estado_bots[b]["ia_input_duplicado"] = bool(clone_real)
+                        estado_bots[b]["ia_input_dup_group"] = sig
+                        estado_bots[b]["ia_input_redundante"] = not bool(clone_real)
+                    except Exception:
+                        pass
+
                 if should_emit:
-                    agregar_evento(
-                        "🛑 IA inválida por INPUT DUPLICADO "
-                        f"[{sig}] | cols_iguales={same_cols[:8]} | esperadas_diferir={expected} | src={src_brief}"
-                    )
+                    if clone_real:
+                        agregar_evento(
+                            "🛑 IA inválida por CLON REAL de input "
+                            f"[{sig}] | cols_iguales={same_cols[:8]} | esperadas_diferir={expected} | src={src_brief}"
+                        )
+                    else:
+                        agregar_evento(
+                            "⚠️ IA redundante (features iguales entre bots; NO se invalida predicción) "
+                            f"[{sig}] | cols_iguales={same_cols[:8]} | src={src_brief}"
+                        )
                     _IA_INPUT_DUP_INFO = {"signature": msg_sig, "ts": now, "bots": list(bots)}
     except Exception:
         pass
@@ -7786,7 +7807,8 @@ def maybe_retrain(force: bool = False):
 RENDER_LOCK = threading.Lock()
 
 def agregar_evento(texto: str):
-    eventos_recentes.append(f"[{time.strftime('%H:%M:%S')}] {texto}")
+    limpio = _normalizar_evento_texto(texto)
+    eventos_recentes.append(f"[{time.strftime('%H:%M:%S')}] {limpio}")
 
 def limpiar_consola():
     os.system("cls" if os.name == "nt" else "clear")
@@ -8177,8 +8199,12 @@ def mostrar_panel():
 
         print(Fore.CYAN + f" IA ▶ modelo XGBoost entrenado: n={n} (GAN={pos}, PERD={neg})")
         print(Fore.CYAN + f"      AUC={auc_txt}  | Thr={thr:.2f}  | Modo={modo_txt}")
+        datos_utiles = int(max(0, pos + neg))
         if warmup_mode:
+            print(Fore.CYAN + f"      Confianza IA: BAJA (Warmup n={n}<{int(TRAIN_WARMUP_MIN_ROWS)} | cierres útiles={datos_utiles}).")
             print(Fore.CYAN + f"      Warmup activo: n={n}<{int(TRAIN_WARMUP_MIN_ROWS)} (solo monitoreo/calibración).")
+        else:
+            print(Fore.CYAN + f"      Confianza IA: {'MEDIA/ALTA' if reliable else 'MEDIA'} | cierres útiles={datos_utiles}.")
 
     # Mostrar contadores de aciertos IA por bot (resumen compacto para reducir ruido)
     resumen_hits = []
