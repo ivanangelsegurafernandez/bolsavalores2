@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 import importlib
 import traceback
+import io
 
 import math
 import hashlib
@@ -577,9 +578,12 @@ BOOT_INIT_SYNC_TAIL_ROWS = 220     # en BOOT_04, sincroniza cola reciente en vez
 BOOT_BACKFILL_ROWS = 500           # backfill inicial más liviano para entrar rápido al HUD
 BOOT_BG_TRAIN_DELAY_S = 0.8        # deja renderizar HUD y luego entrena en segundo plano
 BOOT_CLEANUP_VISUAL_S = 1.2      # evita pantalla "vacía" larga antes de mostrar interfaz
+CSV_TAIL_MAX_BYTES = 1_200_000      # límite de bytes para tail inicial por bot
+CSV_APPEND_MAX_BYTES = 600_000      # límite de bytes por lectura incremental (anti-picos)
 MAX_CICLOS = len(MARTI_ESCALADO)
 huellas_usadas = {bot: set() for bot in BOT_NAMES}
 SNAPSHOT_FILAS = {bot: 0 for bot in BOT_NAMES}
+SNAPSHOT_BYTES = {bot: 0 for bot in BOT_NAMES}  # offset por bytes para lectura incremental ultra-rápida
 REAL_ENTRY_BASELINE = {bot: 0 for bot in BOT_NAMES}  # filas al entrar/reafirmar REAL
 OCULTAR_HASTA_NUEVO = {bot: False for bot in BOT_NAMES}
 t_inicio_indef = {bot: None for bot in BOT_NAMES}
@@ -5647,8 +5651,13 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
         if quick_snapshot:
             # Arranque rápido: evita escanear todos los CSV antes de mostrar HUD.
             SNAPSHOT_FILAS[bot] = int(max(0, SNAPSHOT_FILAS.get(bot, 0) or 0))
+            SNAPSHOT_BYTES[bot] = 0
         else:
             SNAPSHOT_FILAS[bot] = contar_filas_csv(bot)
+            try:
+                SNAPSHOT_BYTES[bot] = int(max(0, os.path.getsize(f"registro_enriquecido_{bot}.csv")))
+            except Exception:
+                SNAPSHOT_BYTES[bot] = 0
         OCULTAR_HASTA_NUEVO[bot] = False  # Cambiado para no ocultar
         IA53_TRIGGERED[bot] = False
         IA90_stats[bot] = {"n": 0, "ok": 0, "pct": 0.0}
@@ -9357,42 +9366,129 @@ REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme
 REAL_STUCK_FORCE_RELEASE_S = 90  # segundos extra tras aviso para liberar REAL si no hay cierre
 REAL_TRIGGER_MIN = IA_ACTIVACION_REAL_THR  # regla operativa: entrada REAL desde 85% o mayor
 
+
+def _leer_header_csv(path: str) -> list[str]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            row = next(csv.reader([f.readline()]))
+            return [str(x).strip() for x in row if str(x).strip() != ""]
+    except Exception:
+        return []
+
+
+def _parse_rows_from_text(text: str, header: list[str]) -> list[dict]:
+    if not text or not header:
+        return []
+    out = []
+    sio = io.StringIO(text)
+    rdr = csv.reader(sio)
+    for r in rdr:
+        if not r:
+            continue
+        if len(r) < len(header):
+            r = r + [""] * (len(header) - len(r))
+        elif len(r) > len(header):
+            r = r[:len(header)]
+        out.append({header[i]: r[i] for i in range(len(header))})
+    return out
+
+
+def _tail_rows_csv(path: str, n_rows: int = 220, max_bytes: int = CSV_TAIL_MAX_BYTES) -> list[dict]:
+    header = _leer_header_csv(path)
+    if not header:
+        return []
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size <= 0:
+                return []
+            want = min(int(max_bytes), int(size))
+            f.seek(max(0, size - want), os.SEEK_SET)
+            chunk = f.read(want)
+        txt = chunk.decode("utf-8", errors="replace")
+        lines = txt.splitlines()
+        if len(lines) <= 1:
+            return []
+        data_lines = lines[-int(max(1, n_rows)):]
+        return _parse_rows_from_text("\n".join(data_lines), header)
+    except Exception:
+        return []
+
+
+def _read_csv_incremental_by_bytes(bot: str, force_tail: bool = False, tail_rows: int = 220) -> tuple[list[dict], int]:
+    path = f"registro_enriquecido_{bot}.csv"
+    if not os.path.exists(path):
+        return [], int(SNAPSHOT_BYTES.get(bot, 0) or 0)
+
+    try:
+        size = int(os.path.getsize(path))
+    except Exception:
+        return [], int(SNAPSHOT_BYTES.get(bot, 0) or 0)
+
+    prev = int(SNAPSHOT_BYTES.get(bot, 0) or 0)
+    if prev < 0:
+        prev = 0
+
+    # Si rota/recorta archivo o en primer boot rápido: usar cola reciente
+    if force_tail or prev == 0 or prev > size:
+        rows = _tail_rows_csv(path, n_rows=int(max(20, tail_rows)), max_bytes=int(CSV_TAIL_MAX_BYTES))
+        return rows, size
+
+    if size == prev:
+        return [], size
+
+    # Leer sólo bytes nuevos anexados (sin releer todo el CSV)
+    try:
+        read_from = prev
+        read_to = size
+        if (read_to - read_from) > int(CSV_APPEND_MAX_BYTES):
+            read_from = max(prev, size - int(CSV_APPEND_MAX_BYTES))
+
+        with open(path, "rb") as f:
+            f.seek(read_from, os.SEEK_SET)
+            raw = f.read(max(0, read_to - read_from))
+        txt = raw.decode("utf-8", errors="replace")
+
+        # Si empezamos en medio de línea, descartar fragmento inicial
+        if read_from > 0 and txt:
+            pos_nl = txt.find("\n")
+            txt = txt[pos_nl + 1:] if pos_nl >= 0 else ""
+        header = _leer_header_csv(path)
+        rows = _parse_rows_from_text(txt, header)
+        return rows, size
+    except Exception:
+        return [], size
+
 # Cargar datos bot
 # Cargar datos bot
-async def cargar_datos_bot(bot, token_actual):
+async def cargar_datos_bot(bot, token_actual, force_tail=False):
     ruta = f"registro_enriquecido_{bot}.csv"
     if not os.path.exists(ruta):
         return
 
     try:
-        snapshot = SNAPSHOT_FILAS.get(bot, 0)
-
         # Fuente de verdad de owner REAL para no pintar DEMO transitorio en HUD/tabla.
         effective_owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else (token_actual if token_actual in BOT_NAMES else next((b for b in BOT_NAMES if estado_bots.get(b, {}).get("token") == "REAL"), None))
 
         # Sincroniza token visual SIEMPRE, incluso si no entran filas nuevas este tick.
         estado_bots[bot]["token"] = "REAL" if effective_owner == bot else "DEMO"
 
-        # Gate rápido (opcional): si el archivo no creció, salimos sin leer todo el CSV
-        actual = contar_filas_csv(bot)
-        if actual <= snapshot:
+        rows_new, new_pos = _read_csv_incremental_by_bytes(
+            bot,
+            force_tail=bool(force_tail),
+            tail_rows=int(max(20, BOOT_INIT_SYNC_TAIL_ROWS)),
+        )
+        SNAPSHOT_BYTES[bot] = int(max(0, new_pos))
+        if not rows_new:
             return
 
-        df = pd.read_csv(ruta, encoding="utf-8", on_bad_lines="skip")
+        # Conservamos el pipeline existente vía DataFrame, pero con lote pequeño.
+        df = pd.DataFrame(rows_new)
         if df.empty:
-            # Lectura temporalmente vacía (archivo en escritura / parse falló).
-            # NO resetees SNAPSHOT_FILAS porque provoca re-procesos y ruido.
             return
 
-        # Si snapshot quedó desfasado frente al df real, lo corregimos
-        if snapshot >= len(df):
-            SNAPSHOT_FILAS[bot] = len(df)
-            return
-
-        nuevas = df.iloc[snapshot:]
-        # IMPORTANTE: el snapshot debe seguir a df (no a contar_filas_csv),
-        # porque read_csv puede saltarse líneas malas con on_bad_lines="skip".
-        SNAPSHOT_FILAS[bot] = len(df)
+        nuevas = df
 
         required_cols = [
             "rsi_9", "rsi_14", "sma_5", "sma_20", "cruce_sma", "breakout",
@@ -9946,13 +10042,8 @@ async def main():
         # Pasada inicial para sincronizar HUD con CSV existentes (cola reciente para acelerar arranque)
         token_actual_loop = "--"  # Dummy para carga inicial
         for bot in BOT_NAMES:
-            if BOOT_FAST_UI:
-                try:
-                    n_rows = contar_filas_csv(bot)
-                    SNAPSHOT_FILAS[bot] = max(0, int(n_rows) - int(max(40, BOOT_INIT_SYNC_TAIL_ROWS)))
-                except Exception:
-                    pass
-            await cargar_datos_bot(bot, token_actual_loop)
+            # En fast boot NO contamos filas (caro). Forzamos tail por bytes en cargar_datos_bot.
+            await cargar_datos_bot(bot, token_actual_loop, force_tail=BOOT_FAST_UI)
 
         while True:
             if salir:
