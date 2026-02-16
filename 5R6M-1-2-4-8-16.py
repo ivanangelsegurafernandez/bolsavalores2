@@ -194,6 +194,23 @@ IA_METRIC_THRESHOLD = IA_ACTIVACION_REAL_THR
 # Mantiene lock de un solo bot en REAL y ciclo martingala global en HUD.
 REAL_CLASSIC_GATE = True
 
+# --- Techo dinámico IA (maestro) ---
+DYN_ROOF_ENABLED = True
+DYN_ROOF_BATCH_TICKS = 15           # B: recalcula/derrite por lotes
+DYN_ROOF_HOLD_BATCHES = 4           # HOLD: paciencia en lotes (4*15=60 ticks)
+DYN_ROOF_STEP = 0.005               # STEP: baja 0.5% por lote tras HOLD
+DYN_ROOF_FLOOR = 0.70               # FLOOR: piso duro para habilitar REAL
+DYN_ROOF_GAP = 0.03                 # GAP: ventaja mínima vs segundo bot
+DYN_ROOF_CONFIRM_TICKS = 2          # CONFIRM: ticks consecutivos requeridos
+DYN_ROOF_LOW_N = 30                 # evidencia mínima para no penalizar techo
+DYN_ROOF_LOW_N_EXTRA = 0.02         # penalización extra de techo si n < LOW_N
+DYN_ROOF_TOUCH_TOL = 0.005          # tolerancia para considerar "toque" de techo (0.5pp)
+
+# Presupuesto de arranque para diagnósticos (evita sensación de "trabado")
+BOOT_HEALTH_MAX_S = 2.5
+BOOT_SAT_LOOKBACK = 350
+BOOT_SAT_MAX_BOTS = 3
+
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
 IA_CALIB_THRESHOLD = 0.60
@@ -549,6 +566,16 @@ reinicio_manual = False
 LIMPIEZA_PANEL_HASTA = 0
 ULTIMA_ACT_SALDO = 0
 REFRESCO_SALDO = 12
+SALDO_BOOT_TIMEOUT_S = 4.0
+SALDO_REFRESH_TIMEOUT_S = 3.0
+WS_OPEN_TIMEOUT_S = 3.0
+WS_REPLY_TIMEOUT_S = 3.0
+
+# Arranque rápido de interfaz (sin comprometer lógica operativa)
+BOOT_FAST_UI = True
+BOOT_INIT_SYNC_TAIL_ROWS = 220     # en BOOT_04, sincroniza cola reciente en vez de historial completo
+BOOT_BACKFILL_ROWS = 500           # backfill inicial más liviano para entrar rápido al HUD
+BOOT_BG_TRAIN_DELAY_S = 0.8        # deja renderizar HUD y luego entrena en segundo plano
 MAX_CICLOS = len(MARTI_ESCALADO)
 huellas_usadas = {bot: set() for bot in BOT_NAMES}
 SNAPSHOT_FILAS = {bot: 0 for bot in BOT_NAMES}
@@ -604,7 +631,165 @@ estado_bots = {
 }
 IA90_stats = {bot: {"n": 0, "ok": 0, "pct": 0.0} for bot in BOT_NAMES}
 
+# Estado del techo dinámico (maestro)
+DYN_ROOF_STATE = {
+    "tick": 0,
+    "batch_tick": 0,
+    "hold_ticks": 0,
+    "last_touch_tick": 0,
+    "roof": float(max(DYN_ROOF_FLOOR, IA_ACTIVACION_REAL_THR)),
+    "best_bot": None,
+    "best_prob": 0.0,
+    "second_prob": 0.0,
+    "has_second": False,
+    "confirm_streak": 0,
+    "last_candidate": None,
+}
+
 EVENTO_MAX_CHARS = 220
+
+def _safe_float(v, default=None):
+    try:
+        if isinstance(v, bool):
+            return default
+        f = float(v)
+        if math.isfinite(f):
+            return f
+    except Exception:
+        pass
+    return default
+
+
+def _top2_prob_live():
+    pares = []
+    for b in BOT_NAMES:
+        p = _safe_float(estado_bots.get(b, {}).get("prob_ia"), None)
+        if p is None:
+            continue
+        p = max(0.0, min(1.0, p))
+        pares.append((p, b))
+    if not pares:
+        return 0.0, None, 0.0, False
+    pares.sort(reverse=True)
+    p_best, best_bot = pares[0]
+    has_second = len(pares) > 1
+    p_second = pares[1][0] if has_second else 0.0
+    return float(p_best), best_bot, float(p_second), bool(has_second)
+
+
+def _dyn_roof_penalty_for_low_n(bot: str, roof: float) -> float:
+    """Si el bot tiene poca evidencia (n<30), exigir +2pp sobre el techo."""
+    try:
+        st = estado_bots.get(bot, {})
+        n = int(st.get("tamano_muestra", 0) or 0)
+    except Exception:
+        n = 0
+    if n < int(DYN_ROOF_LOW_N):
+        return float(min(0.99, roof + float(DYN_ROOF_LOW_N_EXTRA)))
+    return float(roof)
+
+
+def actualizar_techo_dinamico_ia():
+    """
+    Reglas:
+    - Sube rápido si aparece nuevo máximo vivo.
+    - Baja lento por lotes tras HOLD sin tocar techo.
+    - Nunca baja del FLOOR.
+    """
+    if not DYN_ROOF_ENABLED:
+        return
+
+    st = DYN_ROOF_STATE
+    st["tick"] = int(st.get("tick", 0)) + 1
+    st["batch_tick"] = int(st.get("batch_tick", 0)) + 1
+
+    p_best, best_bot, p_second, has_second = _top2_prob_live()
+    st["best_prob"] = float(p_best)
+    st["second_prob"] = float(p_second)
+    st["has_second"] = bool(has_second)
+    st["best_bot"] = best_bot
+
+    roof = float(st.get("roof", max(DYN_ROOF_FLOOR, IA_ACTIVACION_REAL_THR)))
+    floor = float(DYN_ROOF_FLOOR)
+
+    # Regla A: techo sube rápido y considera "casi toque" para mantener paciencia
+    # (evita derretir por variaciones pequeñas: 85.0 -> 84.7).
+    touch_thr = float(max(floor, roof - float(DYN_ROOF_TOUCH_TOL)))
+    touched = p_best >= touch_thr
+
+    if touched:
+        # El techo NUNCA se ajusta hacia abajo por toque: solo sube por máximos reales.
+        st["roof"] = float(max(floor, roof, p_best))
+        st["last_touch_tick"] = int(st["tick"])
+        st["hold_ticks"] = 0
+        return
+
+    # Regla B: techo baja lento con paciencia y por lotes
+    hold_total = int(DYN_ROOF_BATCH_TICKS * DYN_ROOF_HOLD_BATCHES)
+    since_touch = int(st["tick"] - int(st.get("last_touch_tick", 0)))
+    if since_touch >= hold_total:
+        if st["batch_tick"] >= int(DYN_ROOF_BATCH_TICKS):
+            st["batch_tick"] = 0
+            st["hold_ticks"] = int(st.get("hold_ticks", 0)) + int(DYN_ROOF_BATCH_TICKS)
+            st["roof"] = float(max(floor, roof - float(DYN_ROOF_STEP)))
+
+
+def dyn_roof_snapshot() -> dict:
+    st = DYN_ROOF_STATE
+    roof = float(st.get("roof", max(DYN_ROOF_FLOOR, IA_ACTIVACION_REAL_THR)))
+    return {
+        "roof": roof,
+        "floor": float(DYN_ROOF_FLOOR),
+        "best_bot": st.get("best_bot"),
+        "best_prob": float(st.get("best_prob", 0.0) or 0.0),
+        "second_prob": float(st.get("second_prob", 0.0) or 0.0),
+        "has_second": bool(st.get("has_second", False)),
+        "gap": max(0.0, float(st.get("best_prob", 0.0) or 0.0) - float(st.get("second_prob", 0.0) or 0.0)),
+        "tick": int(st.get("tick", 0) or 0),
+    }
+
+
+def dyn_roof_best_candidate() -> tuple[str | None, float, dict]:
+    """Compuerta REAL con confirmación 2 ticks seguidos y GAP vs 2º."""
+    snap = dyn_roof_snapshot()
+    best_bot = snap["best_bot"]
+    p_best = float(snap["best_prob"])
+    p_second = float(snap["second_prob"])
+    roof = float(snap["roof"])
+
+    if not best_bot:
+        DYN_ROOF_STATE["confirm_streak"] = 0
+        DYN_ROOF_STATE["last_candidate"] = None
+        return None, roof, snap
+
+    roof_eff = _dyn_roof_penalty_for_low_n(best_bot, roof)
+    has_second = bool(snap.get("has_second", False))
+    gap_ok = (not has_second) or ((p_best - p_second) >= float(DYN_ROOF_GAP))
+    pass_gate = (
+        p_best >= roof_eff and
+        p_best >= float(DYN_ROOF_FLOOR) and
+        gap_ok
+    )
+
+    last_c = DYN_ROOF_STATE.get("last_candidate")
+    if pass_gate and last_c == best_bot:
+        DYN_ROOF_STATE["confirm_streak"] = int(DYN_ROOF_STATE.get("confirm_streak", 0)) + 1
+    elif pass_gate:
+        DYN_ROOF_STATE["confirm_streak"] = 1
+        DYN_ROOF_STATE["last_candidate"] = best_bot
+    else:
+        DYN_ROOF_STATE["confirm_streak"] = 0
+        DYN_ROOF_STATE["last_candidate"] = None
+
+    snap["roof_eff"] = float(roof_eff)
+    snap["confirm_streak"] = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
+    snap["gap_required"] = float(DYN_ROOF_GAP) if has_second else 0.0
+    snap["confirm_need"] = int(DYN_ROOF_CONFIRM_TICKS)
+
+    if int(DYN_ROOF_STATE.get("confirm_streak", 0)) >= int(DYN_ROOF_CONFIRM_TICKS):
+        return best_bot, roof_eff, snap
+    return None, roof_eff, snap
+
 
 def _normalizar_evento_texto(msg: str, max_chars: int = EVENTO_MAX_CHARS) -> str:
     try:
@@ -5160,7 +5345,7 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
 
 def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_real_token=False, expected_ciclo=None):
     """
-    Devuelve: (resultado_norm, monto, ciclo, payout_total)
+    Devuelve: (resultado_norm, monto, ciclo, payout_total, cierre_id)
     - min_fila: solo acepta filas con número > min_fila (evita cierres viejos)
               Nota: min_fila se interpreta como "cantidad de filas de datos" (sin header),
               y cuadra con contar_filas_csv().
@@ -5206,6 +5391,7 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
         return None
 
     i_res = _col("resultado", "result", "outcome")
+    i_epoch = _col("epoch", "ts", "timestamp")
     i_status = _col("trade_status", "status")
     i_monto = _col("monto", "stake", "buy_price", "amount")
     i_ciclo = _col("ciclo", "ciclo_martingala", "ciclo_actual", "marti_ciclo", "martingale_step")
@@ -5330,7 +5516,21 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
         except Exception:
             monto_out = None
 
-        return (res_norm, monto_out, ciclo, payout_total)
+        cierre_id = None
+        try:
+            ep = row[i_epoch] if (i_epoch is not None and i_epoch < len(row)) else None
+            epf = _safe_float_local(ep)
+            if epf is not None:
+                cierre_id = f"ep:{int(epf)}"
+        except Exception:
+            cierre_id = None
+        if not cierre_id:
+            try:
+                cierre_id = f"fila:{int(fila_num)}"
+            except Exception:
+                cierre_id = f"fila:{ridx}"
+
+        return (res_norm, monto_out, ciclo, payout_total, cierre_id)
 
     return None
 
@@ -8673,8 +8873,8 @@ def mostrar_advertencia_meta():
                             pass
                 try:
                     if MAIN_LOOP:
-                        fut = asyncio.run_coroutine_threadsafe(refresh_saldo_real(forzado=True), MAIN_LOOP)
-                        fut.result(timeout=15)
+                        fut = asyncio.run_coroutine_threadsafe(refresh_saldo_real_safe(forzado=True, timeout_s=SALDO_BOOT_TIMEOUT_S), MAIN_LOOP)
+                        fut.result(timeout=6)
                     valor = obtener_valor_saldo()
                     if valor is not None:
                         SALDO_INICIAL = round(valor, 2)
@@ -9355,22 +9555,30 @@ async def obtener_saldo_real():
     if not WEBSOCKETS_OK:
         return
     try:
-        async with websockets.connect(DERIV_WS_URL) as ws:
+        async with websockets.connect(
+            DERIV_WS_URL,
+            open_timeout=float(WS_OPEN_TIMEOUT_S),
+            close_timeout=1.0,
+            ping_interval=20,
+            ping_timeout=10,
+        ) as ws:
             auth_msg = json.dumps({"authorize": token_real})
             await ws.send(auth_msg)
-            resp = json.loads(await ws.recv())
+            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=float(WS_REPLY_TIMEOUT_S)))
             if "error" in resp:
                 print(f"⚠️ Error en auth: {resp['error']['message']}")
                 return
             bal_msg = json.dumps({"balance": 1, "subscribe": 1})
             await ws.send(bal_msg)
-            resp = json.loads(await ws.recv())
+            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=float(WS_REPLY_TIMEOUT_S)))
             if "error" in resp:
                 print(f"⚠️ Error en balance: {resp['error']['message']}")
                 return
             if "balance" in resp:
                 saldo_real = f"{resp['balance']['balance']:.2f}"
                 ULTIMA_ACT_SALDO = time.time()
+    except asyncio.TimeoutError:
+        print("⚠️ Timeout obteniendo saldo REAL (WS). Continúo sin bloquear HUD.")
     except Exception as e:
         print(f"⚠️ Error obteniendo saldo: {e}")
 
@@ -9378,6 +9586,16 @@ async def refresh_saldo_real(forzado=False):
     global ULTIMA_ACT_SALDO
     if forzado or time.time() - ULTIMA_ACT_SALDO > REFRESCO_SALDO:
         await obtener_saldo_real()
+
+
+async def refresh_saldo_real_safe(forzado=False, timeout_s: float = SALDO_REFRESH_TIMEOUT_S):
+    """Wrapper anti-bloqueo: nunca deja clavado el loop/HUD por saldo WS."""
+    try:
+        await asyncio.wait_for(refresh_saldo_real(forzado=forzado), timeout=float(max(0.5, timeout_s)))
+    except asyncio.TimeoutError:
+        agregar_evento("⏱️ Saldo WS demoró demasiado; continúo sin bloquear interfaz.")
+    except Exception as e:
+        agregar_evento(f"⚠️ Refresh saldo omitido: {e}")
 
 def obtener_valor_saldo():
     global saldo_real
@@ -9533,32 +9751,60 @@ def _auditar_saturacion_features_bot(bot: str, lookback: int = 800) -> dict:
     return out
 
 
-def _auditar_saturacion_todos_bots(lookback: int = 800) -> dict:
-    """Resume saturación de señales por bot (no bloqueante)."""
-    out = {"bots": {}, "hot_bots": []}
+def _auditar_saturacion_todos_bots(lookback: int = 800, max_bots: int | None = None, budget_s: float | None = None) -> dict:
+    """Resume saturación de señales por bot con presupuesto de tiempo."""
+    out = {"bots": {}, "hot_bots": [], "partial": False}
+    t0 = time.time()
+    done = 0
     for b in BOT_NAMES:
+        if max_bots is not None and done >= int(max_bots):
+            out["partial"] = True
+            break
+        if budget_s is not None and (time.time() - t0) >= float(budget_s):
+            out["partial"] = True
+            break
+
         rep = _auditar_saturacion_features_bot(b, lookback=lookback)
         out["bots"][b] = rep
         dom = rep.get("dominance", {}) if isinstance(rep, dict) else {}
         hot = [k for k, v in dom.items() if isinstance(v, (int, float)) and v >= 0.90]
         if hot:
             out["hot_bots"].append({"bot": b, "features": hot, "dominance": dom})
+        done += 1
     return out
 
 
-def _auditar_calidad_incremental(path: str = "dataset_incremental.csv") -> dict:
-    """Chequeo liviano de calidad de labels para detectar n-meta inflado."""
-    out = {"ok": False, "rows": 0, "valid": 0, "invalid": 0, "path": path}
+def _auditar_calidad_incremental(path: str = "dataset_incremental.csv", sample_rows: int = 15000) -> dict:
+    """Chequeo de labels con muestreo de cola para no frenar el arranque."""
+    out = {"ok": False, "rows": 0, "valid": 0, "invalid": 0, "path": path, "sampled": 0}
     if not os.path.exists(path):
         return out
+
     try:
-        df = pd.read_csv(path, sep=",", encoding="utf-8", engine="python", on_bad_lines="skip")
+        total_rows = contar_filas_incremental()
+    except Exception:
+        total_rows = 0
+    out["rows"] = int(max(0, total_rows))
+
+    try:
+        want = max(1000, int(sample_rows))
+        skip = max(0, int(total_rows) - want)
+        df = pd.read_csv(
+            path,
+            sep=",",
+            encoding="utf-8",
+            usecols=lambda c: c == "result_bin",
+            skiprows=(range(1, skip + 1) if skip > 0 else None),
+            on_bad_lines="skip",
+            low_memory=True,
+        )
     except Exception:
         return out
+
     if df is None or df.empty:
         out["ok"] = True
         return out
-    out["rows"] = int(len(df))
+    out["sampled"] = int(len(df))
     if "result_bin" not in df.columns:
         out["invalid"] = int(len(df))
         out["ok"] = True
@@ -9585,7 +9831,11 @@ def _boot_health_check():
             msgs.append("⚠️ Sin permisos de escritura en cwd (no se podrán persistir logs/modelos).")
 
         # Señales congeladas: diagnóstico operativo rápido por bot (no bloqueante)
-        sat_all = _auditar_saturacion_todos_bots(lookback=900)
+        sat_all = _auditar_saturacion_todos_bots(
+            lookback=int(BOOT_SAT_LOOKBACK),
+            max_bots=int(BOOT_SAT_MAX_BOTS),
+            budget_s=float(max(0.6, BOOT_HEALTH_MAX_S * 0.5)),
+        )
         hot_bots = sat_all.get("hot_bots", []) if isinstance(sat_all, dict) else []
         for hb in hot_bots[:6]:
             bot = hb.get("bot", "?")
@@ -9596,16 +9846,39 @@ def _boot_health_check():
                 msgs.append(f"⚠️ Features saturadas en {bot}: " + ", ".join(hot))
 
         # Calidad de labels del incremental (si hay inválidas, la IA aprende con humo)
-        incq = _auditar_calidad_incremental("dataset_incremental.csv")
+        incq = _auditar_calidad_incremental("dataset_incremental.csv", sample_rows=12000)
         if incq.get("ok", False):
             rows = int(incq.get("rows", 0) or 0)
             invalid = int(incq.get("invalid", 0) or 0)
             valid = int(incq.get("valid", 0) or 0)
+            sampled = int(incq.get("sampled", 0) or 0)
             if rows > 0 and invalid > 0:
-                msgs.append(f"⚠️ Incremental con labels inválidas: valid={valid}, invalid={invalid}, total={rows}.")
+                msgs.append(f"⚠️ Incremental con labels inválidas: valid={valid}, invalid={invalid}, muestra={sampled}, total={rows}.")
+
+        if isinstance(sat_all, dict) and sat_all.get("partial", False):
+            msgs.append("ℹ️ Health-check parcial: auditoría de saturación recortada para no frenar el arranque.")
     except Exception as e:
         msgs.append(f"⚠️ Health-check parcial con error: {e}")
     return msgs
+
+
+async def _warmup_ia_boot_background():
+    """Backfill+retrain en background para no bloquear entrada al HUD."""
+    try:
+        await asyncio.sleep(float(max(0.0, BOOT_BG_TRAIN_DELAY_S)))
+        try:
+            backfill_incremental(ultimas=int(max(200, BOOT_BACKFILL_ROWS)))
+        except Exception as e:
+            agregar_evento(f"⚠️ IA(bg): error en backfill inicial: {e}")
+        try:
+            maybe_retrain(force=True)
+        except Exception as e:
+            agregar_evento(f"⚠️ IA(bg): error en entrenamiento inicial: {e}")
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ IA(bg): warmup abortado: {e}")
+        except Exception:
+            pass
 
 
 async def main():
@@ -9641,28 +9914,39 @@ async def main():
         reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True)
         loop = asyncio.get_running_loop()
         set_main_loop(loop)
-        await refresh_saldo_real(forzado=True)
+        await refresh_saldo_real_safe(forzado=True, timeout_s=SALDO_BOOT_TIMEOUT_S)
         valor = obtener_valor_saldo()
         if valor is not None:
             inicializar_saldo_real(valor)
 
-        set_etapa("BOOT_03", "Backfill y primer entrenamiento")
-        # Backfill IA desde los logs enriquecidos
-        try:
-            backfill_incremental(ultimas=1500)
-        except Exception as e:
-            agregar_evento(f"⚠️ IA: error en backfill inicial: {e}")
-
-        # Intentar un primer entrenamiento, si ya hay suficientes filas
-        try:
-            maybe_retrain(force=True)
-        except Exception as e:
-            agregar_evento(f"⚠️ IA: error al intentar entrenar tras el backfill: {e}")
+        set_etapa("BOOT_03", "Warmup IA inicial")
+        if BOOT_FAST_UI:
+            agregar_evento("⚡ BOOT rápido: backfill/retrain en segundo plano para abrir HUD antes.")
+            try:
+                asyncio.create_task(_warmup_ia_boot_background())
+            except Exception as e:
+                agregar_evento(f"⚠️ IA(bg): no se pudo lanzar warmup: {e}")
+        else:
+            # Modo completo (bloqueante)
+            try:
+                backfill_incremental(ultimas=int(max(200, BOOT_BACKFILL_ROWS)))
+            except Exception as e:
+                agregar_evento(f"⚠️ IA: error en backfill inicial: {e}")
+            try:
+                maybe_retrain(force=True)
+            except Exception as e:
+                agregar_evento(f"⚠️ IA: error al intentar entrenar tras el backfill: {e}")
 
         set_etapa("BOOT_04", "Sincronizando HUD con CSV")
-        # Pasada inicial para sincronizar HUD con CSV existentes
+        # Pasada inicial para sincronizar HUD con CSV existentes (cola reciente para acelerar arranque)
         token_actual_loop = "--"  # Dummy para carga inicial
         for bot in BOT_NAMES:
+            if BOOT_FAST_UI:
+                try:
+                    n_rows = contar_filas_csv(bot)
+                    SNAPSHOT_FILAS[bot] = max(0, int(n_rows) - int(max(40, BOOT_INIT_SYNC_TAIL_ROWS)))
+                except Exception:
+                    pass
             await cargar_datos_bot(bot, token_actual_loop)
 
         while True:
@@ -9675,7 +9959,7 @@ async def main():
             if reinicio_manual:
                 reinicio_manual = False
                 reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True)
-                await refresh_saldo_real(forzado=True)
+                await refresh_saldo_real_safe(forzado=True, timeout_s=SALDO_BOOT_TIMEOUT_S)
 
             try:  
                 set_etapa("TICK_01")
@@ -9771,8 +10055,14 @@ async def main():
 
                             # Cierre inmediato: en REAL siempre 1 operación y vuelve a DEMO (gane o pierda)
                             if cierre_info and isinstance(cierre_info, tuple) and len(cierre_info) >= 4:
-                                res, monto, ciclo, payout_total = cierre_info
-                                sig = (res, round(float(monto or 0.0), 2), int(ciclo or 0), round(float(payout_total or 0.0), 4))
+                                res, monto, ciclo, payout_total = cierre_info[:4]
+                                cierre_id = cierre_info[4] if len(cierre_info) >= 5 else None
+                                # Dedup robusto: usa id de fila/epoch para no saltar cierres distintos
+                                # que coinciden en firma económica (mismo ciclo/monto/payout/resultado).
+                                if cierre_id:
+                                    sig = (str(cierre_id),)
+                                else:
+                                    sig = (res, round(float(monto or 0.0), 2), int(ciclo or 0), round(float(payout_total or 0.0), 4))
 
                                 # Evita reprocesar el mismo cierre en ticks consecutivos
                                 if sig == LAST_REAL_CLOSE_SIG.get(bot):
@@ -9802,10 +10092,15 @@ async def main():
                             activo_real = owner_lock if owner_lock in BOT_NAMES else holder_memoria
                             _enforce_single_real_standby(activo_real)
 
+                        # Actualiza techo dinámico por tick antes de evaluar candidatos.
+                        actualizar_techo_dinamico_ia()
+
                         # Umbral maestro calibrado con históricos de Prob IA (top quantil),
                         # acotado por [AUTO_REAL_THR_MIN .. AUTO_REAL_THR] para activar REAL
                         # usando los valores altos observados recientemente.
-                        if REAL_CLASSIC_GATE:
+                        if DYN_ROOF_ENABLED:
+                            umbral_ia_real = float(max(REAL_TRIGGER_MIN, DYN_ROOF_STATE.get("roof", IA_ACTIVACION_REAL_THR), DYN_ROOF_FLOOR))
+                        elif REAL_CLASSIC_GATE:
                             umbral_ia_real = float(IA_ACTIVACION_REAL_THR)
                         else:
                             umbral_ia_real = max(float(REAL_TRIGGER_MIN), float(get_umbral_real_calibrado()))
@@ -9833,7 +10128,8 @@ async def main():
                                     if not isinstance(p, (int, float)):
                                         continue
                                     # Primer filtro suave: evitar basura por debajo del piso operativo.
-                                    if float(p) < float(IA_ACTIVACION_REAL_THR):
+                                    piso_operativo = float(DYN_ROOF_FLOOR) if DYN_ROOF_ENABLED else float(IA_ACTIVACION_REAL_THR)
+                                    if float(p) < piso_operativo:
                                         continue
 
                                     # Modo clásico: si hay 85% o más, el bot es elegible sin gates extra.
@@ -9929,6 +10225,25 @@ async def main():
 
                             candidatos.sort(key=lambda x: x[0], reverse=True)
 
+                            # Compuerta dinámica final: mejor bot debe dominar al segundo (GAP)
+                            # y confirmar por ticks consecutivos para evitar parpadeo.
+                            if DYN_ROOF_ENABLED and candidatos:
+                                bot_ok, roof_eff, snap = dyn_roof_best_candidate()
+                                if bot_ok:
+                                    candidatos = [c for c in candidatos if c[1] == bot_ok]
+                                    if not candidatos:
+                                        agregar_evento(
+                                            f"🧊 Techo dinámico: {bot_ok} confirmó (roof={roof_eff*100:.1f}%), pero fue bloqueado por gates secundarios."
+                                        )
+                                else:
+                                    candidatos = []
+                                    bb = snap.get("best_bot") or "-"
+                                    agregar_evento(
+                                        f"🧠 Techo dinámico esperando: best={bb} {snap.get('best_prob',0.0)*100:.1f}% | "
+                                        f"roof={snap.get('roof',0.0)*100:.1f}% (eff={snap.get('roof_eff',snap.get('roof',0.0))*100:.1f}%) | "
+                                        f"gap={snap.get('gap',0.0)*100:.1f}% | confirm={snap.get('confirm_streak',0)}/{snap.get('confirm_need',DYN_ROOF_CONFIRM_TICKS)}"
+                                    )
+
                             # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
 
                         # Si hay señal pero saldo insuficiente -> avisar y NO abrir ventana
@@ -9996,7 +10311,7 @@ async def main():
                                 pass
 
                     set_etapa("TICK_04")
-                    await refresh_saldo_real()
+                    await refresh_saldo_real_safe()
                     if meta_mostrada and not pausado and not MODAL_ACTIVO:
                         mostrar_advertencia_meta()
                     if not MODAL_ACTIVO:
