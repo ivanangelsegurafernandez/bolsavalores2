@@ -471,7 +471,12 @@ def write_token_atomic(path, content):
         return False
 
 
-BOT_NAMES = ["fulll45","fulll46","fulll47","fulll48","fulll49","fulll50"]
+# Orden operativo recomendado (calidad real primero):
+# 1) fulll47: mejor hit-rate y menor inflación del set comparado.
+# 2) fulll50/fulll45: rendimiento similar pero con muestra algo mayor.
+# 3) fulll48: intermedio, baja muestra.
+# 4) fulll49/fulll46: sobreconfianza alta y peor hit-rate reciente.
+BOT_NAMES = ["fulll47", "fulll50", "fulll45", "fulll48", "fulll49", "fulll46"]
 IA53_TRIGGERED = {bot: False for bot in BOT_NAMES}
 IA53_LAST_TS = {bot: 0.0 for bot in BOT_NAMES}
 TOKEN_FILE = "token_actual.txt"
