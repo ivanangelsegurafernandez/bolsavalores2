@@ -639,8 +639,8 @@ IA90_stats = {bot: {"n": 0, "ok": 0, "pct": 0.0} for bot in BOT_NAMES}
 # Estado del techo dinámico (maestro)
 DYN_ROOF_STATE = {
     "tick": 0,
-    "batch_tick": 0,
     "hold_ticks": 0,
+    "post_hold_ticks": 0,
     "last_touch_tick": 0,
     "roof": float(max(DYN_ROOF_FLOOR, IA_ACTIVACION_REAL_THR)),
     "best_bot": None,
@@ -696,9 +696,12 @@ def _dyn_roof_penalty_for_low_n(bot: str, roof: float) -> float:
 
 def actualizar_techo_dinamico_ia():
     """
+    "TECHO DINÁMICO + COMPUERTA REAL" (núcleo maestro)
+
     Reglas:
-    - Sube rápido si aparece nuevo máximo vivo.
-    - Baja lento por lotes tras HOLD sin tocar techo.
+    - Roof sube rápido: roof = max(roof, p_best) cuando se toca/rompe techo.
+    - Touch tolerante: cuenta como "tocado" si p_best >= roof - touch_tol.
+    - Roof baja lento con paciencia por ticks/lotes: tras HOLD, baja STEP cada B ticks.
     - Nunca baja del FLOOR.
     """
     if not DYN_ROOF_ENABLED:
@@ -706,7 +709,6 @@ def actualizar_techo_dinamico_ia():
 
     st = DYN_ROOF_STATE
     st["tick"] = int(st.get("tick", 0)) + 1
-    st["batch_tick"] = int(st.get("batch_tick", 0)) + 1
 
     p_best, best_bot, p_second, has_second = _top2_prob_live()
     st["best_prob"] = float(p_best)
@@ -727,16 +729,22 @@ def actualizar_techo_dinamico_ia():
         st["roof"] = float(max(floor, roof, p_best))
         st["last_touch_tick"] = int(st["tick"])
         st["hold_ticks"] = 0
+        st["post_hold_ticks"] = 0
         return
 
     # Regla B: techo baja lento con paciencia y por lotes
     hold_total = int(DYN_ROOF_BATCH_TICKS * DYN_ROOF_HOLD_BATCHES)
     since_touch = int(st["tick"] - int(st.get("last_touch_tick", 0)))
-    if since_touch >= hold_total:
-        if st["batch_tick"] >= int(DYN_ROOF_BATCH_TICKS):
-            st["batch_tick"] = 0
-            st["hold_ticks"] = int(st.get("hold_ticks", 0)) + int(DYN_ROOF_BATCH_TICKS)
-            st["roof"] = float(max(floor, roof - float(DYN_ROOF_STEP)))
+    if since_touch < hold_total:
+        st["hold_ticks"] = int(since_touch)
+        st["post_hold_ticks"] = 0
+        return
+
+    st["hold_ticks"] = int(hold_total)
+    st["post_hold_ticks"] = int(st.get("post_hold_ticks", 0)) + 1
+    if int(st["post_hold_ticks"]) >= int(DYN_ROOF_BATCH_TICKS):
+        st["post_hold_ticks"] = 0
+        st["roof"] = float(max(floor, roof - float(DYN_ROOF_STEP)))
 
 
 def dyn_roof_snapshot() -> dict:
