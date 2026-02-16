@@ -32,14 +32,8 @@
 # === FIN BLOQUE 0 ===
 
 # === BLOQUE 1 — IMPORTS Y ENTORNO BÁSICO ===
-import os, csv, time, random, asyncio, websockets, json, re
+import os, csv, time, random, asyncio, json, re
 from collections import deque
-from colorama import Fore, Style, init
-import pygame
-try:
-    import winsound
-except ImportError:
-    winsound = None
 from unicodedata import normalize
 import threading
 from datetime import datetime, timedelta
@@ -49,6 +43,8 @@ import shutil
 import joblib
 import numpy as np
 import pandas as pd
+import importlib
+import traceback
 
 import math
 import hashlib
@@ -64,6 +60,54 @@ warnings.filterwarnings(
     "ignore",
     message="X does not have valid feature names, but StandardScaler was fitted with feature names"
 )
+
+
+def _load_optional_module(name: str):
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        return None
+
+
+websockets = _load_optional_module("websockets")
+WEBSOCKETS_OK = websockets is not None
+
+
+colorama = _load_optional_module("colorama")
+if colorama is not None:
+    Fore = colorama.Fore
+    Style = colorama.Style
+    init = colorama.init
+else:
+    class _NoColor:
+        def __getattr__(self, _name):
+            return ""
+    Fore = _NoColor()
+    Style = _NoColor()
+    def init(*args, **kwargs):
+        return None
+
+pygame = _load_optional_module("pygame")
+PYGAME_OK = pygame is not None
+if not PYGAME_OK:
+    class _DummyMixer:
+        def get_init(self):
+            return False
+        def pre_init(self, *args, **kwargs):
+            return None
+        def init(self, *args, **kwargs):
+            return None
+        def quit(self):
+            return None
+        def Sound(self, *args, **kwargs):
+            return None
+
+    class _DummyPygame:
+        mixer = _DummyMixer()
+
+    pygame = _DummyPygame()
+
+winsound = _load_optional_module("winsound")
 
 # ============================================================
 # XGBoost (robusto): permite correr aunque xgboost no esté
@@ -263,6 +307,11 @@ MIN_AUC_CONF = 0.65        # AUC mínimo para audios/colores verdes
 MAX_CLASS_IMBALANCE = 0.8  # Máx proporción pos/neg para entrenar (evita 99% wins)
 AUC_DROP_TOL = 0.05        # Tolerancia para no machacar modelo si AUC baja
 FEATURE_MAX_DOMINANCE = 0.90  # Si una feature repite >90%, se considera casi constante
+TRAIN_WARMUP_MIN_ROWS = 250          # evita declarar modo confiable sin muestra mínima
+INPUT_DUP_DIAG_COOLDOWN_S = 25.0     # anti-spam de diagnóstico por inputs duplicados
+CLONED_PROB_TICKS_ALERT = 3          # ticks consecutivos de probs clonadas para alertar
+INPUT_DUP_FINGERPRINT_DECIMALS = 6   # precisión estable para huella de inputs IA
+
 
 # Semáforo de calibración (lectura rápida PredMedia/Real/Inflación/n)
 SEM_CAL_N_ROJO = 30
@@ -9001,6 +9050,8 @@ async def obtener_saldo_real():
     token_demo, token_real = leer_tokens_usuario()
     if not token_real:
         return
+    if not WEBSOCKETS_OK:
+        return
     try:
         async with websockets.connect(DERIV_WS_URL) as ws:
             auth_msg = json.dumps({"authorize": token_real})
@@ -9126,21 +9177,62 @@ if sys.stdout.isatty():
     threading.Thread(target=escuchar_teclas, daemon=True).start()
 
 # Main - Añadida pasada inicial para sincronizar HUD con CSV existentes
+DIAGNOSTIC_MODE = ("--diagnostico" in sys.argv) or (os.getenv("MAESTRO_DIAGNOSTICO", "0") == "1")
+
+
+def _log_exception(tag: str, exc: Exception | None = None):
+    try:
+        ts = time.strftime('%F %T')
+        detail = traceback.format_exc()
+        if exc is not None and (not detail or detail.strip() == "NoneType: None"):
+            detail = f"{type(exc).__name__}: {exc}"
+        with open("crash.log", "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {tag}\n{detail}\n")
+    except Exception:
+        pass
+
+
+
+def _boot_health_check():
+    msgs = []
+    try:
+        if not WEBSOCKETS_OK:
+            msgs.append("⚠️ Dependencia faltante: websockets (sin WS/saldo, resto del HUD sigue).")
+        if not PYGAME_OK:
+            msgs.append("⚠️ Dependencia faltante: pygame (audio desactivado, ejecución continúa).")
+        csv_presentes = [b for b in BOT_NAMES if os.path.exists(f"registro_enriquecido_{b}.csv")]
+        if not csv_presentes:
+            msgs.append("⚠️ No hay CSV enriquecidos de bots todavía; esperando generación de datos.")
+        if not os.access(os.getcwd(), os.W_OK):
+            msgs.append("⚠️ Sin permisos de escritura en cwd (no se podrán persistir logs/modelos).")
+    except Exception as e:
+        msgs.append(f"⚠️ Health-check parcial con error: {e}")
+    return msgs
+
+
 async def main():
     global salir, pausado, reinicio_manual, SALDO_INICIAL
     global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA, REAL_OWNER_LOCK
 
     try:
         set_etapa("BOOT_01", "Inicializando main()", anunciar=True)
-        try:
-            os.remove("real.lock")
-        except:
-            pass
+        # Seguridad: NO borrar real.lock al arrancar; evita carreras entre instancias.
         set_etapa("BOOT_02", "Leyendo tokens de usuario")
         tokens = leer_tokens_usuario()
         if tokens == (None, None):
             print("⚠️ Tokens ausentes. Modo sin-saldo activo (HUD/IA continúan).")
         init_audio()
+        for _msg in _boot_health_check():
+            print(_msg)
+            try:
+                agregar_evento(_msg)
+            except Exception:
+                pass
+
+        if DIAGNOSTIC_MODE:
+            print("🧪 MODO DIAGNÓSTICO activo: sin auto-operación REAL.")
+            globals()["MODO_REAL_MANUAL"] = True
+
         if RESET_ON_START:
             for nb in BOT_NAMES:
                 resetear_csv_bot(nb)
@@ -9475,6 +9567,7 @@ async def main():
     except Exception as e:
         set_etapa("STOP", f"Error en main: {str(e)}", anunciar=True)
         agregar_evento(f"⛔ Error en main: {str(e)}")
+        _log_exception("Error en main()", e)
 
 if __name__ == "__main__":
     # ============================================
@@ -9516,9 +9609,8 @@ if __name__ == "__main__":
             break
         except Exception as e:
             print(f"⛔ Error crítico: {str(e)}")
-            with open("crash.log","a",encoding="utf-8") as f:
-                f.write(f"[{time.strftime('%F %T')}] {e}\n")
-            time.sleep(5) 
+            _log_exception("Error crítico en __main__", e)
+            time.sleep(5)
 
 # === FIN BLOQUE 13 ===
 # === BLOQUE 99 — RESUMEN FINAL DE LO QUE SE LOGRA ===
