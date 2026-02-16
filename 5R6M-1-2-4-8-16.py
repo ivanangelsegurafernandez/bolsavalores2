@@ -32,14 +32,8 @@
 # === FIN BLOQUE 0 ===
 
 # === BLOQUE 1 — IMPORTS Y ENTORNO BÁSICO ===
-import os, csv, time, random, asyncio, websockets, json, re
+import os, csv, time, random, asyncio, json, re
 from collections import deque
-from colorama import Fore, Style, init
-import pygame
-try:
-    import winsound
-except ImportError:
-    winsound = None
 from unicodedata import normalize
 import threading
 from datetime import datetime, timedelta
@@ -49,6 +43,8 @@ import shutil
 import joblib
 import numpy as np
 import pandas as pd
+import importlib
+import traceback
 
 import math
 import hashlib
@@ -64,6 +60,54 @@ warnings.filterwarnings(
     "ignore",
     message="X does not have valid feature names, but StandardScaler was fitted with feature names"
 )
+
+
+def _load_optional_module(name: str):
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        return None
+
+
+websockets = _load_optional_module("websockets")
+WEBSOCKETS_OK = websockets is not None
+
+
+colorama = _load_optional_module("colorama")
+if colorama is not None:
+    Fore = colorama.Fore
+    Style = colorama.Style
+    init = colorama.init
+else:
+    class _NoColor:
+        def __getattr__(self, _name):
+            return ""
+    Fore = _NoColor()
+    Style = _NoColor()
+    def init(*args, **kwargs):
+        return None
+
+pygame = _load_optional_module("pygame")
+PYGAME_OK = pygame is not None
+if not PYGAME_OK:
+    class _DummyMixer:
+        def get_init(self):
+            return False
+        def pre_init(self, *args, **kwargs):
+            return None
+        def init(self, *args, **kwargs):
+            return None
+        def quit(self):
+            return None
+        def Sound(self, *args, **kwargs):
+            return None
+
+    class _DummyPygame:
+        mixer = _DummyMixer()
+
+    pygame = _DummyPygame()
+
+winsound = _load_optional_module("winsound")
 
 # ============================================================
 # XGBoost (robusto): permite correr aunque xgboost no esté
@@ -263,6 +307,11 @@ MIN_AUC_CONF = 0.65        # AUC mínimo para audios/colores verdes
 MAX_CLASS_IMBALANCE = 0.8  # Máx proporción pos/neg para entrenar (evita 99% wins)
 AUC_DROP_TOL = 0.05        # Tolerancia para no machacar modelo si AUC baja
 FEATURE_MAX_DOMINANCE = 0.90  # Si una feature repite >90%, se considera casi constante
+TRAIN_WARMUP_MIN_ROWS = 250          # evita declarar modo confiable sin muestra mínima
+INPUT_DUP_DIAG_COOLDOWN_S = 25.0     # anti-spam de diagnóstico por inputs duplicados
+CLONED_PROB_TICKS_ALERT = 3          # ticks consecutivos de probs clonadas para alertar
+INPUT_DUP_FINGERPRINT_DECIMALS = 6   # precisión estable para huella de inputs IA
+
 
 # Semáforo de calibración (lectura rápida PredMedia/Real/Inflación/n)
 SEM_CAL_N_ROJO = 30
@@ -471,7 +520,12 @@ def write_token_atomic(path, content):
         return False
 
 
-BOT_NAMES = ["fulll45","fulll46","fulll47","fulll48","fulll49","fulll50"]
+# Orden operativo recomendado (calidad real primero):
+# 1) fulll47: mejor hit-rate y menor inflación del set comparado.
+# 2) fulll50/fulll45: rendimiento similar pero con muestra algo mayor.
+# 3) fulll48: intermedio, baja muestra.
+# 4) fulll49/fulll46: sobreconfianza alta y peor hit-rate reciente.
+BOT_NAMES = ["fulll47", "fulll50", "fulll45", "fulll48", "fulll49", "fulll46"]
 IA53_TRIGGERED = {bot: False for bot in BOT_NAMES}
 IA53_LAST_TS = {bot: 0.0 for bot in BOT_NAMES}
 TOKEN_FILE = "token_actual.txt"
@@ -542,6 +596,20 @@ estado_bots = {
     for bot in BOT_NAMES
 }
 IA90_stats = {bot: {"n": 0, "ok": 0, "pct": 0.0} for bot in BOT_NAMES}
+
+EVENTO_MAX_CHARS = 220
+
+def _normalizar_evento_texto(msg: str, max_chars: int = EVENTO_MAX_CHARS) -> str:
+    try:
+        txt = str(msg if msg is not None else "")
+    except Exception:
+        txt = ""
+    for ch in ("\r", "\n", "\t"):
+        txt = txt.replace(ch, " ")
+    txt = " ".join(txt.split())
+    if len(txt) > int(max_chars):
+        txt = txt[: max(0, int(max_chars) - 1)] + "…"
+    return txt
 # --- BLINDAJE: asegurar símbolos críticos si faltan (no pisa definiciones reales) ---
 if "RENDER_LOCK" not in globals():
     RENDER_LOCK = threading.Lock()
@@ -550,10 +618,11 @@ if "agregar_evento" not in globals():
     def agregar_evento(msg: str):
         try:
             ts = time.strftime("%H:%M:%S")
-            eventos_recentes.appendleft(f"{ts} {msg}")
+            limpio = _normalizar_evento_texto(msg)
+            eventos_recentes.appendleft(f"{ts} {limpio}")
         except Exception:
             try:
-                print(msg)
+                print(_normalizar_evento_texto(msg))
             except Exception:
                 pass
 # --- /BLINDAJE ---
@@ -4300,7 +4369,7 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
     Lee features para PREDICCIÓN (sin label):
     - Prefiere trade_status PRE_TRADE/PENDIENTE/OPEN/ABIERTO
     - Fallback: última fila “no cierre” antes del último cierre
-    - Anti-leakage: elimina payout_total/ganancia_perdida/resultado del dict final
+    - Anti-leakage: elimina campos de cierre (ganancia/profit/resultado) del dict final
     """
     ruta = f"registro_enriquecido_{bot}.csv"
     if not os.path.exists(ruta):
@@ -4377,7 +4446,7 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
         pass
 
     # 🔒 Anti-leakage duro
-    for k in ("payout_total", "ganancia_perdida", "profit", "resultado", "resultado_norm"):
+    for k in ("ganancia_perdida", "profit", "resultado", "resultado_norm"):
         try:
             row.pop(k, None)
         except Exception:
@@ -4628,7 +4697,7 @@ def actualizar_prob_ia_bot(bot: str):
             return
         _last_pred_ts[bot] = now
 
-        # Guardrail duro: no confiar en predicción si el input del bot está duplicado en este tick.
+        # Guardrail duro: solo invalidar cuando se detecta CLON REAL de origen en este tick.
         if bool(estado_bots.get(bot, {}).get("ia_input_duplicado", False)):
             estado_bots[bot]["ia_ready"] = False
             estado_bots[bot]["ia_last_err"] = "INPUT_DUPLICADO"
@@ -4706,6 +4775,7 @@ def actualizar_prob_ia_todos():
     for b in BOT_NAMES:
         try:
             estado_bots[b]["ia_input_duplicado"] = False
+            estado_bots[b]["ia_input_redundante"] = False
             estado_bots[b]["ia_input_dup_group"] = ""
         except Exception:
             pass
@@ -4720,7 +4790,7 @@ def actualizar_prob_ia_todos():
         except Exception:
             pass
 
-    # 2) Fingerprints por bot para cortar input duplicado en origen
+    # 2) Fingerprints por bot: detectar redundancia y SOLO invalidar si hay clon real de origen
     rows_by_bot = {}
     fp_map = {}
     try:
@@ -4732,56 +4802,61 @@ def actualizar_prob_ia_todos():
             fp = _fingerprint_features_row(row, feats=list(INCREMENTAL_FEATURES_V2))
             fp_map.setdefault(fp, []).append(b)
 
-        # Diagnóstico de lectura: misma fila/hash/ts entre bots => probable causa A (lectura clónica)
-        try:
-            hash_map = {}
-            ts_map = {}
-            for b, rr in rows_by_bot.items():
-                hh = str(rr.get("__src_row_hash", ""))
-                tt = str(rr.get("__src_ts", rr.get("__src_epoch", "")))
-                if hh:
-                    hash_map.setdefault(hh, []).append(b)
-                if tt:
-                    ts_map.setdefault(tt, []).append(b)
-
-            same_hash_groups = [bb for bb in hash_map.values() if len(bb) >= 2]
-            if same_hash_groups:
-                g = "+".join(sorted(same_hash_groups[0]))
-                agregar_evento(f"🧭 DIAG LECTURA: misma fila/hash detectada en [{g}] (revisar source path/timestamp por bot)")
-        except Exception:
-            pass
-
         dup_groups = [bots for bots in fp_map.values() if len(bots) >= 2]
         if dup_groups:
             now = time.time()
             for bots in dup_groups:
                 sig = "+".join(sorted(bots))
-                for b in bots:
-                    try:
-                        estado_bots[b]["ia_input_duplicado"] = True
-                        estado_bots[b]["ia_input_dup_group"] = sig
-                    except Exception:
-                        pass
-
                 diag = _diagnosticar_inputs_duplicados(rows_by_bot, bots, feats=list(INCREMENTAL_FEATURES_V2))
                 same_cols = diag.get("same_cols", [])
                 expected = diag.get("expected_diff", [])
                 src_info = diag.get("source_info", {}) if isinstance(diag, dict) else {}
+
+                # Clon real: misma fuente + misma fila/hash/epoch entre bots.
+                source_keys = []
+                for bb in bots:
+                    inf = src_info.get(bb, {}) if isinstance(src_info, dict) else {}
+                    path = str(inf.get("path", "") or "")
+                    hsh = str(inf.get("hash", "") or "")
+                    tsv = str(inf.get("ts", "") or "")
+                    source_keys.append((path, hsh, tsv))
+
+                clone_real = False
+                if source_keys:
+                    unique_keys = set(source_keys)
+                    if len(unique_keys) == 1 and all(any(x for x in k) for k in unique_keys):
+                        clone_real = True
+
                 src_brief = []
                 for bb in bots[:3]:
                     inf = src_info.get(bb, {}) if isinstance(src_info, dict) else {}
-                    src_brief.append(f"{bb}:{inf.get('hash','')}/{inf.get('ts','')}")
-                msg_sig = f"{sig}|{','.join(same_cols[:6])}"
+                    src_brief.append(f"{bb}:{inf.get('path','')}/{inf.get('hash','')}/{inf.get('ts','')}")
 
+                msg_sig = f"{sig}|{','.join(same_cols[:6])}|clone={int(clone_real)}"
                 should_emit = (
                     msg_sig != str(_IA_INPUT_DUP_INFO.get("signature", "")) or
                     (now - float(_IA_INPUT_DUP_INFO.get("ts", 0.0) or 0.0)) >= float(INPUT_DUP_DIAG_COOLDOWN_S)
                 )
+
+                for b in bots:
+                    try:
+                        estado_bots[b]["ia_input_duplicado"] = bool(clone_real)
+                        estado_bots[b]["ia_input_dup_group"] = sig
+                        estado_bots[b]["ia_input_redundante"] = not bool(clone_real)
+                    except Exception:
+                        pass
+
                 if should_emit:
-                    agregar_evento(
-                        "🛑 IA inválida por INPUT DUPLICADO "
-                        f"[{sig}] | cols_iguales={same_cols[:8]} | esperadas_diferir={expected} | src={src_brief}"
-                    )
+                    if clone_real:
+                        agregar_evento(
+                            "🛑 IA inválida por CLON REAL de input "
+                            f"[{sig}] | cols_iguales={same_cols[:8]} | esperadas_diferir={expected} | src={src_brief}"
+                        )
+                    else:
+                        agregar_evento(
+                            "⚠️ IA redundante (features iguales entre bots; NO se invalida predicción) "
+                            f"[{sig}] | cols_iguales={same_cols[:8]} | src={src_brief}"
+                        )
                     _IA_INPUT_DUP_INFO = {"signature": msg_sig, "ts": now, "bots": list(bots)}
     except Exception:
         pass
@@ -7732,7 +7807,8 @@ def maybe_retrain(force: bool = False):
 RENDER_LOCK = threading.Lock()
 
 def agregar_evento(texto: str):
-    eventos_recentes.append(f"[{time.strftime('%H:%M:%S')}] {texto}")
+    limpio = _normalizar_evento_texto(texto)
+    eventos_recentes.append(f"[{time.strftime('%H:%M:%S')}] {limpio}")
 
 def limpiar_consola():
     os.system("cls" if os.name == "nt" else "clear")
@@ -8123,8 +8199,12 @@ def mostrar_panel():
 
         print(Fore.CYAN + f" IA ▶ modelo XGBoost entrenado: n={n} (GAN={pos}, PERD={neg})")
         print(Fore.CYAN + f"      AUC={auc_txt}  | Thr={thr:.2f}  | Modo={modo_txt}")
+        datos_utiles = int(max(0, pos + neg))
         if warmup_mode:
+            print(Fore.CYAN + f"      Confianza IA: BAJA (Warmup n={n}<{int(TRAIN_WARMUP_MIN_ROWS)} | cierres útiles={datos_utiles}).")
             print(Fore.CYAN + f"      Warmup activo: n={n}<{int(TRAIN_WARMUP_MIN_ROWS)} (solo monitoreo/calibración).")
+        else:
+            print(Fore.CYAN + f"      Confianza IA: {'MEDIA/ALTA' if reliable else 'MEDIA'} | cierres útiles={datos_utiles}.")
 
     # Mostrar contadores de aciertos IA por bot (resumen compacto para reducir ruido)
     resumen_hits = []
@@ -8996,6 +9076,8 @@ async def obtener_saldo_real():
     token_demo, token_real = leer_tokens_usuario()
     if not token_real:
         return
+    if not WEBSOCKETS_OK:
+        return
     try:
         async with websockets.connect(DERIV_WS_URL) as ws:
             auth_msg = json.dumps({"authorize": token_real})
@@ -9121,21 +9203,62 @@ if sys.stdout.isatty():
     threading.Thread(target=escuchar_teclas, daemon=True).start()
 
 # Main - Añadida pasada inicial para sincronizar HUD con CSV existentes
+DIAGNOSTIC_MODE = ("--diagnostico" in sys.argv) or (os.getenv("MAESTRO_DIAGNOSTICO", "0") == "1")
+
+
+def _log_exception(tag: str, exc: Exception | None = None):
+    try:
+        ts = time.strftime('%F %T')
+        detail = traceback.format_exc()
+        if exc is not None and (not detail or detail.strip() == "NoneType: None"):
+            detail = f"{type(exc).__name__}: {exc}"
+        with open("crash.log", "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {tag}\n{detail}\n")
+    except Exception:
+        pass
+
+
+
+def _boot_health_check():
+    msgs = []
+    try:
+        if not WEBSOCKETS_OK:
+            msgs.append("⚠️ Dependencia faltante: websockets (sin WS/saldo, resto del HUD sigue).")
+        if not PYGAME_OK:
+            msgs.append("⚠️ Dependencia faltante: pygame (audio desactivado, ejecución continúa).")
+        csv_presentes = [b for b in BOT_NAMES if os.path.exists(f"registro_enriquecido_{b}.csv")]
+        if not csv_presentes:
+            msgs.append("⚠️ No hay CSV enriquecidos de bots todavía; esperando generación de datos.")
+        if not os.access(os.getcwd(), os.W_OK):
+            msgs.append("⚠️ Sin permisos de escritura en cwd (no se podrán persistir logs/modelos).")
+    except Exception as e:
+        msgs.append(f"⚠️ Health-check parcial con error: {e}")
+    return msgs
+
+
 async def main():
     global salir, pausado, reinicio_manual, SALDO_INICIAL
     global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA, REAL_OWNER_LOCK
 
     try:
         set_etapa("BOOT_01", "Inicializando main()", anunciar=True)
-        try:
-            os.remove("real.lock")
-        except:
-            pass
+        # Seguridad: NO borrar real.lock al arrancar; evita carreras entre instancias.
         set_etapa("BOOT_02", "Leyendo tokens de usuario")
         tokens = leer_tokens_usuario()
         if tokens == (None, None):
             print("⚠️ Tokens ausentes. Modo sin-saldo activo (HUD/IA continúan).")
         init_audio()
+        for _msg in _boot_health_check():
+            print(_msg)
+            try:
+                agregar_evento(_msg)
+            except Exception:
+                pass
+
+        if DIAGNOSTIC_MODE:
+            print("🧪 MODO DIAGNÓSTICO activo: sin auto-operación REAL.")
+            globals()["MODO_REAL_MANUAL"] = True
+
         if RESET_ON_START:
             for nb in BOT_NAMES:
                 resetear_csv_bot(nb)
@@ -9470,6 +9593,7 @@ async def main():
     except Exception as e:
         set_etapa("STOP", f"Error en main: {str(e)}", anunciar=True)
         agregar_evento(f"⛔ Error en main: {str(e)}")
+        _log_exception("Error en main()", e)
 
 if __name__ == "__main__":
     # ============================================
@@ -9511,9 +9635,8 @@ if __name__ == "__main__":
             break
         except Exception as e:
             print(f"⛔ Error crítico: {str(e)}")
-            with open("crash.log","a",encoding="utf-8") as f:
-                f.write(f"[{time.strftime('%F %T')}] {e}\n")
-            time.sleep(5) 
+            _log_exception("Error crítico en __main__", e)
+            time.sleep(5)
 
 # === FIN BLOQUE 13 ===
 # === BLOQUE 99 — RESUMEN FINAL DE LO QUE SE LOGRA ===
