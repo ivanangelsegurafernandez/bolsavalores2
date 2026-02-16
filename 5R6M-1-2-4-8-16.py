@@ -190,6 +190,9 @@ AUTO_REAL_LIVE_MIN_BOTS = 3   # mínimos bots con prob viva para calibración po
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
 IA_METRIC_THRESHOLD = IA_ACTIVACION_REAL_THR
+# Modo clásico solicitado: activación REAL inmediata con prob IA >= 65%.
+# Mantiene lock de un solo bot en REAL y ciclo martingala global en HUD.
+REAL_CLASSIC_GATE = True
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
@@ -555,6 +558,8 @@ t_inicio_indef = {bot: None for bot in BOT_NAMES}
 last_update_time = {bot: time.time() for bot in BOT_NAMES}
 LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mismo cierre REAL varias veces
 REAL_OWNER_LOCK = None  # owner REAL en memoria (evita carreras de lectura de archivo)
+REAL_LOCK_MISMATCH_SINCE = 0.0
+REAL_LOCK_RECONCILE_S = 6.0
 
 try:
     last_sig_por_bot
@@ -1811,6 +1816,26 @@ def leer_token_actual():
         if fallback in BOT_NAMES:
             _enforce_single_real_standby(fallback)
         return fallback
+
+
+def leer_token_archivo_raw():
+    """
+    Lee token_actual.txt SIN priorizar REAL_OWNER_LOCK (para reconciliar desincronías).
+    Retorna bot owner REAL o None.
+    """
+    if not os.path.exists(TOKEN_FILE):
+        return None
+    try:
+        with open(TOKEN_FILE, encoding="utf-8", errors="replace") as f:
+            linea = (f.read() or "").strip()
+        if not linea.startswith("REAL:"):
+            return None
+        bot_name = linea.split(":", 1)[1].strip()
+        if bot_name in BOT_NAMES:
+            return bot_name
+        return None
+    except Exception:
+        return None
 
 # Escribir token actual
 async def escribir_token_actual(bot):
@@ -7212,6 +7237,56 @@ def _auditar_salud_features(X_df: pd.DataFrame, feats: list[str]):
     return out
 
 
+def _dataset_quality_gate_for_training(X_df: pd.DataFrame, feats: list[str]):
+    """
+    Gate de calidad mínimo para entrenamiento IA.
+    Retorna: (ok: bool, reasons: list[str], health: dict)
+    """
+    reasons = []
+    health = {}
+    try:
+        if X_df is None or X_df.empty:
+            return False, ["dataset_vacio"], {}
+
+        n_rows = int(len(X_df))
+        min_rows = int(max(4, MIN_FIT_ROWS_LOW))
+        if n_rows < min_rows:
+            reasons.append(f"filas_insuficientes:{n_rows}<{min_rows}")
+
+        health = _auditar_salud_features(X_df, feats)
+        if not isinstance(health, dict) or not health:
+            reasons.append("health_unavailable")
+            return (len(reasons) == 0), reasons, (health if isinstance(health, dict) else {})
+
+        n_ok = 0
+        n_bad = 0
+        dom_hot = 0
+        for c in feats:
+            rep = health.get(c, {}) if isinstance(health.get(c, {}), dict) else {}
+            st = str(rep.get("status", "")).upper()
+            dom = float(rep.get("dominance", 1.0) or 1.0)
+            if st == "OK":
+                n_ok += 1
+            else:
+                n_bad += 1
+            if dom >= float(FEATURE_MAX_DOMINANCE):
+                dom_hot += 1
+
+        # Exigimos al menos una base de columnas útiles para entrenar sin colapsar.
+        min_ok = max(3, min(6, len(feats)))
+        if n_ok < min_ok:
+            reasons.append(f"features_ok_bajas:{n_ok}<{min_ok}")
+
+        # Si casi todo está casi-constante, bloqueamos para evitar entrenos basura.
+        if len(feats) > 0 and dom_hot >= max(1, int(len(feats) * 0.8)):
+            reasons.append(f"dominancia_alta:{dom_hot}/{len(feats)}")
+
+        return len(reasons) == 0, reasons, health
+    except Exception as e:
+        reasons.append(f"dq_gate_error:{type(e).__name__}")
+        return False, reasons, (health if isinstance(health, dict) else {})
+
+
 def _fingerprint_features_row(row: dict, feats: list[str] | None = None, decimals: int = INPUT_DUP_FINGERPRINT_DECIMALS) -> str:
     """Huella estable por bot/tick para detectar inputs duplicados entre bots."""
     base_feats = list(feats) if feats else list(INCREMENTAL_FEATURES_V2)
@@ -9529,6 +9604,7 @@ def _boot_health_check():
 async def main():
     global salir, pausado, reinicio_manual, SALDO_INICIAL
     global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA, REAL_OWNER_LOCK
+    global REAL_LOCK_MISMATCH_SINCE
 
     try:
         set_etapa("BOOT_01", "Inicializando main()", anunciar=True)
@@ -9597,6 +9673,26 @@ async def main():
             try:  
                 set_etapa("TICK_01")
                 token_actual_loop = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else (leer_token_actual() or next((b for b in BOT_NAMES if estado_bots.get(b, {}).get("token") == "REAL"), None))
+
+                # Reconciliación anti-desincronía maestro↔bots:
+                # si memoria dice REAL pero token_actual.txt ya está en none por varios segundos,
+                # liberamos lock fantasma para permitir nuevas asignaciones REAL correctas.
+                owner_mem_now = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+                owner_file_now = leer_token_archivo_raw()
+                if owner_mem_now and (owner_file_now is None):
+                    if REAL_LOCK_MISMATCH_SINCE <= 0.0:
+                        REAL_LOCK_MISMATCH_SINCE = time.time()
+                    elif (time.time() - REAL_LOCK_MISMATCH_SINCE) >= float(REAL_LOCK_RECONCILE_S):
+                        agregar_evento(f"🩹 Reconciliación lock REAL: liberando owner fantasma {owner_mem_now.upper()} (archivo token ya está en none).")
+                        try:
+                            _set_ui_token_holder(None)
+                        except Exception:
+                            pass
+                        REAL_OWNER_LOCK = None
+                        REAL_LOCK_MISMATCH_SINCE = 0.0
+                        token_actual_loop = leer_token_actual() or None
+                else:
+                    REAL_LOCK_MISMATCH_SINCE = 0.0
                 # Heartbeat: mantiene ACK alineado al HUD aunque no entren filas nuevas ese tick.
                 refrescar_ia_ack_desde_hud(intervalo_s=1.0)
                 owner_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
@@ -9702,7 +9798,10 @@ async def main():
                         # Umbral maestro calibrado con históricos de Prob IA (top quantil),
                         # acotado por [AUTO_REAL_THR_MIN .. AUTO_REAL_THR] para activar REAL
                         # usando los valores altos observados recientemente.
-                        umbral_ia_real = max(float(REAL_TRIGGER_MIN), float(get_umbral_real_calibrado()))
+                        if REAL_CLASSIC_GATE:
+                            umbral_ia_real = float(IA_ACTIVACION_REAL_THR)
+                        else:
+                            umbral_ia_real = max(float(REAL_TRIGGER_MIN), float(get_umbral_real_calibrado()))
 
                         # Bloqueo por saldo (no abras ventanas si no puedes ejecutar ciclo1)
                         try:
@@ -9728,6 +9827,18 @@ async def main():
                                         continue
                                     # Primer filtro suave: evitar basura por debajo del piso operativo.
                                     if float(p) < float(IA_ACTIVACION_REAL_THR):
+                                        continue
+
+                                    # Modo clásico: si hay 65% o más, el bot es elegible sin gates extra.
+                                    # Mantiene el lock de un único bot REAL a la vez en el flujo superior.
+                                    if REAL_CLASSIC_GATE:
+                                        regime_score = _score_regimen_contexto(_ultimo_contexto_operativo_bot(b))
+                                        p_post = float(p)
+                                        score_final = float(p_post)
+                                        estado_bots[b]["ia_regime_score"] = float(regime_score)
+                                        estado_bots[b]["ia_evidence_n"] = int(estado_bots[b].get("ia_evidence_n", 0) or 0)
+                                        estado_bots[b]["ia_evidence_wr"] = float(estado_bots[b].get("ia_evidence_wr", 0.0) or 0.0)
+                                        candidatos.append((float(score_final), b, float(p), float(p_post), float(regime_score), 0, 0.0, 0.0))
                                         continue
 
                                     # 1) Gate de calidad por racha/rebote (priorizar precisión real)
