@@ -204,6 +204,12 @@ DYN_ROOF_GAP = 0.03                 # GAP: ventaja mínima vs segundo bot
 DYN_ROOF_CONFIRM_TICKS = 2          # CONFIRM: ticks consecutivos requeridos
 DYN_ROOF_LOW_N = 30                 # evidencia mínima para no penalizar techo
 DYN_ROOF_LOW_N_EXTRA = 0.02         # penalización extra de techo si n < LOW_N
+DYN_ROOF_TOUCH_TOL = 0.005          # tolerancia para considerar "toque" de techo (0.5pp)
+
+# Presupuesto de arranque para diagnósticos (evita sensación de "trabado")
+BOOT_HEALTH_MAX_S = 2.5
+BOOT_SAT_LOOKBACK = 350
+BOOT_SAT_MAX_BOTS = 3
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
@@ -625,6 +631,7 @@ DYN_ROOF_STATE = {
     "best_bot": None,
     "best_prob": 0.0,
     "second_prob": 0.0,
+    "has_second": False,
     "confirm_streak": 0,
     "last_candidate": None,
 }
@@ -652,11 +659,12 @@ def _top2_prob_live():
         p = max(0.0, min(1.0, p))
         pares.append((p, b))
     if not pares:
-        return 0.0, None, 0.0
+        return 0.0, None, 0.0, False
     pares.sort(reverse=True)
     p_best, best_bot = pares[0]
-    p_second = pares[1][0] if len(pares) > 1 else 0.0
-    return float(p_best), best_bot, float(p_second)
+    has_second = len(pares) > 1
+    p_second = pares[1][0] if has_second else 0.0
+    return float(p_best), best_bot, float(p_second), bool(has_second)
 
 
 def _dyn_roof_penalty_for_low_n(bot: str, roof: float) -> float:
@@ -685,18 +693,23 @@ def actualizar_techo_dinamico_ia():
     st["tick"] = int(st.get("tick", 0)) + 1
     st["batch_tick"] = int(st.get("batch_tick", 0)) + 1
 
-    p_best, best_bot, p_second = _top2_prob_live()
+    p_best, best_bot, p_second, has_second = _top2_prob_live()
     st["best_prob"] = float(p_best)
     st["second_prob"] = float(p_second)
+    st["has_second"] = bool(has_second)
     st["best_bot"] = best_bot
 
     roof = float(st.get("roof", max(DYN_ROOF_FLOOR, IA_ACTIVACION_REAL_THR)))
     floor = float(DYN_ROOF_FLOOR)
 
-    # Regla A: techo sube rápido
-    if p_best >= roof:
-        if p_best > roof + 1e-9:
-            st["roof"] = float(max(floor, p_best))
+    # Regla A: techo sube rápido y considera "casi toque" para mantener paciencia
+    # (evita derretir por variaciones pequeñas: 85.0 -> 84.7).
+    touch_thr = float(max(floor, roof - float(DYN_ROOF_TOUCH_TOL)))
+    touched = p_best >= touch_thr
+
+    if touched:
+        # El techo NUNCA se ajusta hacia abajo por toque: solo sube por máximos reales.
+        st["roof"] = float(max(floor, roof, p_best))
         st["last_touch_tick"] = int(st["tick"])
         st["hold_ticks"] = 0
         return
@@ -720,6 +733,7 @@ def dyn_roof_snapshot() -> dict:
         "best_bot": st.get("best_bot"),
         "best_prob": float(st.get("best_prob", 0.0) or 0.0),
         "second_prob": float(st.get("second_prob", 0.0) or 0.0),
+        "has_second": bool(st.get("has_second", False)),
         "gap": max(0.0, float(st.get("best_prob", 0.0) or 0.0) - float(st.get("second_prob", 0.0) or 0.0)),
         "tick": int(st.get("tick", 0) or 0),
     }
@@ -739,10 +753,12 @@ def dyn_roof_best_candidate() -> tuple[str | None, float, dict]:
         return None, roof, snap
 
     roof_eff = _dyn_roof_penalty_for_low_n(best_bot, roof)
+    has_second = bool(snap.get("has_second", False))
+    gap_ok = (not has_second) or ((p_best - p_second) >= float(DYN_ROOF_GAP))
     pass_gate = (
         p_best >= roof_eff and
         p_best >= float(DYN_ROOF_FLOOR) and
-        (p_best - p_second) >= float(DYN_ROOF_GAP)
+        gap_ok
     )
 
     last_c = DYN_ROOF_STATE.get("last_candidate")
@@ -757,6 +773,7 @@ def dyn_roof_best_candidate() -> tuple[str | None, float, dict]:
 
     snap["roof_eff"] = float(roof_eff)
     snap["confirm_streak"] = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
+    snap["gap_required"] = float(DYN_ROOF_GAP) if has_second else 0.0
     snap["confirm_need"] = int(DYN_ROOF_CONFIRM_TICKS)
 
     if int(DYN_ROOF_STATE.get("confirm_streak", 0)) >= int(DYN_ROOF_CONFIRM_TICKS):
@@ -9691,32 +9708,60 @@ def _auditar_saturacion_features_bot(bot: str, lookback: int = 800) -> dict:
     return out
 
 
-def _auditar_saturacion_todos_bots(lookback: int = 800) -> dict:
-    """Resume saturación de señales por bot (no bloqueante)."""
-    out = {"bots": {}, "hot_bots": []}
+def _auditar_saturacion_todos_bots(lookback: int = 800, max_bots: int | None = None, budget_s: float | None = None) -> dict:
+    """Resume saturación de señales por bot con presupuesto de tiempo."""
+    out = {"bots": {}, "hot_bots": [], "partial": False}
+    t0 = time.time()
+    done = 0
     for b in BOT_NAMES:
+        if max_bots is not None and done >= int(max_bots):
+            out["partial"] = True
+            break
+        if budget_s is not None and (time.time() - t0) >= float(budget_s):
+            out["partial"] = True
+            break
+
         rep = _auditar_saturacion_features_bot(b, lookback=lookback)
         out["bots"][b] = rep
         dom = rep.get("dominance", {}) if isinstance(rep, dict) else {}
         hot = [k for k, v in dom.items() if isinstance(v, (int, float)) and v >= 0.90]
         if hot:
             out["hot_bots"].append({"bot": b, "features": hot, "dominance": dom})
+        done += 1
     return out
 
 
-def _auditar_calidad_incremental(path: str = "dataset_incremental.csv") -> dict:
-    """Chequeo liviano de calidad de labels para detectar n-meta inflado."""
-    out = {"ok": False, "rows": 0, "valid": 0, "invalid": 0, "path": path}
+def _auditar_calidad_incremental(path: str = "dataset_incremental.csv", sample_rows: int = 15000) -> dict:
+    """Chequeo de labels con muestreo de cola para no frenar el arranque."""
+    out = {"ok": False, "rows": 0, "valid": 0, "invalid": 0, "path": path, "sampled": 0}
     if not os.path.exists(path):
         return out
+
     try:
-        df = pd.read_csv(path, sep=",", encoding="utf-8", engine="python", on_bad_lines="skip")
+        total_rows = contar_filas_incremental()
+    except Exception:
+        total_rows = 0
+    out["rows"] = int(max(0, total_rows))
+
+    try:
+        want = max(1000, int(sample_rows))
+        skip = max(0, int(total_rows) - want)
+        df = pd.read_csv(
+            path,
+            sep=",",
+            encoding="utf-8",
+            usecols=lambda c: c == "result_bin",
+            skiprows=(range(1, skip + 1) if skip > 0 else None),
+            on_bad_lines="skip",
+            low_memory=True,
+        )
     except Exception:
         return out
+
     if df is None or df.empty:
         out["ok"] = True
         return out
-    out["rows"] = int(len(df))
+    out["sampled"] = int(len(df))
     if "result_bin" not in df.columns:
         out["invalid"] = int(len(df))
         out["ok"] = True
@@ -9743,7 +9788,11 @@ def _boot_health_check():
             msgs.append("⚠️ Sin permisos de escritura en cwd (no se podrán persistir logs/modelos).")
 
         # Señales congeladas: diagnóstico operativo rápido por bot (no bloqueante)
-        sat_all = _auditar_saturacion_todos_bots(lookback=900)
+        sat_all = _auditar_saturacion_todos_bots(
+            lookback=int(BOOT_SAT_LOOKBACK),
+            max_bots=int(BOOT_SAT_MAX_BOTS),
+            budget_s=float(max(0.6, BOOT_HEALTH_MAX_S * 0.5)),
+        )
         hot_bots = sat_all.get("hot_bots", []) if isinstance(sat_all, dict) else []
         for hb in hot_bots[:6]:
             bot = hb.get("bot", "?")
@@ -9754,13 +9803,17 @@ def _boot_health_check():
                 msgs.append(f"⚠️ Features saturadas en {bot}: " + ", ".join(hot))
 
         # Calidad de labels del incremental (si hay inválidas, la IA aprende con humo)
-        incq = _auditar_calidad_incremental("dataset_incremental.csv")
+        incq = _auditar_calidad_incremental("dataset_incremental.csv", sample_rows=12000)
         if incq.get("ok", False):
             rows = int(incq.get("rows", 0) or 0)
             invalid = int(incq.get("invalid", 0) or 0)
             valid = int(incq.get("valid", 0) or 0)
+            sampled = int(incq.get("sampled", 0) or 0)
             if rows > 0 and invalid > 0:
-                msgs.append(f"⚠️ Incremental con labels inválidas: valid={valid}, invalid={invalid}, total={rows}.")
+                msgs.append(f"⚠️ Incremental con labels inválidas: valid={valid}, invalid={invalid}, muestra={sampled}, total={rows}.")
+
+        if isinstance(sat_all, dict) and sat_all.get("partial", False):
+            msgs.append("ℹ️ Health-check parcial: auditoría de saturación recortada para no frenar el arranque.")
     except Exception as e:
         msgs.append(f"⚠️ Health-check parcial con error: {e}")
     return msgs
