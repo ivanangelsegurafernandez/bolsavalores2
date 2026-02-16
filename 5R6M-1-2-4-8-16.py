@@ -570,6 +570,12 @@ SALDO_BOOT_TIMEOUT_S = 4.0
 SALDO_REFRESH_TIMEOUT_S = 3.0
 WS_OPEN_TIMEOUT_S = 3.0
 WS_REPLY_TIMEOUT_S = 3.0
+
+# Arranque rápido de interfaz (sin comprometer lógica operativa)
+BOOT_FAST_UI = True
+BOOT_INIT_SYNC_TAIL_ROWS = 220     # en BOOT_04, sincroniza cola reciente en vez de historial completo
+BOOT_BACKFILL_ROWS = 500           # backfill inicial más liviano para entrar rápido al HUD
+BOOT_BG_TRAIN_DELAY_S = 0.8        # deja renderizar HUD y luego entrena en segundo plano
 MAX_CICLOS = len(MARTI_ESCALADO)
 huellas_usadas = {bot: set() for bot in BOT_NAMES}
 SNAPSHOT_FILAS = {bot: 0 for bot in BOT_NAMES}
@@ -9856,6 +9862,25 @@ def _boot_health_check():
     return msgs
 
 
+async def _warmup_ia_boot_background():
+    """Backfill+retrain en background para no bloquear entrada al HUD."""
+    try:
+        await asyncio.sleep(float(max(0.0, BOOT_BG_TRAIN_DELAY_S)))
+        try:
+            backfill_incremental(ultimas=int(max(200, BOOT_BACKFILL_ROWS)))
+        except Exception as e:
+            agregar_evento(f"⚠️ IA(bg): error en backfill inicial: {e}")
+        try:
+            maybe_retrain(force=True)
+        except Exception as e:
+            agregar_evento(f"⚠️ IA(bg): error en entrenamiento inicial: {e}")
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ IA(bg): warmup abortado: {e}")
+        except Exception:
+            pass
+
+
 async def main():
     global salir, pausado, reinicio_manual, SALDO_INICIAL
     global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA, REAL_OWNER_LOCK
@@ -9894,23 +9919,34 @@ async def main():
         if valor is not None:
             inicializar_saldo_real(valor)
 
-        set_etapa("BOOT_03", "Backfill y primer entrenamiento")
-        # Backfill IA desde los logs enriquecidos
-        try:
-            backfill_incremental(ultimas=1500)
-        except Exception as e:
-            agregar_evento(f"⚠️ IA: error en backfill inicial: {e}")
-
-        # Intentar un primer entrenamiento, si ya hay suficientes filas
-        try:
-            maybe_retrain(force=True)
-        except Exception as e:
-            agregar_evento(f"⚠️ IA: error al intentar entrenar tras el backfill: {e}")
+        set_etapa("BOOT_03", "Warmup IA inicial")
+        if BOOT_FAST_UI:
+            agregar_evento("⚡ BOOT rápido: backfill/retrain en segundo plano para abrir HUD antes.")
+            try:
+                asyncio.create_task(_warmup_ia_boot_background())
+            except Exception as e:
+                agregar_evento(f"⚠️ IA(bg): no se pudo lanzar warmup: {e}")
+        else:
+            # Modo completo (bloqueante)
+            try:
+                backfill_incremental(ultimas=int(max(200, BOOT_BACKFILL_ROWS)))
+            except Exception as e:
+                agregar_evento(f"⚠️ IA: error en backfill inicial: {e}")
+            try:
+                maybe_retrain(force=True)
+            except Exception as e:
+                agregar_evento(f"⚠️ IA: error al intentar entrenar tras el backfill: {e}")
 
         set_etapa("BOOT_04", "Sincronizando HUD con CSV")
-        # Pasada inicial para sincronizar HUD con CSV existentes
+        # Pasada inicial para sincronizar HUD con CSV existentes (cola reciente para acelerar arranque)
         token_actual_loop = "--"  # Dummy para carga inicial
         for bot in BOT_NAMES:
+            if BOOT_FAST_UI:
+                try:
+                    n_rows = contar_filas_csv(bot)
+                    SNAPSHOT_FILAS[bot] = max(0, int(n_rows) - int(max(40, BOOT_INIT_SYNC_TAIL_ROWS)))
+                except Exception:
+                    pass
             await cargar_datos_bot(bot, token_actual_loop)
 
         while True:
