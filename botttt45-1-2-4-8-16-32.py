@@ -135,10 +135,13 @@ ARCHIVO_CSV = f"registro_enriquecido_{NOMBRE_BOT}.csv"
 ARCHIVO_TOKEN = "token_actual.txt"  # Fuente única de verdad (coincide con 5R6M)
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
-MARTINGALA_DEMO = [1, 2, 4, 8, 16, 32]
-MARTINGALA_REAL = [1, 2, 4, 8, 16, 32]
+MARTINGALA_DEMO = [1, 2, 4, 8, 16]   # Alineado con 5R6M (5 ciclos)
+MARTINGALA_REAL = [1, 2, 4, 8, 16]   # Alineado con 5R6M (5 ciclos)
 VELAS = 20
 PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
+WS_OPEN_TRIES = 4
+WS_FAILSAFE_BATCH_LIMIT = 3
+WS_FAILSAFE_COOLDOWN_S = 12
 # ==================== VENTANA DE DECISIÓN IA ====================
 # Objetivo: dar tiempo al MAESTRO + humano para decidir pasar a REAL ANTES del BUY.
 # (0 para desactivar)
@@ -329,6 +332,14 @@ def sep_saldos():
 def sep_ciclo():
     """Separador discreto para inicio/fin de ciclos de martingala."""
     print(Fore.BLUE + "─" * 60)
+
+def print_ciclo_header(bot: str, modo_real: bool, ciclo: int, total: int, monto: float):
+    modo_txt = "REAL" if modo_real else "DEMO"
+    line = "=" * 80
+    print(Fore.CYAN + Style.BRIGHT + line)
+    print(Fore.CYAN + Style.BRIGHT + f"{bot.upper()} | MODO {modo_txt} | CICLO #{ciclo}/{total}".center(80))
+    print(Fore.CYAN + f"Stake objetivo: {float(monto):.2f} USD | Blindaje WS: ON".center(80))
+    print(Fore.CYAN + Style.BRIGHT + line)
 
 # <<< BLOQUE C
 
@@ -1913,7 +1924,7 @@ async def ejecutar_panel():
         except Exception:
             pass
 
-    async def _abrir_ws(token: str, tries: int = 4):
+    async def _abrir_ws(token: str, tries: int = WS_OPEN_TRIES):
         last = None
         for i in range(max(1, int(tries))):
             try:
@@ -1990,6 +2001,7 @@ async def ejecutar_panel():
             estado_bot["reinicios_consecutivos"] = 0
             N = len(martingala)
             indefinidos_consecutivos = 0
+            ws_reconexion_lote = 0
 
             while ciclo <= N and (not stop_event.is_set()):
 
@@ -2010,10 +2022,7 @@ async def ejecutar_panel():
                 modo_real = (current_token == TOKEN_REAL)
                 martingala = MARTINGALA_REAL if modo_real else MARTINGALA_DEMO
 
-                print(Fore.CYAN + Style.BRIGHT + "=" * 80)
-                titulo = f"{NOMBRE_BOT.upper()} | MODO {'REAL' if modo_real else 'DEMO'} | CICLO #{ciclo}/{len(martingala)}"
-                print(Fore.CYAN + Style.BRIGHT + titulo.center(80))
-                print(Fore.CYAN + Style.BRIGHT + "=" * 80)
+                print_ciclo_header(NOMBRE_BOT, modo_real, ciclo, len(martingala), monto)
 
                 # Salud WS (si buscar_estrategia detectó 1006 masivos)
                 if ws_reset_needed.is_set():
@@ -2021,9 +2030,16 @@ async def ejecutar_panel():
                     ws = await _abrir_ws(current_token)
                     _ws_fail_streak = 0
                     ws_reset_needed.clear()
+                    ws_reconexion_lote += 1
+                    if ws_reconexion_lote >= WS_FAILSAFE_BATCH_LIMIT:
+                        print(Fore.YELLOW + Style.BRIGHT + f"[BLINDAJE WS] {ws_reconexion_lote} reconexiones seguidas. Enfriando {WS_FAILSAFE_COOLDOWN_S}s para estabilizar red...")
+                        await asyncio.sleep(WS_FAILSAFE_COOLDOWN_S)
+                        ws_reconexion_lote = 0
                     if _print_once("ws-reopened", ttl=20):
                         print(Fore.CYAN + Style.BRIGHT + "WS reabierto por salud. Retomando MISMO ciclo.")
                     await asyncio.sleep(0.6 + random.uniform(0.0, 0.5))
+                else:
+                    ws_reconexion_lote = 0
 
                 # ========= BUSCAR SEÑAL =========
                 symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion = await buscar_estrategia(ws, ciclo, current_token)
