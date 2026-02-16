@@ -9270,6 +9270,44 @@ def _auditar_saturacion_features_bot(bot: str, lookback: int = 800) -> dict:
     return out
 
 
+def _auditar_saturacion_todos_bots(lookback: int = 800) -> dict:
+    """Resume saturación de señales por bot (no bloqueante)."""
+    out = {"bots": {}, "hot_bots": []}
+    for b in BOT_NAMES:
+        rep = _auditar_saturacion_features_bot(b, lookback=lookback)
+        out["bots"][b] = rep
+        dom = rep.get("dominance", {}) if isinstance(rep, dict) else {}
+        hot = [k for k, v in dom.items() if isinstance(v, (int, float)) and v >= 0.90]
+        if hot:
+            out["hot_bots"].append({"bot": b, "features": hot, "dominance": dom})
+    return out
+
+
+def _auditar_calidad_incremental(path: str = "dataset_incremental.csv") -> dict:
+    """Chequeo liviano de calidad de labels para detectar n-meta inflado."""
+    out = {"ok": False, "rows": 0, "valid": 0, "invalid": 0, "path": path}
+    if not os.path.exists(path):
+        return out
+    try:
+        df = pd.read_csv(path, sep=",", encoding="utf-8", engine="python", on_bad_lines="skip")
+    except Exception:
+        return out
+    if df is None or df.empty:
+        out["ok"] = True
+        return out
+    out["rows"] = int(len(df))
+    if "result_bin" not in df.columns:
+        out["invalid"] = int(len(df))
+        out["ok"] = True
+        return out
+    rb = pd.to_numeric(df["result_bin"], errors="coerce")
+    valid_mask = rb.isin([0, 1])
+    out["valid"] = int(valid_mask.sum())
+    out["invalid"] = int((~valid_mask).sum())
+    out["ok"] = True
+    return out
+
+
 def _boot_health_check():
     msgs = []
     try:
@@ -9283,13 +9321,25 @@ def _boot_health_check():
         if not os.access(os.getcwd(), os.W_OK):
             msgs.append("⚠️ Sin permisos de escritura en cwd (no se podrán persistir logs/modelos).")
 
-        # Señales congeladas: diagnóstico operativo rápido (no bloqueante)
-        sat = _auditar_saturacion_features_bot("fulll45", lookback=900)
-        if sat.get("ok", False) and int(sat.get("n", 0)) >= 120:
-            dom = sat.get("dominance", {}) if isinstance(sat.get("dominance", {}), dict) else {}
-            hot = [f"{k}={v*100:.1f}%" for k, v in dom.items() if isinstance(v, (int, float)) and v >= 0.90]
+        # Señales congeladas: diagnóstico operativo rápido por bot (no bloqueante)
+        sat_all = _auditar_saturacion_todos_bots(lookback=900)
+        hot_bots = sat_all.get("hot_bots", []) if isinstance(sat_all, dict) else []
+        for hb in hot_bots[:6]:
+            bot = hb.get("bot", "?")
+            dom = hb.get("dominance", {}) if isinstance(hb.get("dominance", {}), dict) else {}
+            feats = hb.get("features", []) if isinstance(hb.get("features", []), list) else []
+            hot = [f"{k}={float(dom.get(k, 0.0))*100:.1f}%" for k in feats]
             if hot:
-                msgs.append("⚠️ Features saturadas detectadas en fulll45 (últimos cierres): " + ", ".join(hot))
+                msgs.append(f"⚠️ Features saturadas en {bot}: " + ", ".join(hot))
+
+        # Calidad de labels del incremental (si hay inválidas, la IA aprende con humo)
+        incq = _auditar_calidad_incremental("dataset_incremental.csv")
+        if incq.get("ok", False):
+            rows = int(incq.get("rows", 0) or 0)
+            invalid = int(incq.get("invalid", 0) or 0)
+            valid = int(incq.get("valid", 0) or 0)
+            if rows > 0 and invalid > 0:
+                msgs.append(f"⚠️ Incremental con labels inválidas: valid={valid}, invalid={invalid}, total={rows}.")
     except Exception as e:
         msgs.append(f"⚠️ Health-check parcial con error: {e}")
     return msgs
