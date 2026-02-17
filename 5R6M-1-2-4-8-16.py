@@ -4751,6 +4751,7 @@ _IA_INPUT_DUP_INFO = {"signature": "", "ts": 0.0, "bots": []}
 _LAST_AUTO_RETRAIN_TICK = 0.0
 _IA_TRAIN_CLEAN_LOG = {"ts": 0.0, "sig": ""}
 _IA_NO_MODEL_LOG_TS = 0.0
+_IA_TIEBREAK_LOG_TS = 0.0
 
 def actualizar_prob_ia_bot(bot: str):
     """
@@ -4832,6 +4833,64 @@ def actualizar_prob_ia_bot(bot: str):
             estado_bots[bot]["ia_last_err"] = "UPD_ERR"
         except Exception:
             pass
+
+def _desempatar_probs_ia_por_bot() -> None:
+    """
+    Si varias Prob IA quedan prácticamente idénticas en un tick,
+    aplica un micro-ajuste por evidencia reciente del bot para romper empates.
+
+    Objetivo: evitar que todos los bots muestren exactamente el mismo valor (p. ej. 78.1%)
+    cuando el modelo queda temporalmente poco discriminante.
+    """
+    global _IA_TIEBREAK_LOG_TS
+    try:
+        live = []
+        for b in BOT_NAMES:
+            st = estado_bots.get(b, {})
+            p = st.get("prob_ia", None)
+            if not bool(st.get("ia_ready", False)):
+                continue
+            if not isinstance(p, (int, float)):
+                continue
+            pf = float(p)
+            if not np.isfinite(pf):
+                continue
+            live.append((b, pf))
+
+        if len(live) < 2:
+            return
+
+        probs = [x[1] for x in live]
+        spread = max(probs) - min(probs)
+        uniq4 = len({round(v, 4) for v in probs})
+
+        # Solo actuar en empate/casi empate real.
+        if spread >= 0.002 and uniq4 >= 3:
+            return
+
+        changed = []
+        for b, pb in live:
+            st = estado_bots.get(b, {})
+            g = int(st.get("ganancias", 0) or 0)
+            d = int(st.get("perdidas", 0) or 0)
+            # WR suavizado (Beta(1,1)) para no sobrecastigar n bajo.
+            wr = float((g + 1.0) / (g + d + 2.0))
+            edge = float(max(-0.5, min(0.5, wr - 0.5)))
+            # Micro-ajuste: máximo ±1pp.
+            delta = float(max(-0.01, min(0.01, edge * 0.02)))
+            p_new = float(max(0.0, min(1.0, pb + delta)))
+            estado_bots[b]["prob_ia"] = p_new
+            changed.append((b, pb, p_new))
+
+        now = time.time()
+        if changed and ((now - float(_IA_TIEBREAK_LOG_TS or 0.0)) >= 20.0):
+            _IA_TIEBREAK_LOG_TS = now
+            top = sorted(changed, key=lambda x: x[2], reverse=True)[:3]
+            txt = ", ".join([f"{b}:{o*100:.1f}→{n*100:.1f}%" for b, o, n in top])
+            agregar_evento(f"🧭 IA tiebreak: desempate leve por evidencia ({txt}).")
+    except Exception:
+        pass
+
 
 def actualizar_prob_ia_todos():
     """
@@ -4946,6 +5005,9 @@ def actualizar_prob_ia_todos():
             actualizar_prob_ia_bot(b)
         except Exception:
             pass
+
+    # 3.5) Desempate leve cuando el modelo deja todas las probs casi idénticas.
+    _desempatar_probs_ia_por_bot()
 
     # 4) Guardrail anti-clonado de probabilidades (síntoma downstream)
     try:
@@ -8499,8 +8561,8 @@ def mostrar_panel():
     else:
         print(Fore.CYAN + " IA ACIERTOS: sin cierres auditados todavía.")
 
-    # Contadores IA ≥70% por bot
-        # HISTÓRICO: señales IA (>=70%) que llegaron a ejecutarse y cerraron con resultado
+    # HISTÓRICO: señales IA que llegaron a ejecutarse y cerraron con resultado
+    # (se mantiene con IA_METRIC_THRESHOLD para comparabilidad histórica de auditoría)
     print(Fore.YELLOW + f" IA HISTÓRICO (señales cerradas, ≥{IA_METRIC_THRESHOLD*100:.0f}%):")
     has_hist = False
     for bot in BOT_NAMES:
@@ -8511,8 +8573,9 @@ def mostrar_panel():
     if not has_hist:
         print(Fore.YELLOW + f"   (Aún no hay operaciones cerradas con señal IA ≥{IA_METRIC_THRESHOLD*100:.0f}%.)")
 
-    # ACTUAL: quién está >= umbral operativo ahora mismo (tick actual)
-    print(Fore.YELLOW + f"\nIA SEÑALES ACTUALES (≥{IA_METRIC_THRESHOLD*100:.0f}% ahora):")
+    # ACTUAL: quién está >= umbral vigente para compuerta REAL en este tick.
+    umbral_actual_hud = float(_umbral_senal_actual_hud())
+    print(Fore.YELLOW + f"\nIA SEÑALES ACTUALES (≥{umbral_actual_hud*100:.0f}% ahora):")
     now = []
     for bot in BOT_NAMES:
         st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
@@ -8524,11 +8587,24 @@ def mostrar_panel():
 
         modo = (st.get("modo_ia") or "off").lower()
         p = st.get("prob_ia", None)
-        if modo != "off" and isinstance(p, (int, float)) and p >= float(IA_METRIC_THRESHOLD):
+        if modo != "off" and isinstance(p, (int, float)) and p >= float(umbral_actual_hud):
             now.append((bot, float(p)))
 
+    if bool(REAL_CLASSIC_GATE):
+        try:
+            roof_h = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
+            cbot_h = DYN_ROOF_STATE.get("confirm_bot")
+            cst_h = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
+            print(
+                Fore.YELLOW
+                + f" Compuerta REAL: roof={roof_h*100:.1f}% | floor={float(DYN_ROOF_FLOOR)*100:.1f}% | "
+                  f"confirm={cst_h}/{int(DYN_ROOF_CONFIRM_TICKS)}" + (f" ({cbot_h})" if cbot_h else "")
+            )
+        except Exception:
+            pass
+
     if not now:
-        print(Fore.YELLOW + f"(Ningún bot ≥{IA_METRIC_THRESHOLD*100:.0f}% en este tick.)")
+        print(Fore.YELLOW + f"(Ningún bot ≥{umbral_actual_hud*100:.0f}% en este tick.)")
     else:
         for b, p in sorted(now, key=lambda x: x[1], reverse=True):
             print(Fore.YELLOW + f"  {b}: {p*100:.1f}%")
@@ -9309,6 +9385,20 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         return out
     except Exception:
         return out
+
+
+def _umbral_senal_actual_hud() -> float:
+    """
+    Umbral visual para "IA SEÑALES ACTUALES".
+    - En compuerta clásica dinámica: el candado duro es FLOOR (70%).
+    - Fuera de ese modo: conserva IA_METRIC_THRESHOLD.
+    """
+    try:
+        if bool(REAL_CLASSIC_GATE):
+            return float(DYN_ROOF_FLOOR)
+        return float(IA_METRIC_THRESHOLD)
+    except Exception:
+        return float(IA_METRIC_THRESHOLD)
 
 # Cargar datos bot
 # Cargar datos bot
