@@ -9181,6 +9181,7 @@ DYN_ROOF_STATE = {
     "melt_batches_applied": 0,
     "confirm_bot": None,
     "confirm_streak": 0,
+    "last_open_tick": 0,
 }
 
 
@@ -9203,6 +9204,7 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         "confirm_streak": int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0),
         "allow_real": False,
         "n_best": 0,
+        "new_open": False,
     }
     try:
         DYN_ROOF_STATE["tick"] = int(DYN_ROOF_STATE.get("tick", 0) or 0) + 1
@@ -9286,6 +9288,12 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         DYN_ROOF_STATE["confirm_bot"] = confirm_bot
         DYN_ROOF_STATE["confirm_streak"] = int(confirm_streak)
 
+        allow_real = bool(pass_gate and (confirm_streak >= int(DYN_ROOF_CONFIRM_TICKS)))
+        last_open_tick = int(DYN_ROOF_STATE.get("last_open_tick", 0) or 0)
+        new_open = bool(allow_real and (last_open_tick != tick_now))
+        if new_open:
+            DYN_ROOF_STATE["last_open_tick"] = int(tick_now)
+
         out.update({
             "best_bot": best_bot,
             "p_best": float(p_best),
@@ -9294,8 +9302,9 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             "roof": float(roof),
             "roof_eff": float(roof_eff),
             "confirm_streak": int(confirm_streak),
-            "allow_real": bool(pass_gate and (confirm_streak >= int(DYN_ROOF_CONFIRM_TICKS))),
+            "allow_real": bool(allow_real),
             "n_best": int(n_best),
+            "new_open": bool(new_open),
         })
         return out
     except Exception:
@@ -9957,6 +9966,15 @@ async def main():
                         if REAL_CLASSIC_GATE:
                             umbral_ia_real = float(IA_ACTIVACION_REAL_THR)
                             dyn_gate = _actualizar_compuerta_techo_dinamico()
+                            if isinstance(dyn_gate, dict) and bool(dyn_gate.get("new_open", False)):
+                                agregar_evento(
+                                    "🧭 Compuerta REAL abierta: "
+                                    f"{dyn_gate.get('best_bot','--')} | "
+                                    f"p_best={float(dyn_gate.get('p_best',0.0))*100:.1f}% "
+                                    f"roof_eff={float(dyn_gate.get('roof_eff',0.0))*100:.1f}% "
+                                    f"gap_ok={'sí' if dyn_gate.get('gap_ok') else 'no'} "
+                                    f"confirm={int(dyn_gate.get('confirm_streak',0))}/{int(DYN_ROOF_CONFIRM_TICKS)}"
+                                )
                         else:
                             umbral_ia_real = max(float(REAL_TRIGGER_MIN), float(get_umbral_real_calibrado()))
                             dyn_gate = None
