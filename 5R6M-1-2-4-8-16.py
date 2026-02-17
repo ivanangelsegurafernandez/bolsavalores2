@@ -763,7 +763,14 @@ def dyn_roof_snapshot() -> dict:
 
 
 def dyn_roof_best_candidate() -> tuple[str | None, float, dict]:
-    """Compuerta REAL con confirmación 2 ticks seguidos y GAP vs 2º."""
+    """
+    "TECHO DINÁMICO + COMPUERTA REAL"
+    Reglas de autorización REAL:
+    - p_best >= roof_eff(bot)  (roof + penalización si n<30)
+    - p_best >= floor
+    - GAP vs segundo bot (si existe; si no, no aplica)
+    - confirmación por ticks consecutivos del MISMO bot
+    """
     snap = dyn_roof_snapshot()
     best_bot = snap["best_bot"]
     p_best = float(snap["best_prob"])
@@ -3822,28 +3829,37 @@ def _to_int_epoch(v) -> int | None:
 
 def _tail_rows_dict(path: str, max_lines: int = 1200) -> list[dict]:
     """
-    Lee SOLO el header + últimas N líneas para no reventar rendimiento con CSV enormes.
-    Devuelve lista de dicts (puede ser vacía).
+    Tail real de CSV: intenta leer sólo el tramo final por bytes.
+    Evita recorrer archivos completos cuando el histórico crece.
     """
     if not os.path.exists(path):
         return []
-    for enc in ("utf-8", "latin-1", "windows-1252"):
-        try:
-            from collections import deque as _dq
-            with open(path, "r", encoding=enc, errors="replace", newline="") as f:
-                header = f.readline()
-                if not header:
-                    return []
-                dq = _dq(f, maxlen=int(max_lines))
-            lines = [header] + list(dq)
-            reader = csv.DictReader(lines)
-            out = []
-            for r in reader:
-                if isinstance(r, dict) and r:
-                    out.append(r)
-            return out
-        except Exception:
-            continue
+
+    try:
+        n = int(max(1, max_lines))
+    except Exception:
+        n = 1200
+
+    # Presupuesto dinámico: suficiente para N filas típicas sin escanear todo el archivo.
+    approx_per_row = 420
+    max_bytes = int(max(CSV_TAIL_MAX_BYTES, min(8_000_000, n * approx_per_row)))
+
+    try:
+        rows = _tail_rows_csv(path, n_rows=n, max_bytes=max_bytes)
+        if rows:
+            return rows
+    except Exception:
+        pass
+
+    # Fallback defensivo: intentar nuevamente con presupuesto más amplio,
+    # pero SIEMPRE por bytes (nunca recorrer archivo completo).
+    try:
+        rows = _tail_rows_csv(path, n_rows=n, max_bytes=int(min(12_000_000, max_bytes * 2)))
+        if rows:
+            return rows
+    except Exception:
+        pass
+
     return []
 
 def ia_audit_get_last_pre_epoch(bot: str) -> int | None:
@@ -4117,6 +4133,53 @@ def log_ia_close(
         return False
 
 IA_AUDIT_LAST_CLOSE_EPOCH = {b: None for b in BOT_NAMES}
+IA_AUDIT_SNAPSHOT_BYTES = {b: 0 for b in BOT_NAMES}
+
+
+def _read_audit_rows_incremental(bot: str, tail_lines: int = 2000) -> tuple[list[dict], int]:
+    """Lectura incremental por bytes para auditoría de cierres (sin releer históricos enormes)."""
+    path = f"registro_enriquecido_{bot}.csv"
+    prev = int(IA_AUDIT_SNAPSHOT_BYTES.get(bot, 0) or 0)
+
+    if not os.path.exists(path):
+        return [], prev
+
+    try:
+        size = int(os.path.getsize(path))
+    except Exception:
+        return [], prev
+
+    # Primer escaneo o rotación/recorte: tomar sólo cola limitada.
+    if prev <= 0 or prev > size:
+        tail_n = int(max(80, min(int(tail_lines or 2000), int(BOOT_BACKFILL_ROWS))))
+        return _tail_rows_dict(path, max_lines=tail_n), size
+
+    if size == prev:
+        return [], size
+
+    try:
+        read_from = int(prev)
+        read_to = int(size)
+        if (read_to - read_from) > int(CSV_APPEND_MAX_BYTES):
+            read_from = max(read_from, read_to - int(CSV_APPEND_MAX_BYTES))
+
+        with open(path, "rb") as f:
+            f.seek(read_from, os.SEEK_SET)
+            raw = f.read(max(0, read_to - read_from))
+
+        txt = raw.decode("utf-8", errors="replace")
+        if read_from > 0 and txt:
+            pos_nl = txt.find("\n")
+            txt = txt[pos_nl + 1:] if pos_nl >= 0 else ""
+
+        header = _leer_header_csv(path)
+        rows = _parse_rows_from_text(txt, header)
+        return rows, size
+    except Exception:
+        # Fallback rápido: cola acotada; nunca archivo completo.
+        tail_n = int(max(80, min(int(tail_lines or 2000), int(BOOT_BACKFILL_ROWS))))
+        return _tail_rows_dict(path, max_lines=tail_n), size
+
 
 def ia_audit_scan_close(bot: str, tail_lines: int = 2000, max_events: int = 6):
     """
@@ -4130,8 +4193,8 @@ def ia_audit_scan_close(bot: str, tail_lines: int = 2000, max_events: int = 6):
     except Exception:
         last = None
 
-    ruta = f"registro_enriquecido_{bot}.csv"
-    rows = _tail_rows_dict(ruta, max_lines=int(tail_lines))
+    rows, new_pos = _read_audit_rows_incremental(bot, tail_lines=int(tail_lines))
+    IA_AUDIT_SNAPSHOT_BYTES[bot] = int(max(0, new_pos))
     if not rows:
         return
 
@@ -5053,8 +5116,9 @@ def actualizar_prob_ia_todos():
     for b in BOT_NAMES:
         try:
             last = IA_AUDIT_LAST_CLOSE_EPOCH.get(b, None)
-            tail_lines = 25000 if last is None else 6000
-            max_events = 60 if last is None else 15
+            # Arranque liviano: evita atasco por backfill masivo en CSV grandes.
+            tail_lines = int(BOOT_BACKFILL_ROWS) if last is None else 1200
+            max_events = 20 if last is None else 12
             ia_audit_scan_close(b, tail_lines=tail_lines, max_events=max_events)
         except Exception:
             pass
