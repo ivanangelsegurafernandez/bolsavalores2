@@ -9152,6 +9152,164 @@ REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme
 REAL_STUCK_FORCE_RELEASE_S = 90  # segundos extra tras aviso para liberar REAL si no hay cierre
 REAL_TRIGGER_MIN = IA_ACTIVACION_REAL_THR  # regla operativa: entrada REAL desde 85% o mayor
 
+# =========================================================
+# TECHO DINÁMICO + COMPUERTA REAL (anti-bug de activación baja)
+# =========================================================
+# Lote de actualización del maestro (ticks de lectura IA)
+DYN_ROOF_BATCH_TICKS = 15
+# Paciencia dura antes de empezar a bajar el techo (4 lotes = 60 ticks)
+DYN_ROOF_HOLD_BATCHES = 4
+DYN_ROOF_HOLD_TICKS = DYN_ROOF_BATCH_TICKS * DYN_ROOF_HOLD_BATCHES
+# Derretido lento del techo: -0.5pp por lote tras la paciencia
+DYN_ROOF_STEP = 0.005
+# Piso duro para REAL
+DYN_ROOF_FLOOR = 0.70
+# Ventaja mínima del mejor vs segundo mejor
+DYN_ROOF_GAP = 0.03
+# Confirmación mínima (ticks consecutivos del MISMO bot)
+DYN_ROOF_CONFIRM_TICKS = 2
+# Tolerancia para considerar "tocado" el techo (near-roof)
+DYN_ROOF_NEAR_TOL = 0.005
+# Penalización por evidencia corta (n < 30): requiere +2pp al techo
+DYN_ROOF_LOW_N_MIN = 30
+DYN_ROOF_LOW_N_PENALTY = 0.02
+
+DYN_ROOF_STATE = {
+    "tick": 0,
+    "roof": float(max(DYN_ROOF_FLOOR, IA_OBJETIVO_REAL_THR)),
+    "last_touch_tick": 0,
+    "melt_batches_applied": 0,
+    "confirm_bot": None,
+    "confirm_streak": 0,
+    "last_open_tick": 0,
+}
+
+
+def _actualizar_compuerta_techo_dinamico() -> dict:
+    """
+    Actualiza el techo dinámico y evalúa la compuerta REAL del mejor bot del tick.
+
+    Reglas clave:
+    - roof sube rápido por máximos (roof=max(roof, p_best)).
+    - roof baja lento tras paciencia (hold), por lotes de batch ticks.
+    - compuerta REAL exige: piso duro, techo efectivo, GAP y confirmación doble.
+    """
+    out = {
+        "best_bot": None,
+        "p_best": 0.0,
+        "p_second": 0.0,
+        "gap_ok": False,
+        "roof": float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR)),
+        "roof_eff": float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR)),
+        "confirm_streak": int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0),
+        "allow_real": False,
+        "n_best": 0,
+        "new_open": False,
+    }
+    try:
+        DYN_ROOF_STATE["tick"] = int(DYN_ROOF_STATE.get("tick", 0) or 0) + 1
+        tick_now = int(DYN_ROOF_STATE["tick"])
+
+        live = []
+        for b in BOT_NAMES:
+            try:
+                if str(estado_bots.get(b, {}).get("modo_ia", "off")).lower() == "off":
+                    continue
+                if not ia_prob_valida(b, max_age_s=12.0):
+                    continue
+                p = float(estado_bots.get(b, {}).get("prob_ia", 0.0) or 0.0)
+                n = int(estado_bots.get(b, {}).get("tamano_muestra", 0) or 0)
+                if np.isfinite(p):
+                    live.append((b, p, n))
+            except Exception:
+                continue
+
+        if not live:
+            DYN_ROOF_STATE["confirm_bot"] = None
+            DYN_ROOF_STATE["confirm_streak"] = 0
+            return out
+
+        live.sort(key=lambda x: x[1], reverse=True)
+        best_bot, p_best, n_best = live[0]
+        p_second = float(live[1][1]) if len(live) > 1 else 0.0
+
+        roof = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
+        last_touch = int(DYN_ROOF_STATE.get("last_touch_tick", 0) or 0)
+
+        # Regla A: tocar/romper techo resetea paciencia; romperlo además lo eleva.
+        near_touch = float(p_best) >= float(roof - DYN_ROOF_NEAR_TOL)
+        if near_touch:
+            roof = max(float(roof), float(p_best))
+            DYN_ROOF_STATE["roof"] = float(roof)
+            DYN_ROOF_STATE["last_touch_tick"] = int(tick_now)
+            DYN_ROOF_STATE["melt_batches_applied"] = 0
+            last_touch = int(tick_now)
+        else:
+            # Regla B: derretido lento solo después de hold y por lotes.
+            elapsed = int(tick_now - last_touch)
+            if elapsed > int(DYN_ROOF_HOLD_TICKS):
+                batches_now = int((elapsed - int(DYN_ROOF_HOLD_TICKS)) // int(DYN_ROOF_BATCH_TICKS))
+                batches_applied = int(DYN_ROOF_STATE.get("melt_batches_applied", 0) or 0)
+                if batches_now > batches_applied:
+                    delta_batches = int(batches_now - batches_applied)
+                    roof = max(float(DYN_ROOF_FLOOR), float(roof - (delta_batches * DYN_ROOF_STEP)))
+                    DYN_ROOF_STATE["roof"] = float(roof)
+                    DYN_ROOF_STATE["melt_batches_applied"] = int(batches_now)
+
+        roof = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
+        penalty = float(DYN_ROOF_LOW_N_PENALTY) if int(n_best) < int(DYN_ROOF_LOW_N_MIN) else 0.0
+        roof_eff = float(roof + penalty)
+
+        # GAP con fallback: si solo hay 1 bot válido, no se bloquea por GAP.
+        if len(live) <= 1:
+            gap_ok = True
+        else:
+            gap_ok = (float(p_best) - float(p_second)) >= float(DYN_ROOF_GAP)
+
+        pass_gate = (
+            (float(p_best) >= float(roof_eff))
+            and (float(p_best) >= float(DYN_ROOF_FLOOR))
+            and bool(gap_ok)
+        )
+
+        # Confirmación: 2 ticks consecutivos del mismo bot.
+        confirm_bot = DYN_ROOF_STATE.get("confirm_bot")
+        confirm_streak = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
+        if pass_gate:
+            if confirm_bot == best_bot:
+                confirm_streak += 1
+            else:
+                confirm_bot = best_bot
+                confirm_streak = 1
+        else:
+            confirm_bot = None
+            confirm_streak = 0
+
+        DYN_ROOF_STATE["confirm_bot"] = confirm_bot
+        DYN_ROOF_STATE["confirm_streak"] = int(confirm_streak)
+
+        allow_real = bool(pass_gate and (confirm_streak >= int(DYN_ROOF_CONFIRM_TICKS)))
+        last_open_tick = int(DYN_ROOF_STATE.get("last_open_tick", 0) or 0)
+        new_open = bool(allow_real and (last_open_tick != tick_now))
+        if new_open:
+            DYN_ROOF_STATE["last_open_tick"] = int(tick_now)
+
+        out.update({
+            "best_bot": best_bot,
+            "p_best": float(p_best),
+            "p_second": float(p_second),
+            "gap_ok": bool(gap_ok),
+            "roof": float(roof),
+            "roof_eff": float(roof_eff),
+            "confirm_streak": int(confirm_streak),
+            "allow_real": bool(allow_real),
+            "n_best": int(n_best),
+            "new_open": bool(new_open),
+        })
+        return out
+    except Exception:
+        return out
+
 # Cargar datos bot
 # Cargar datos bot
 async def cargar_datos_bot(bot, token_actual):
@@ -9807,8 +9965,19 @@ async def main():
                         # usando los valores altos observados recientemente.
                         if REAL_CLASSIC_GATE:
                             umbral_ia_real = float(IA_ACTIVACION_REAL_THR)
+                            dyn_gate = _actualizar_compuerta_techo_dinamico()
+                            if isinstance(dyn_gate, dict) and bool(dyn_gate.get("new_open", False)):
+                                agregar_evento(
+                                    "🧭 Compuerta REAL abierta: "
+                                    f"{dyn_gate.get('best_bot','--')} | "
+                                    f"p_best={float(dyn_gate.get('p_best',0.0))*100:.1f}% "
+                                    f"roof_eff={float(dyn_gate.get('roof_eff',0.0))*100:.1f}% "
+                                    f"gap_ok={'sí' if dyn_gate.get('gap_ok') else 'no'} "
+                                    f"confirm={int(dyn_gate.get('confirm_streak',0))}/{int(DYN_ROOF_CONFIRM_TICKS)}"
+                                )
                         else:
                             umbral_ia_real = max(float(REAL_TRIGGER_MIN), float(get_umbral_real_calibrado()))
+                            dyn_gate = None
 
                         # Bloqueo por saldo (no abras ventanas si no puedes ejecutar ciclo1)
                         try:
@@ -9833,12 +10002,20 @@ async def main():
                                     if not isinstance(p, (int, float)):
                                         continue
                                     # Primer filtro suave: evitar basura por debajo del piso operativo.
-                                    if float(p) < float(IA_ACTIVACION_REAL_THR):
+                                    piso_operativo = float(DYN_ROOF_FLOOR) if REAL_CLASSIC_GATE else float(IA_ACTIVACION_REAL_THR)
+                                    if float(p) < float(piso_operativo):
                                         continue
 
-                                    # Modo clásico: si hay 85% o más, el bot es elegible sin gates extra.
-                                    # Mantiene el lock de un único bot REAL a la vez en el flujo superior.
+                                    # Modo clásico reforzado: compuerta dinámica anti-bug.
+                                    # Solo el mejor bot del tick puede pasar, con piso duro + GAP + confirmación doble.
                                     if REAL_CLASSIC_GATE:
+                                        if not isinstance(dyn_gate, dict):
+                                            continue
+                                        if b != dyn_gate.get("best_bot"):
+                                            continue
+                                        if not bool(dyn_gate.get("allow_real", False)):
+                                            continue
+
                                         regime_score = _score_regimen_contexto(_ultimo_contexto_operativo_bot(b))
                                         p_post = float(p)
                                         score_final = float(p_post)
