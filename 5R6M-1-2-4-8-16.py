@@ -358,6 +358,9 @@ FEATURE_MAX_PROD = 4
 FEATURE_MIN_AUC_DELTA = 0.015      # aporte mínimo (|AUC_uni - 0.5|)
 FEATURE_MAX_DOMINANCE_GATE = 0.965 # evita casi-constantes
 FEATURE_DYNAMIC_SELECTION = True
+# Durante warmup evitamos selección agresiva para no colapsar a 2-4 features.
+FEATURE_FREEZE_CORE_DURING_WARMUP = True
+FEATURE_FREEZE_CORE_MIN_ROWS = TRAIN_WARMUP_MIN_ROWS
 
 # Meta objetivo (calidad real en señales fuertes)
 IA_TARGET_PRECISION = 0.70
@@ -7276,14 +7279,25 @@ def _seleccionar_features_calidad(X_df: pd.DataFrame, y_arr: np.ndarray, feats: 
                     y_late = y[cut:]
                     x_late = s.values[cut:]
 
-                    if len(y_early) >= 20 and len(np.unique(y_early)) == 2:
+                    early_has_2c = bool(len(y_early) >= 20 and len(np.unique(y_early)) == 2)
+                    late_has_2c = bool(len(y_late) >= 20 and len(np.unique(y_late)) == 2)
+
+                    if early_has_2c:
                         auc_early = float(roc_auc_score(y_early, x_early))
-                    if len(y_late) >= 20 and len(np.unique(y_late)) == 2:
+                    if late_has_2c:
                         auc_late = float(roc_auc_score(y_late, x_late))
 
                     d1 = abs(auc_early - 0.5)
                     d2 = abs(auc_late - 0.5)
-                    stable = (d1 >= float(FEATURE_MIN_AUC_DELTA) * 0.60 and d2 >= float(FEATURE_MIN_AUC_DELTA) * 0.60)
+
+                    # Regla anti-colapso: si una mitad no tiene ambas clases,
+                    # no penalizar estabilidad por ese lado (muestra insuficiente).
+                    if early_has_2c and late_has_2c:
+                        stable = (d1 >= float(FEATURE_MIN_AUC_DELTA) * 0.60 and d2 >= float(FEATURE_MIN_AUC_DELTA) * 0.60)
+                    elif early_has_2c or late_has_2c:
+                        stable = (auc_delta >= float(FEATURE_MIN_AUC_DELTA))
+                    else:
+                        stable = True
             except Exception:
                 pass
 
@@ -7696,7 +7710,8 @@ def maybe_retrain(force: bool = False):
                 pass
 
         # 4.3) Selección dinámica de calidad (features_prod vs shadow)
-        if FEATURE_DYNAMIC_SELECTION:
+        freeze_core_warmup = bool(FEATURE_FREEZE_CORE_DURING_WARMUP) and (len(X) < int(FEATURE_FREEZE_CORE_MIN_ROWS))
+        if FEATURE_DYNAMIC_SELECTION and (not freeze_core_warmup):
             try:
                 feats_quality, quality_report = _seleccionar_features_calidad(X, y, feats_used)
                 feats_quality = [c for c in feats_quality if c in X.columns]
@@ -7710,6 +7725,17 @@ def maybe_retrain(force: bool = False):
                     if quality_report:
                         txt = ", ".join([f"{k}:{r}" for k, r in quality_report[:8]])
                         agregar_evento(f"🎯 IA quality-gate: prod={feats_used} | {txt}")
+            except Exception:
+                pass
+        elif freeze_core_warmup:
+            try:
+                keep_core = [f for f in FEATURE_NAMES_CORE_13 if f in X.columns]
+                if keep_core:
+                    X = X[keep_core].copy()
+                    feats_used = list(keep_core)
+                    globals()["FEATURE_NAMES_PROD"] = list(feats_used)
+                    globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f not in feats_used]
+                    agregar_evento(f"🧱 IA warmup: freeze CORE ({len(feats_used)} feats) hasta n>={int(FEATURE_FREEZE_CORE_MIN_ROWS)}.")
             except Exception:
                 pass
 
@@ -7815,7 +7841,8 @@ def maybe_retrain(force: bool = False):
         y_test  = np.asarray(y)[i2:i3]
 
         # 8.1) Selección dinámica de calidad (SIN fuga: solo con TRAIN_BASE)
-        if FEATURE_DYNAMIC_SELECTION:
+        freeze_core_warmup_train = bool(FEATURE_FREEZE_CORE_DURING_WARMUP) and (n_total < int(FEATURE_FREEZE_CORE_MIN_ROWS))
+        if FEATURE_DYNAMIC_SELECTION and (not freeze_core_warmup_train):
             try:
                 feats_quality, quality_report = _seleccionar_features_calidad(X_train, y_train, feats_used)
                 feats_quality = [c for c in feats_quality if c in X_train.columns]
@@ -7832,6 +7859,19 @@ def maybe_retrain(force: bool = False):
                     if quality_report:
                         txt = ", ".join([f"{k}:{r}" for k, r in quality_report[:8]])
                         agregar_evento(f"🎯 IA quality-gate(train): prod={feats_used} | {txt}")
+            except Exception:
+                pass
+        elif freeze_core_warmup_train:
+            try:
+                keep_core = [f for f in FEATURE_NAMES_CORE_13 if f in X_train.columns]
+                if keep_core:
+                    X_train = X_train[keep_core].copy()
+                    if X_calib is not None and len(X_calib) > 0:
+                        X_calib = X_calib[keep_core].copy()
+                    X_test = X_test[keep_core].copy()
+                    feats_used = list(keep_core)
+                    globals()["FEATURE_NAMES_PROD"] = list(feats_used)
+                    globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f not in feats_used]
             except Exception:
                 pass
 
