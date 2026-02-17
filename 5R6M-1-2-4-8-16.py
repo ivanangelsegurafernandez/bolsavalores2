@@ -3572,6 +3572,44 @@ def _ajustar_prob_operativa(prob: float | None) -> float | None:
     except Exception:
         return prob
 
+
+def _ajustar_prob_por_evidencia_bot(bot: str, prob: float | None) -> float | None:
+    """
+    Ajuste leve por evidencia específica del bot para mejorar discriminación
+    cuando el modelo queda plano entre varios bots.
+
+    - Usa WR suavizado (Beta(1,1)) del bot (ganancias/pérdidas en memoria).
+    - Si el input del bot fue marcado como redundante en el tick, reduce el efecto.
+    - Ajuste acotado: máximo ±2pp para no romper calibración global.
+    """
+    try:
+        if not isinstance(prob, (int, float)):
+            return prob
+        p = max(0.0, min(1.0, float(prob)))
+
+        st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
+        g = int(st.get("ganancias", 0) or 0)
+        d = int(st.get("perdidas", 0) or 0)
+        n = max(0, g + d)
+
+        # WR suavizado para no sobre-reaccionar con n bajo.
+        wr = float((g + 1.0) / (n + 2.0))
+        edge = float(max(-0.20, min(0.20, wr - 0.50)))
+
+        # Peso crece con muestra, saturando en n=120.
+        w = min(1.0, float(n) / 120.0)
+        delta = float(edge * w * 0.10)  # máx teórico ±2pp
+
+        # Si la entrada fue redundante este tick, hacemos el ajuste más conservador.
+        if bool(st.get("ia_input_redundante", False)):
+            delta *= 0.35
+
+        p2 = float(max(0.0, min(1.0, p + delta)))
+        return p2
+    except Exception:
+        return prob
+
+
 def _ensure_ia_signals_log():
     """Crea el archivo con header si no existe."""
     if os.path.exists(IA_SIGNALS_LOG):
@@ -4782,6 +4820,7 @@ def actualizar_prob_ia_bot(bot: str):
         if p is not None:
             p = _aplicar_orientacion_prob(float(p))
             p = _ajustar_prob_operativa(float(p))
+            p = _ajustar_prob_por_evidencia_bot(bot, float(p))
             estado_bots[bot]["prob_ia"] = float(p)
             estado_bots[bot]["ia_ready"] = True
             estado_bots[bot]["ia_last_err"] = None
@@ -5059,6 +5098,7 @@ def actualizar_prob_ia_bots_tick():
             # Guardar raw (modelo calibrado) y métricas SOLO como diagnóstico (NO ajustar prob_ia)
             prob_raw = float(prob)
             prob_raw = float(_aplicar_orientacion_prob(prob_raw))
+            prob_raw = float(_ajustar_prob_por_evidencia_bot(bot, prob_raw))
             estado_bots[bot]["prob_ia_raw"] = prob_raw
 
             # Auditoría/calibración: calcular UNA sola vez por tick (evita leer CSV 6 veces)
@@ -10086,6 +10126,10 @@ async def main():
                                     if modo_b == "off":
                                         continue
                                     if not ia_prob_valida(b, max_age_s=12.0):
+                                        continue
+                                    # Evitar promover señales ambiguas cuando el input del bot
+                                    # fue marcado como redundante en este tick.
+                                    if bool(estado_bots.get(b, {}).get("ia_input_redundante", False)):
                                         continue
 
                                     p = estado_bots[b].get("prob_ia", None)
