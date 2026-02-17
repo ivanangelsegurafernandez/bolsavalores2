@@ -1,40 +1,40 @@
 {
-  "trained_at": "2026-02-15 05:03:34",
-  "rows_total": 676,
-  "rows_train": 440,
-  "rows_calib": 101,
-  "rows_test": 135,
-  "pos": 322,
-  "neg": 354,
-  "auc": 0.5656645569620253,
-  "f1": 0.4186046511627907,
-  "brier": 0.24625995725993152,
-  "cv_auc": 0.5478621608527131,
-  "threshold": 0.55,
+  "trained_at": "2026-02-17 12:24:37",
+  "rows_total": 143,
+  "rows_train": 23,
+  "rows_calib": 80,
+  "rows_test": 40,
+  "pos": 86,
+  "neg": 57,
+  "auc": 0.6515151515151514,
+  "f1": 0.7096774193548387,
+  "brier": 0.240912622812043,
+  "cv_auc": null,
+  "threshold": 0.5,
   "reliable": false,
   "calibration": "sigmoid",
-  "calib_precision_at_thr": 0.75,
-  "calib_n_at_thr": 16,
-  "test_precision_at_thr": 0.6,
-  "test_n_at_thr": 30,
+  "calib_precision_at_thr": 0.6,
+  "calib_n_at_thr": 80,
+  "test_precision_at_thr": 0.55,
+  "test_n_at_thr": 40,
   "feature_names": [
     "racha_actual"
   ],
   "label_col": "result_bin",
   "feature_health": {
     "rsi_9": {
-      "nunique": 581,
-      "dominance": 0.005917159763313609,
+      "nunique": 142,
+      "dominance": 0.013986013986013986,
       "status": "OK"
     },
     "rsi_14": {
-      "nunique": 579,
-      "dominance": 0.005917159763313609,
+      "nunique": 140,
+      "dominance": 0.013986013986013986,
       "status": "OK"
     },
     "sma_5": {
-      "nunique": 615,
-      "dominance": 0.004437869822485207,
+      "nunique": 142,
+      "dominance": 0.013986013986013986,
       "status": "OK"
     },
     "sma_spread": {
@@ -43,65 +43,57 @@
       "status": "ROTA"
     },
     "cruce_sma": {
-      "nunique": 616,
-      "dominance": 0.004437869822485207,
+      "nunique": 142,
+      "dominance": 0.013986013986013986,
       "status": "OK"
     },
     "breakout": {
-      "nunique": 616,
-      "dominance": 0.004437869822485207,
+      "nunique": 142,
+      "dominance": 0.013986013986013986,
       "status": "OK"
     },
     "rsi_reversion": {
-      "nunique": 589,
-      "dominance": 0.0073964497041420114,
+      "nunique": 140,
+      "dominance": 0.013986013986013986,
       "status": "OK"
     },
     "racha_actual": {
-      "nunique": 14,
-      "dominance": 0.2618343195266272,
+      "nunique": 13,
+      "dominance": 0.2517482517482518,
       "status": "OK"
     },
     "payout": {
-      "nunique": 10,
-      "dominance": 0.5414201183431953,
+      "nunique": 4,
+      "dominance": 0.6713286713286714,
       "status": "OK"
     },
     "puntaje_estrategia": {
-      "nunique": 640,
-      "dominance": 0.004437869822485207,
+      "nunique": 143,
+      "dominance": 0.006993006993006993,
       "status": "OK"
     },
     "volatilidad": {
-      "nunique": 1,
-      "dominance": 1.0,
-      "status": "ROTA"
+      "nunique": 142,
+      "dominance": 0.013986013986013986,
+      "status": "OK"
     },
     "es_rebote": {
-      "nunique": 616,
-      "dominance": 0.004437869822485207,
+      "nunique": 141,
+      "dominance": 0.013986013986013986,
       "status": "OK"
     },
     "hora_bucket": {
-      "nunique": 1,
-      "dominance": 1.0,
-      "status": "ROTA"
+      "nunique": 7,
+      "dominance": 0.2727272727272727,
+      "status": "OK"
     }
   },
   "dropped_features": [
     {
       "feature": "sma_spread",
       "reason": "ROTA:nunique=1"
-    },
-    {
-      "feature": "volatilidad",
-      "reason": "ROTA:nunique=1"
-    },
-    {
-      "feature": "hora_bucket",
-      "reason": "ROTA:nunique=1"
     }
   ],
-  "n_samples": 676,
-  "n": 676
+  "n_samples": 143,
+  "n": 143
 }
