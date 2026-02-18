@@ -181,6 +181,9 @@ ORACULO_DELTA_PRE = 0.05
 
 # Umbral visual/alerta: alineado al mínimo operativo REAL
 IA_VERDE_THR = IA_ACTIVACION_REAL_THR
+IA_SUCESO_LOOKBACK = 16
+IA_SUCESO_DELTA_MIN = 0.035
+IA_SUCESO_EVENTO_MIN = 0.55
 AUTO_REAL_THR = IA_OBJETIVO_REAL_THR      # techo: mantener foco en acercarse al 70%
 AUTO_REAL_THR_MIN = IA_ACTIVACION_REAL_THR  # piso: permitir activación REAL desde 85%
 AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
@@ -359,7 +362,7 @@ FEATURE_NAMES_INTERACCIONES = [
 # Gobernanza calidad>cantidad: entrenar solo con features que realmente aporten.
 FEATURE_ALWAYS_KEEP = ["racha_actual"]
 FEATURE_MAX_PROD = 4
-FEATURE_SET_PROD_WARMUP = ["racha_actual", "payout", "rsi_14", "breakout"]
+FEATURE_SET_PROD_WARMUP = ["racha_actual", "payout", "breakout", "rsi_14", "es_rebote", "puntaje_estrategia"]
 FEATURE_SET_CORE_EXT = [
     "racha_actual", "payout", "rsi_14", "breakout",
     "rsi_9", "cruce_sma", "rsi_reversion", "es_rebote",
@@ -5298,6 +5301,45 @@ def actualizar_prob_ia_todos():
     except Exception:
         pass
 
+def _detectar_suceso_prob_bot(bot: str, p_now: float | None) -> tuple[bool, float]:
+    """Detecta salto relativo de probabilidad vs su línea base reciente."""
+    try:
+        if not isinstance(p_now, (int, float)):
+            return False, 0.0
+        p = float(max(0.0, min(1.0, p_now)))
+        st = estado_bots.get(bot, {})
+        hist = st.get("ia_prob_hist_raw", None)
+        if not isinstance(hist, list):
+            hist = []
+        hist.append(p)
+        max_len = int(max(6, IA_SUCESO_LOOKBACK * 3))
+        if len(hist) > max_len:
+            hist = hist[-max_len:]
+        st["ia_prob_hist_raw"] = hist
+        estado_bots[bot] = st
+
+        look = int(max(4, IA_SUCESO_LOOKBACK))
+        prev = hist[:-1][-look:]
+        if len(prev) < 4:
+            return False, 0.0
+        base = float(np.median(np.asarray(prev, dtype=float)))
+        delta = float(p - base)
+        return bool(delta >= float(IA_SUCESO_DELTA_MIN)), delta
+    except Exception:
+        return False, 0.0
+
+
+def _evento_contexto_activo(bot: str) -> bool:
+    """True si hay evento de mercado razonable para validar un suceso relativo."""
+    try:
+        row = leer_ultima_fila_features_para_pred(bot) or {}
+        brk = float(row.get("breakout", 0.0) or 0.0)
+        reb = float(row.get("es_rebote", 0.0) or 0.0)
+        return bool(max(brk, reb) >= float(IA_SUCESO_EVENTO_MIN))
+    except Exception:
+        return False
+
+
 def actualizar_prob_ia_bots_tick():
     """
     Actualiza estado_bots[*].prob_ia con la prob REAL (aunque sea < 0.70).
@@ -5363,9 +5405,23 @@ def actualizar_prob_ia_bots_tick():
         # IMPORTANTE: aquí SOLO marcamos "pendiente" (HUD / elegibilidad).
         # El LOG de auditoría (ia_signals_log) se escribe cuando HAY orden/operación real.
         try:
-            if prob is not None and float(prob) >= float(IA_VERDE_THR):
-                estado_bots[bot]["ia_senal_pendiente"] = True
-                estado_bots[bot]["ia_prob_senal"] = float(prob)
+            if prob is not None:
+                p_live = float(prob)
+                abs_gate = bool(p_live >= float(IA_VERDE_THR))
+                suc_ok, suc_delta = _detectar_suceso_prob_bot(bot, p_live)
+                evt_ok = _evento_contexto_activo(bot)
+                red_ok = not bool(estado_bots.get(bot, {}).get("ia_input_redundante", False))
+                suceso_gate = bool(suc_ok and evt_ok and red_ok)
+
+                estado_bots[bot]["ia_suceso_delta"] = float(suc_delta)
+                estado_bots[bot]["ia_suceso_ok"] = bool(suceso_gate)
+
+                if abs_gate or suceso_gate:
+                    estado_bots[bot]["ia_senal_pendiente"] = True
+                    estado_bots[bot]["ia_prob_senal"] = float(p_live)
+                else:
+                    estado_bots[bot]["ia_senal_pendiente"] = False
+                    estado_bots[bot]["ia_prob_senal"] = None
             else:
                 estado_bots[bot]["ia_senal_pendiente"] = False
                 estado_bots[bot]["ia_prob_senal"] = None
