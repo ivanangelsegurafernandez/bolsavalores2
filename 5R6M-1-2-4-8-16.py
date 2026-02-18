@@ -242,6 +242,7 @@ EVIDENCE_CACHE_TTL_S = 20.0
 DIAG_PATH = "diagnostico_pipeline_ia.json"
 ORIENTATION_RECHECK_S = 90.0
 ORIENTATION_FLIP_MIN_DELTA = 0.03
+ORIENTATION_MIN_CLOSED = 80
 HARD_GATE_MAX_GAP_HIGH_BINS = 0.10
 HARD_GATE_MIN_N_FOR_HIGH_THR = 200
 INCREMENTAL_DUP_SCAN_LINES = 6000
@@ -2518,6 +2519,39 @@ def calcular_hora_features(row_dict: dict) -> tuple[float, float]:
     return hb, hm
 
 
+def _calcular_sma_spread_robusto(row_dict: dict | None) -> float | None:
+    """Calcula sma_spread continuo con fallback de denominador para evitar constantes artificiales."""
+    try:
+        d = dict(row_dict or {})
+        sma5 = _safe_float_local(d.get("sma_5"))
+        sma20 = _safe_float_local(d.get("sma_20"))
+        px = None
+        for k in ("close", "cierre", "price", "precio"):
+            v = _safe_float_local(d.get(k))
+            if v is not None and math.isfinite(float(v)) and abs(float(v)) > 1e-12:
+                px = float(v)
+                break
+
+        if sma5 is None and sma20 is None:
+            return None
+
+        if sma5 is None:
+            sma5 = sma20
+        if sma20 is None:
+            sma20 = sma5
+
+        denom = abs(float(sma20))
+        if (not math.isfinite(denom)) or denom <= 1e-12:
+            denom = abs(float(px)) if px is not None else 1e-9
+
+        spread = abs(float(sma5) - float(sma20)) / max(denom, 1e-9)
+        if not math.isfinite(spread):
+            return None
+        return float(max(0.0, min(float(spread), 5.0)))
+    except Exception:
+        return None
+
+
 def _calcular_eventos_pretrade_desde_historial(df: pd.DataFrame, idx_ref: int, row_base: dict | None = None) -> dict:
     """
     Calcula señales de evento (no estado) para PRE_TRADE usando solo pasado <= idx_ref.
@@ -2548,8 +2582,9 @@ def _calcular_eventos_pretrade_desde_historial(df: pd.DataFrame, idx_ref: int, r
 
         # Intensidad de spread SMA (continua)
         if sma5 is not None and sma20 is not None:
-            base = max(abs(float(sma20)), 1e-9)
-            out["sma_spread"] = float(max(0.0, min(abs(float(sma5) - float(sma20)) / base, 5.0)))
+            sp = _calcular_sma_spread_robusto({"sma_5": sma5, "sma_20": sma20, "close": row_now.get("close", None)})
+            if sp is not None:
+                out["sma_spread"] = float(sp)
 
         # cruce_sma como evento (cambio de signo)
         cruce_evt = 0.0
@@ -3104,8 +3139,9 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
             sma5 = _safe_float_local(row_dict_full.get("sma_5"))
             sma20 = _safe_float_local(row_dict_full.get("sma_20"))
             if sma5 is not None and sma20 is not None:
-                base = max(abs(float(sma20)), 1e-9)
-                row_dict_full["sma_spread"] = float(max(0.0, min(abs(float(sma5) - float(sma20)) / base, 5.0)))
+                sp = _calcular_sma_spread_robusto({"sma_5": sma5, "sma_20": sma20, "close": row_dict_full.get("close", None)})
+                if sp is not None:
+                    row_dict_full["sma_spread"] = float(sp)
         except Exception:
             pass
 
@@ -3573,6 +3609,7 @@ def _leer_gate_desde_diagnostico(ttl_s: float = 60.0) -> dict:
 def _resolver_orientacion_runtime(ttl_s: float = ORIENTATION_RECHECK_S) -> dict:
     """
     Determina si conviene invertir p->1-p con evidencia cerrada (mismo set p vs 1-p).
+    Regla conservadora: jamás invertir por heurística de model_meta con n bajo.
     """
     global _IA_ORIENTATION_CACHE
     now = time.time()
@@ -3593,22 +3630,13 @@ def _resolver_orientacion_runtime(ttl_s: float = ORIENTATION_RECHECK_S) -> dict:
             m = y.isin([0, 1]) & p.notna()
             yy = y[m].astype(int)
             pp = p[m].astype(float)
-            if len(yy) >= 30 and len(set(yy.tolist())) >= 2:
+            n = int(len(yy))
+            if n >= int(ORIENTATION_MIN_CLOSED) and len(set(yy.tolist())) >= 2:
                 auc = float(roc_auc_score(yy, pp))
                 auc_flip = float(roc_auc_score(yy, 1.0 - pp))
                 if (auc_flip - auc) >= float(ORIENTATION_FLIP_MIN_DELTA):
                     inv = True
                 source = "signals"
-
-        # fallback al meta si no hay evidencia suficiente
-        if source == "none":
-            meta = leer_model_meta() or {}
-            a = float(meta.get("auc", 0.0) or 0.0)
-            if a > 0:
-                auc = a
-                auc_flip = 1.0 - a
-                inv = (auc_flip - auc) >= float(ORIENTATION_FLIP_MIN_DELTA)
-                source = "model_meta"
 
         _IA_ORIENTATION_CACHE = {"ts": now, "invert": bool(inv), "auc": auc, "auc_flip": auc_flip, "source": source}
         return dict(_IA_ORIENTATION_CACHE)
@@ -4920,7 +4948,9 @@ def predecir_prob_ia_bot(bot: str) -> tuple[float | None, str | None]:
         # 6) Predict proba
         try:
             proba = model.predict_proba(X_scaled)
-            p = float(proba[0][1])
+            p = _extraer_probabilidad_clase_positiva(model, proba, default_idx=1)
+            if p is None:
+                return None, "PRED_FAIL:BAD_PROBA"
         except Exception as e:
             return None, f"PRED_FAIL:{type(e).__name__}"
 
@@ -4937,6 +4967,36 @@ def predecir_prob_ia_bot(bot: str) -> tuple[float | None, str | None]:
 
     except Exception as e:
         return None, f"IA_ERR:{type(e).__name__}"
+
+def _extraer_probabilidad_clase_positiva(model, proba_arr, default_idx: int = 1) -> float | None:
+    """Extrae P(y=1) respetando model.classes_ cuando exista."""
+    try:
+        arr = np.asarray(proba_arr, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        if arr.ndim != 2 or arr.shape[0] < 1 or arr.shape[1] < 1:
+            return None
+
+        idx = int(default_idx)
+        try:
+            classes = list(getattr(model, "classes_", []) or [])
+            if classes:
+                # Forzamos búsqueda de etiqueta positiva 1 (ganancia)
+                if 1 in classes:
+                    idx = int(classes.index(1))
+                elif "1" in classes:
+                    idx = int(classes.index("1"))
+        except Exception:
+            pass
+
+        idx = max(0, min(int(idx), int(arr.shape[1]) - 1))
+        p = float(arr[0][idx])
+        if not np.isfinite(p):
+            return None
+        return float(max(0.0, min(1.0, p)))
+    except Exception:
+        return None
+
 
 # --- Updater: NO fuerces prob_ia=0 cuando falla ---
 IA_PRED_TTL_S = 180.0          # si falla por mucho tiempo, recién se limpia a None
@@ -6681,8 +6741,8 @@ def oraculo_predict(fila_dict, modelo, scaler, meta, bot_name=""):
             try:
                 sma5 = float(fila_dict.get("sma_5", 0.0) or 0.0)
                 sma20 = float(fila_dict.get("sma_20", 0.0) or 0.0)
-                base = max(abs(sma20), 1e-9)
-                fila_dict["sma_spread"] = float(max(0.0, min(abs(sma5 - sma20) / base, 5.0)))
+                sp = _calcular_sma_spread_robusto({"sma_5": sma5, "sma_20": sma20, "close": fila_dict.get("close", None)})
+                fila_dict["sma_spread"] = float(sp) if sp is not None else 0.0
             except Exception:
                 fila_dict["sma_spread"] = 0.0
         if "racha_x_rebote" in feature_names and "racha_x_rebote" not in fila_dict:
@@ -7579,6 +7639,7 @@ def _dataset_quality_gate_for_training(X_df: pd.DataFrame, feats: list[str]):
 def _fingerprint_features_row(row: dict, feats: list[str] | None = None, decimals: int = INPUT_DUP_FINGERPRINT_DECIMALS) -> str:
     """Huella estable por bot/tick para detectar inputs duplicados entre bots."""
     base_feats = list(feats) if feats else list(INCREMENTAL_FEATURES_V2)
+    base_feats = _features_vivas_para_redundancia(base_feats)
     parts = []
     for k in base_feats:
         v = (row or {}).get(k, 0.0)
@@ -7592,9 +7653,33 @@ def _fingerprint_features_row(row: dict, feats: list[str] | None = None, decimal
     return "|".join(parts)
 
 
+def _features_vivas_para_redundancia(base_feats: list[str]) -> list[str]:
+    """Usa solo features activas del modelo y evita columnas marcadas ROTA."""
+    try:
+        meta = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+        model_feats = meta.get("feature_names", []) if isinstance(meta, dict) else []
+        health = meta.get("feature_health", {}) if isinstance(meta, dict) else {}
+
+        if not isinstance(model_feats, list) or not model_feats:
+            return list(base_feats)
+
+        out = []
+        for c in base_feats:
+            if c not in model_feats:
+                continue
+            st = str((health.get(c, {}) if isinstance(health, dict) else {}).get("status", "OK") or "OK").upper()
+            if st == "ROTA":
+                continue
+            out.append(c)
+        return out if out else list(base_feats)
+    except Exception:
+        return list(base_feats)
+
+
 def _diagnosticar_inputs_duplicados(rows_by_bot: dict, dup_bots: list[str], feats: list[str] | None = None) -> dict:
     """Diagnóstico compacto de columnas idénticas/variables en grupos duplicados."""
     base_feats = list(feats) if feats else list(INCREMENTAL_FEATURES_V2)
+    base_feats = _features_vivas_para_redundancia(base_feats)
     same_cols, diff_cols = [], []
 
     for c in base_feats:
@@ -7610,7 +7695,8 @@ def _diagnosticar_inputs_duplicados(rows_by_bot: dict, dup_bots: list[str], feat
         else:
             diff_cols.append(c)
 
-    expected_diff = [c for c in ("payout", "rsi_9", "rsi_14", "sma_5", "sma_spread") if c in base_feats]
+    expected_pref = ["payout", "rsi_9", "rsi_14", "sma_5", "sma_spread", "volatilidad", "hora_bucket"]
+    expected_diff = [c for c in expected_pref if c in base_feats]
     source_info = {}
     for b in dup_bots:
         rv = rows_by_bot.get(b, {}) or {}
@@ -9347,8 +9433,12 @@ def backfill_incremental(ultimas=500):
             for _, r in sub.iterrows():
                 # base mínima
                 fila = {k: float(r[k]) for k in req}
-                base = max(abs(float(r.get("sma_20", 0.0) or 0.0)), 1e-9)
-                fila["sma_spread"] = float(max(0.0, min(abs(float(r.get("sma_5", 0.0) or 0.0) - float(r.get("sma_20", 0.0) or 0.0)) / base, 5.0)))
+                sp = _calcular_sma_spread_robusto({
+                    "sma_5": r.get("sma_5", 0.0),
+                    "sma_20": r.get("sma_20", 0.0),
+                    "close": r.get("close", r.get("cierre", None)),
+                })
+                fila["sma_spread"] = float(sp) if sp is not None else 0.0
 
                 # Diccionario completo para helpers enriquecidos
                 row_dict_full = r.to_dict()
