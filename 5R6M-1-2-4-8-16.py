@@ -187,6 +187,9 @@ IA_SUCESO_EVENTO_MIN = 0.55
 IA_SENSOR_DOM_HOT = 0.95
 IA_SENSOR_MIN_HOT_FEATS = 3
 IA_REDUNDANCY_SCORE_PENALTY = 0.03
+IA_SENSOR_PLANO_SCORE_PENALTY = 0.04
+IA_SUCESO_SCORE_WEIGHT = 0.08
+IA_OBSERVE_THR = 0.70
 AUTO_REAL_THR = IA_OBJETIVO_REAL_THR      # techo: mantener foco en acercarse al 70%
 AUTO_REAL_THR_MIN = IA_ACTIVACION_REAL_THR  # piso: permitir activación REAL desde 85%
 AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
@@ -5282,6 +5285,8 @@ def actualizar_prob_ia_todos():
     for b in BOT_NAMES:
         try:
             actualizar_prob_ia_bot(b)
+            p_live = estado_bots.get(b, {}).get("prob_ia", None)
+            _actualizar_estado_suceso_bot(b, p_live if isinstance(p_live, (int, float)) else None)
         except Exception:
             pass
 
@@ -5399,101 +5404,52 @@ def _evento_contexto_activo(bot: str) -> bool:
         return False
 
 
-def actualizar_prob_ia_bots_tick():
-    """
-    Actualiza estado_bots[*].prob_ia con la prob REAL (aunque sea < 0.70).
-    La regla ≥0.70 se usa SOLO para “señal”, no para pintar prob.
-    """
-    now = time.time()
+def _actualizar_estado_suceso_bot(bot: str, prob_live: float | None) -> None:
+    """Ruta canónica única para actualizar telemetría/señal por suceso."""
+    try:
+        if prob_live is None or not isinstance(prob_live, (int, float)):
+            estado_bots[bot]["ia_senal_pendiente"] = False
+            estado_bots[bot]["ia_prob_senal"] = None
+            estado_bots[bot]["ia_suceso_ok"] = False
+            estado_bots[bot]["ia_suceso_delta"] = 0.0
+            estado_bots[bot]["ia_suceso_idx"] = 0.0
+            return
 
-    for bot in BOT_NAMES:
-        # 10A: cierre automático de auditoría si hubo trade cerrado nuevo
+        p_live = float(prob_live)
+        abs_gate = bool(p_live >= float(IA_VERDE_THR))
+        suc_ok, suc_delta = _detectar_suceso_prob_bot(bot, p_live)
+        evt_ok = _evento_contexto_activo(bot)
+        redundante_tick = bool(estado_bots.get(bot, {}).get("ia_input_redundante", False))
+        suceso_gate = bool(suc_ok and evt_ok)
+
+        suceso_idx = _calcular_indice_suceso_bot(bot, p_live=p_live, suceso_delta=suc_delta)
+        sensor_plano, sensor_meta = _sensor_plano_bot(bot, lookback=80)
+
+        estado_bots[bot]["ia_suceso_delta"] = float(suc_delta)
+        estado_bots[bot]["ia_suceso_ok"] = bool(suceso_gate)
+        estado_bots[bot]["ia_suceso_idx"] = float(suceso_idx)
+        estado_bots[bot]["ia_suceso_redundante"] = bool(redundante_tick)
+        estado_bots[bot]["ia_sensor_plano"] = bool(sensor_plano)
+        estado_bots[bot]["ia_sensor_hot_feats"] = list(sensor_meta.get("hot", []))
+
+        if abs_gate or suceso_gate:
+            estado_bots[bot]["ia_senal_pendiente"] = True
+            estado_bots[bot]["ia_prob_senal"] = float(p_live)
+        else:
+            estado_bots[bot]["ia_senal_pendiente"] = False
+            estado_bots[bot]["ia_prob_senal"] = None
+    except Exception:
         try:
-            ia_audit_scan_close(bot)
+            estado_bots[bot]["ia_senal_pendiente"] = False
+            estado_bots[bot]["ia_prob_senal"] = None
         except Exception:
             pass
-        prob, err = predecir_prob_ia_bot(bot)
-
-        if prob is None:
-            estado_bots[bot]["ia_ready"] = False
-            estado_bots[bot]["ia_last_err"] = err
-            # NO fuerces a 0 por estética: deja el último prob si había, o queda 0 si nunca hubo
-            # (pero el HUD lo mostrará como -- con el parche #3)
-            # 🔒 evita “señal fantasma” si antes estaba en True
-            estado_bots[bot]["ia_senal_pendiente"] = False
-            estado_bots[bot]["ia_prob_senal"] = None
-        else:
-            estado_bots[bot]["ia_ready"] = True
-            estado_bots[bot]["ia_last_err"] = None
-
-            # Modo IA coherente con meta
-            meta_local = _ORACLE_CACHE.get("meta") or leer_model_meta()
-            estado_bots[bot]["modo_ia"] = "CONFIABLE" if bool((meta_local or {}).get("reliable", False)) else "MODELO"
-
-            # Guardar raw (modelo calibrado) y métricas SOLO como diagnóstico (NO ajustar prob_ia)
-            prob_raw = float(prob)
-            prob_raw = float(_aplicar_orientacion_prob(prob_raw))
-            prob_raw = float(_ajustar_prob_por_evidencia_bot(bot, prob_raw))
-            prob_raw = float(_cap_prob_por_madurez(prob_raw, bot=bot))
-            estado_bots[bot]["prob_ia_raw"] = prob_raw
-
-            # Auditoría/calibración: calcular UNA sola vez por tick (evita leer CSV 6 veces)
-            if "_stats_cal_global" not in locals():
-                _stats_cal_global = auditar_calibracion_seniales_reales(min_prob=0.70) or {}
-
-            por_bot = _stats_cal_global.get("por_bot", {}) if isinstance(_stats_cal_global, dict) else {}
-            stats_cal = por_bot.get(bot, {}) if isinstance(por_bot, dict) else {}
-
-            estado_bots[bot]["cal_n"] = int(stats_cal.get("n", 0) or 0)
-            estado_bots[bot]["cal_win_rate"] = stats_cal.get("win_rate", None)
-            estado_bots[bot]["cal_avg_pred"] = stats_cal.get("avg_pred", None)
-            estado_bots[bot]["cal_infl_pp"] = stats_cal.get("inflacion_pp", None)
-
-            # Guardamos el factor sugerido SOLO para diagnóstico (no se aplica a prob)
-            estado_bots[bot]["cal_factor_sugerido"] = float(stats_cal.get("factor", 1.0) or 1.0)
-            estado_bots[bot]["cal_brier"] = stats_cal.get("brier", None)
-            estado_bots[bot]["cal_ece"] = stats_cal.get("ece", None)
 
 
-            # FIX CLAVE: prob_ia ES la prob real del modelo (calibrada), sin multiplicadores
-            estado_bots[bot]["cal_factor"] = 1.0
-            estado_bots[bot]["prob_ia"] = prob_raw
-            estado_bots[bot]["ia_last_prob_ts"] = now
+def actualizar_prob_ia_bots_tick():
+    """Compat: ruta única de actualización IA (delegada)."""
+    actualizar_prob_ia_todos()
 
-        # Señal SOLO si supera el umbral verde
-        # IMPORTANTE: aquí SOLO marcamos "pendiente" (HUD / elegibilidad).
-        # El LOG de auditoría (ia_signals_log) se escribe cuando HAY orden/operación real.
-        try:
-            if prob is not None:
-                p_live = float(prob)
-                abs_gate = bool(p_live >= float(IA_VERDE_THR))
-                suc_ok, suc_delta = _detectar_suceso_prob_bot(bot, p_live)
-                evt_ok = _evento_contexto_activo(bot)
-                redundante_tick = bool(estado_bots.get(bot, {}).get("ia_input_redundante", False))
-                suceso_gate = bool(suc_ok and evt_ok)
-
-                suceso_idx = _calcular_indice_suceso_bot(bot, p_live=p_live, suceso_delta=suc_delta)
-                sensor_plano, sensor_meta = _sensor_plano_bot(bot, lookback=80)
-
-                estado_bots[bot]["ia_suceso_delta"] = float(suc_delta)
-                estado_bots[bot]["ia_suceso_ok"] = bool(suceso_gate)
-                estado_bots[bot]["ia_suceso_idx"] = float(suceso_idx)
-                estado_bots[bot]["ia_suceso_redundante"] = bool(redundante_tick)
-                estado_bots[bot]["ia_sensor_plano"] = bool(sensor_plano)
-                estado_bots[bot]["ia_sensor_hot_feats"] = list(sensor_meta.get("hot", []))
-
-                if abs_gate or suceso_gate:
-                    estado_bots[bot]["ia_senal_pendiente"] = True
-                    estado_bots[bot]["ia_prob_senal"] = float(p_live)
-                else:
-                    estado_bots[bot]["ia_senal_pendiente"] = False
-                    estado_bots[bot]["ia_prob_senal"] = None
-            else:
-                estado_bots[bot]["ia_senal_pendiente"] = False
-                estado_bots[bot]["ia_prob_senal"] = None
-        except Exception:
-            estado_bots[bot]["ia_senal_pendiente"] = False
-            estado_bots[bot]["ia_prob_senal"] = None
 
 def ia_prob_valida(bot: str, max_age_s: float = 10.0) -> bool:
     """
@@ -8732,14 +8688,18 @@ def mostrar_panel():
     try:
         bots_con_prob = 0
         umbral_real_vigente = float(get_umbral_real_calibrado())
-        bots_75 = 0
+        umbral_obs = float(globals().get("IA_OBSERVE_THR", 0.70) or 0.70)
+        bots_real = 0
+        bots_obs = 0
         mejor = None
         for b in BOT_NAMES:
             pb = estado_bots.get(b, {}).get("prob_ia")
             if isinstance(pb, (int, float)):
                 bots_con_prob += 1
                 if float(pb) >= float(umbral_real_vigente):
-                    bots_75 += 1
+                    bots_real += 1
+                if float(pb) >= float(umbral_obs):
+                    bots_obs += 1
                 if (mejor is None) or (float(pb) > mejor[1]):
                     mejor = (b, float(pb))
         owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
@@ -8748,7 +8708,7 @@ def mostrar_panel():
         suceso_vals = [float(estado_bots.get(b, {}).get("ia_suceso_idx", 0.0) or 0.0) for b in BOT_NAMES]
         best_suceso = max(suceso_vals) if suceso_vals else 0.0
         sensores_planos = sum(1 for b in BOT_NAMES if bool(estado_bots.get(b, {}).get("ia_sensor_plano", False)))
-        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥{umbral_real_vigente*100:.1f}%: {bots_75} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} | Token: {owner_txt}")
+        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | OBS≥{umbral_obs*100:.1f}%: {bots_obs} | REAL≥{umbral_real_vigente*100:.1f}%: {bots_real} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} | Token: {owner_txt}")
 
         if owner not in (None, "none") and mejor is not None and owner != mejor[0]:
             print(padding + Fore.YELLOW + f"⛓️ Token bloqueado en {owner}; mejor IA actual es {mejor[0]} ({mejor[1]*100:.1f}%).")
@@ -10764,13 +10724,18 @@ async def main():
 
                                     # 7) Ranking final (Capa B + régimen + evidencia)
                                     evidence_score = min(1.0, p_post + min(0.15, ev_n / 400.0))
+                                    suceso_idx_b = float(estado_bots.get(b, {}).get("ia_suceso_idx", 0.0) or 0.0) / 100.0
+                                    sensor_plano_b = bool(estado_bots.get(b, {}).get("ia_sensor_plano", False))
                                     score_final = (
                                         float(REGIME_GATE_WEIGHT_PROB) * float(p_post)
                                         + float(REGIME_GATE_WEIGHT_REGIME) * float(regime_score)
                                         + float(REGIME_GATE_WEIGHT_EVIDENCE) * float(evidence_score)
+                                        + float(IA_SUCESO_SCORE_WEIGHT) * float(max(0.0, min(1.0, suceso_idx_b)))
                                     )
                                     if redundante_tick:
                                         score_final = float(score_final) - float(IA_REDUNDANCY_SCORE_PENALTY)
+                                    if sensor_plano_b:
+                                        score_final = float(score_final) - float(IA_SENSOR_PLANO_SCORE_PENALTY)
 
                                     estado_bots[b]["ia_regime_score"] = float(regime_score)
                                     estado_bots[b]["ia_evidence_n"] = int(ev_n)
