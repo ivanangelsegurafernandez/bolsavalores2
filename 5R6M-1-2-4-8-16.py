@@ -2518,6 +2518,91 @@ def calcular_hora_features(row_dict: dict) -> tuple[float, float]:
     return hb, hm
 
 
+def _calcular_eventos_pretrade_desde_historial(df: pd.DataFrame, idx_ref: int, row_base: dict | None = None) -> dict:
+    """
+    Calcula señales de evento (no estado) para PRE_TRADE usando solo pasado <= idx_ref.
+    - cruce_sma: 1 solo si cambia el signo de (sma_5 - sma_20) entre vela previa y actual.
+    - breakout: 1 solo si el close rompe max/min de ventana previa (sin incluir vela actual).
+    - sma_spread: intensidad continua del spread SMA (0..5) para conservar información.
+    """
+    out = dict(row_base or {})
+    try:
+        if df is None or df.empty:
+            return out
+
+        if idx_ref not in df.index:
+            return out
+
+        pos = int(df.index.get_indexer([idx_ref])[0])
+        if pos < 0:
+            return out
+
+        d = df.copy()
+        for c in ("sma_5", "sma_20", "close", "cierre", "price", "precio", "high", "maximo", "low", "minimo"):
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+
+        row_now = d.iloc[pos]
+        sma5 = _safe_float_local(row_now.get("sma_5"))
+        sma20 = _safe_float_local(row_now.get("sma_20"))
+
+        # Intensidad de spread SMA (continua)
+        if sma5 is not None and sma20 is not None:
+            base = max(abs(float(sma20)), 1e-9)
+            out["sma_spread"] = float(max(0.0, min(abs(float(sma5) - float(sma20)) / base, 5.0)))
+
+        # cruce_sma como evento (cambio de signo)
+        cruce_evt = 0.0
+        if pos >= 1 and sma5 is not None and sma20 is not None:
+            row_prev = d.iloc[pos - 1]
+            sma5_prev = _safe_float_local(row_prev.get("sma_5"))
+            sma20_prev = _safe_float_local(row_prev.get("sma_20"))
+            if sma5_prev is not None and sma20_prev is not None:
+                prev_diff = float(sma5_prev) - float(sma20_prev)
+                now_diff = float(sma5) - float(sma20)
+                if (prev_diff < 0.0 <= now_diff) or (prev_diff > 0.0 >= now_diff):
+                    cruce_evt = 1.0
+        out["cruce_sma"] = cruce_evt
+
+        # breakout como evento (rompe máximo/mínimo de ventana previa)
+        breakout_evt = 0.0
+        lookback = 20
+        if pos >= 2:
+            i0 = max(0, pos - lookback)
+            hist = d.iloc[i0:pos]
+            if not hist.empty:
+                close_now = None
+                for cc in ("close", "cierre", "price", "precio"):
+                    v = _safe_float_local(row_now.get(cc))
+                    if v is not None:
+                        close_now = float(v)
+                        break
+
+                hi_prev = None
+                lo_prev = None
+                for hc in ("high", "maximo", "close", "cierre"):
+                    if hc in hist.columns:
+                        s = pd.to_numeric(hist[hc], errors="coerce").dropna()
+                        if len(s) > 0:
+                            hi_prev = float(s.max())
+                            break
+                for lc in ("low", "minimo", "close", "cierre"):
+                    if lc in hist.columns:
+                        s = pd.to_numeric(hist[lc], errors="coerce").dropna()
+                        if len(s) > 0:
+                            lo_prev = float(s.min())
+                            break
+
+                if close_now is not None and hi_prev is not None and lo_prev is not None:
+                    if (close_now > hi_prev) or (close_now < lo_prev):
+                        breakout_evt = 1.0
+        out["breakout"] = breakout_evt
+
+    except Exception:
+        return out
+    return out
+
+
 def enriquecer_features_evento(row_dict: dict):
     """Convierte señales binarias en intensidades continuas para reducir dominancia."""
     d = dict(row_dict or {})
@@ -2844,6 +2929,13 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
             return None, None
 
         row_dict_full = canonicalizar_campos_bot_maestro(pre_row)
+
+        # Señales de evento reales (anti-saturación): usar solo historial pasado hasta PRE_TRADE.
+        try:
+            if pre_idx is not None:
+                row_dict_full = _calcular_eventos_pretrade_desde_historial(df, int(pre_idx), row_base=row_dict_full)
+        except Exception:
+            pass
 
         # 3) Asegurar monto (stake) desde PRE; si falta, tomar del cierre (monto NO filtra label)
         if ("monto" not in row_dict_full) or (row_dict_full.get("monto") in (None, "", 0, 0.0)):
@@ -4523,12 +4615,14 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
 
     # 1) preferir PRE_TRADE/PENDIENTE
     pre = None
+    pre_idx = None
     if has_trade_status:
         df_pre = df[df["trade_status_norm"].isin(["PENDIENTE", "PRE_TRADE", "OPEN", "ABIERTO"])].copy()
         # evitar “filas basura”: no usar cierres
         if "resultado_norm" in df_pre.columns:
             df_pre = df_pre[~df_pre["resultado_norm"].isin(["GANANCIA", "PÉRDIDA"])].copy()
         if not df_pre.empty:
+            pre_idx = int(df_pre.index[-1])
             pre = df_pre.iloc[-1].to_dict()
 
     # 2) fallback: tomar última fila antes del último cierre que no sea cierre
@@ -4547,14 +4641,24 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
 
         cand = df_before[~df_before["resultado_norm"].isin(["GANANCIA", "PÉRDIDA"])].copy()
         if not cand.empty:
+            pre_idx = int(cand.index[-1])
             pre = cand.iloc[-1].to_dict()
         else:
+            pre_idx = int(df_before.index[-1])
             pre = df_before.iloc[-1].to_dict()
 
     if pre is None:
         return None
 
     row = dict(pre)
+
+    # Señales evento desde historial (sin futuro) para evitar cruce/breakout pegados.
+    try:
+        if pre_idx is None:
+            pre_idx = int(df.index[-1])
+        row = _calcular_eventos_pretrade_desde_historial(df, int(pre_idx), row_base=row)
+    except Exception:
+        pass
 
     # Meta trazable del origen (diagnóstico anti-clonado por bot/tick)
     try:
@@ -9123,10 +9227,13 @@ def evaluar_semaforo():
 RESET_ON_START = False  # Cambiado a False para mantener historial entre sesiones
 
 def _csv_header_bot():
-    return ["fecha","activo","direction","monto","resultado","ganancia_perdida",
-            "rsi_9","rsi_14","sma_5","sma_20","cruce_sma","breakout",
-            "rsi_reversion","racha_actual","payout","puntaje_estrategia",
-            "result_bin","payout_decimal_rounded"]
+    return [
+        "fecha","ts","epoch","activo","direction","monto","resultado","ganancia_perdida","trade_status",
+        "rsi_9","rsi_14","sma_5","sma_20","sma_spread","cruce_sma","breakout",
+        "rsi_reversion","racha_actual","payout","puntaje_estrategia",
+        "volatilidad","es_rebote","hora_bucket","result_bin",
+        "payout_decimal_rounded","payout_multiplier","payout_total","close","high","low"
+    ]
 
 def resetear_csv_bot(nombre_bot: str):
     ruta = f"registro_enriquecido_{nombre_bot}.csv"
@@ -9978,6 +10085,44 @@ def _auditar_calidad_incremental(path: str = "dataset_incremental.csv") -> dict:
     out["ok"] = True
     return out
 
+def _auditar_salud_features_incremental(path: str = "dataset_incremental.csv") -> dict:
+    """Diagnóstico de presencia/variación para core-13 en incremental."""
+    core13 = [
+        "rsi_9","rsi_14","sma_5","sma_spread","cruce_sma","breakout",
+        "rsi_reversion","racha_actual","payout","puntaje_estrategia",
+        "volatilidad","es_rebote","hora_bucket",
+    ]
+    out = {"ok": False, "path": path, "rows": 0, "missing": [], "dominance": {}, "low_var": []}
+    if not os.path.exists(path):
+        return out
+    try:
+        df = pd.read_csv(path, sep=",", encoding="utf-8", engine="python", on_bad_lines="skip")
+    except Exception:
+        return out
+    if df is None or df.empty:
+        out["ok"] = True
+        return out
+
+    out["rows"] = int(len(df))
+    out["missing"] = [c for c in core13 if c not in df.columns]
+    for c in core13:
+        if c not in df.columns:
+            continue
+        s = pd.to_numeric(df[c], errors="coerce").dropna()
+        if s.empty:
+            out["low_var"].append(c)
+            out["dominance"][c] = 1.0
+            continue
+        top = float(s.value_counts(normalize=True, dropna=True).iloc[0])
+        uniq = int(s.nunique(dropna=True))
+        out["dominance"][c] = top
+        if uniq <= 2:
+            out["low_var"].append(c)
+
+    out["ok"] = True
+    return out
+
+
 
 def _boot_health_check():
     msgs = []
@@ -10011,6 +10156,21 @@ def _boot_health_check():
             valid = int(incq.get("valid", 0) or 0)
             if rows > 0 and invalid > 0:
                 msgs.append(f"⚠️ Incremental con labels inválidas: valid={valid}, invalid={invalid}, total={rows}.")
+
+        # Salud de features core-13: presencia + variación + dominancia
+        featq = _auditar_salud_features_incremental("dataset_incremental.csv")
+        if featq.get("ok", False):
+            miss = featq.get("missing", []) or []
+            low = featq.get("low_var", []) or []
+            dom = featq.get("dominance", {}) or {}
+            hot = [k for k, v in dom.items() if isinstance(v, (int, float)) and v >= FEATURE_MAX_DOMINANCE]
+            if miss:
+                msgs.append("⚠️ Incremental core-13 faltantes: " + ", ".join(miss))
+            if low:
+                msgs.append("⚠️ Incremental features con baja variación (nunique<=2): " + ", ".join(low))
+            if hot:
+                tops = [f"{k}={float(dom.get(k, 0.0))*100:.1f}%" for k in hot]
+                msgs.append("⚠️ Incremental features dominantes (>90%): " + ", ".join(tops))
     except Exception as e:
         msgs.append(f"⚠️ Health-check parcial con error: {e}")
     return msgs
