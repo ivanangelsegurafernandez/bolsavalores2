@@ -359,6 +359,12 @@ FEATURE_NAMES_INTERACCIONES = [
 # Gobernanza calidad>cantidad: entrenar solo con features que realmente aporten.
 FEATURE_ALWAYS_KEEP = ["racha_actual"]
 FEATURE_MAX_PROD = 4
+FEATURE_SET_PROD_WARMUP = ["racha_actual", "payout", "rsi_14", "breakout"]
+FEATURE_SET_CORE_EXT = [
+    "racha_actual", "payout", "rsi_14", "breakout",
+    "rsi_9", "cruce_sma", "rsi_reversion", "es_rebote",
+]
+FEATURE_SET_CORE_EXT_MIN_ROWS = 500
 FEATURE_MIN_AUC_DELTA = 0.015      # aporte mínimo (|AUC_uni - 0.5|)
 FEATURE_MAX_DOMINANCE_GATE = 0.965 # evita casi-constantes
 FEATURE_DYNAMIC_SELECTION = True
@@ -7654,24 +7660,52 @@ def _fingerprint_features_row(row: dict, feats: list[str] | None = None, decimal
 
 
 def _features_vivas_para_redundancia(base_feats: list[str]) -> list[str]:
-    """Usa solo features activas del modelo y evita columnas marcadas ROTA."""
+    """Usa features activas del modelo, evitando filtrar de más por metadatos viejos."""
     try:
-        meta = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
-        model_feats = meta.get("feature_names", []) if isinstance(meta, dict) else []
-        health = meta.get("feature_health", {}) if isinstance(meta, dict) else {}
+        base = list(base_feats)
 
-        if not isinstance(model_feats, list) or not model_feats:
-            return list(base_feats)
+        # 1) Priorizar feature_names.pkl (estado real más reciente del modelo)
+        model_feats = None
+        try:
+            fpath = globals().get("_FEATURES_PATH", "feature_names.pkl")
+            if os.path.exists(fpath):
+                raw = joblib.load(fpath)
+                if isinstance(raw, (list, tuple)):
+                    mf = [str(x) for x in raw if str(x).strip()]
+                    if len(mf) >= 4:
+                        model_feats = mf
+        except Exception:
+            model_feats = None
+
+        # 2) Fallback a meta
+        if not model_feats:
+            meta = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+            mf = meta.get("feature_names", []) if isinstance(meta, dict) else []
+            if isinstance(mf, list) and len(mf) >= 4:
+                model_feats = [str(x) for x in mf if str(x).strip()]
+
+        if not model_feats:
+            return base
+
+        # 3) Excluir solo features explícitamente rotas
+        health = {}
+        try:
+            meta2 = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+            health = meta2.get("feature_health", {}) if isinstance(meta2, dict) else {}
+        except Exception:
+            health = {}
 
         out = []
-        for c in base_feats:
+        for c in base:
             if c not in model_feats:
                 continue
             st = str((health.get(c, {}) if isinstance(health, dict) else {}).get("status", "OK") or "OK").upper()
             if st == "ROTA":
                 continue
             out.append(c)
-        return out if out else list(base_feats)
+
+        # Anti-colapso: no degradar redundancia a 1-2 columnas por metadata stale.
+        return out if len(out) >= 4 else base
     except Exception:
         return list(base_feats)
 
@@ -7991,16 +8025,26 @@ def maybe_retrain(force: bool = False):
             except Exception:
                 pass
 
-        # 4.4) Modo temporal de simplificación: si casi todo está roto, entrenar solo con racha_actual
-        if ("racha_actual" in X.columns) and (len(feats_used) <= 2):
-            X = X[["racha_actual"]].copy()
-            feats_used = ["racha_actual"]
-            globals()["FEATURE_NAMES_PROD"] = ["racha_actual"]
-            globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f != "racha_actual"]
-            try:
-                agregar_evento("🧩 IA: modo simplificado activo (solo racha_actual) hasta reparar pipeline.")
-            except Exception:
-                pass
+        # 4.4) Capa de madurez: evitar colapso a 1 feature durante warmup.
+        try:
+            n_rows_cur = int(len(X))
+            if n_rows_cur < int(FEATURE_SET_CORE_EXT_MIN_ROWS):
+                pref = [f for f in FEATURE_SET_PROD_WARMUP if f in X.columns]
+                if len(pref) >= 3:
+                    X = X[pref].copy()
+                    feats_used = list(pref)
+                    globals()["FEATURE_NAMES_PROD"] = list(feats_used)
+                    globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f not in feats_used]
+                    agregar_evento(f"🧩 IA capa warmup: prod={feats_used} (n={n_rows_cur}).")
+            else:
+                pref_ext = [f for f in FEATURE_SET_CORE_EXT if f in X.columns]
+                if len(pref_ext) >= 5:
+                    X = X[pref_ext].copy()
+                    feats_used = list(pref_ext)
+                    globals()["FEATURE_NAMES_PROD"] = list(feats_used)
+                    globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f not in feats_used]
+        except Exception:
+            pass
 
         # 5) Recorte a MAX_DATASET_ROWS (manteniendo orden temporal)
         try:
