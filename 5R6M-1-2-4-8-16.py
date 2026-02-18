@@ -207,6 +207,9 @@ IA_SHRINK_ALPHA = 0.60               # p_ajustada = alpha*p + (1-alpha)*tasa_bas
 IA_SHRINK_ALPHA_MIN = 0.45           # piso de mezcla (más conservador en descalibración fuerte)
 IA_SHRINK_ALPHA_MAX = 0.85           # techo de mezcla (más sensible cuando la calibración mejora)
 IA_BASE_RATE_WINDOW = 300            # cierres recientes para tasa base rolling
+# Cap conservador de probabilidad durante warmup para evitar inflado (ej. 99-100%).
+IA_WARMUP_PROB_CAP_MIN = 0.70
+IA_WARMUP_PROB_CAP_MAX = 0.85
 
 # Gate de calidad operativo (objetivo: mejorar precisión real, no volumen)
 GATE_RACHA_NEG_BLOQUEO = -2.0        # bloquear señales con racha <= -2
@@ -3626,6 +3629,41 @@ def _ajustar_prob_por_evidencia_bot(bot: str, prob: float | None) -> float | Non
         return prob
 
 
+def _cap_prob_por_madurez(prob: float | None, bot: str | None = None) -> float | None:
+    """
+    Evita inflado irreal de Prob IA durante warmup (n bajo).
+    Mientras el modelo no alcanza madurez, limita la probabilidad máxima
+    con un techo progresivo entre IA_WARMUP_PROB_CAP_MIN y IA_WARMUP_PROB_CAP_MAX.
+    """
+    try:
+        if not isinstance(prob, (int, float)):
+            return prob
+        p = max(0.0, min(1.0, float(prob)))
+
+        meta = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+        n_samples = int(meta.get("n_samples", meta.get("n", 0)) or 0)
+        warmup = bool(meta.get("warmup_mode", n_samples < int(TRAIN_WARMUP_MIN_ROWS)))
+        if not warmup:
+            return p
+
+        ratio = max(0.0, min(1.0, float(n_samples) / float(max(1, int(TRAIN_WARMUP_MIN_ROWS)))))
+        cap = float(IA_WARMUP_PROB_CAP_MIN + (IA_WARMUP_PROB_CAP_MAX - IA_WARMUP_PROB_CAP_MIN) * ratio)
+
+        # Si el bot aún no tiene evidencia auditada mínima, mantener cap más conservador.
+        if isinstance(bot, str) and bot:
+            try:
+                st = estado_bots.get(bot, {})
+                cal_n = int(st.get("cal_n", 0) or 0)
+                if cal_n < 20:
+                    cap = min(cap, 0.80)
+            except Exception:
+                pass
+
+        return float(min(p, cap))
+    except Exception:
+        return prob
+
+
 def _ensure_ia_signals_log():
     """Crea el archivo con header si no existe."""
     if os.path.exists(IA_SIGNALS_LOG):
@@ -4837,6 +4875,7 @@ def actualizar_prob_ia_bot(bot: str):
             p = _aplicar_orientacion_prob(float(p))
             p = _ajustar_prob_operativa(float(p))
             p = _ajustar_prob_por_evidencia_bot(bot, float(p))
+            p = _cap_prob_por_madurez(float(p), bot=bot)
             estado_bots[bot]["prob_ia"] = float(p)
             estado_bots[bot]["ia_ready"] = True
             estado_bots[bot]["ia_last_err"] = None
@@ -4914,6 +4953,15 @@ def _desempatar_probs_ia_por_bot() -> None:
 
         if len(live) < 2:
             return
+
+        try:
+            meta = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+            n_samples = int(meta.get("n_samples", meta.get("n", 0)) or 0)
+            warmup = bool(meta.get("warmup_mode", n_samples < int(TRAIN_WARMUP_MIN_ROWS)))
+            if warmup:
+                return
+        except Exception:
+            pass
 
         probs = [x[1] for x in live]
         spread = max(probs) - min(probs)
@@ -5115,6 +5163,7 @@ def actualizar_prob_ia_bots_tick():
             prob_raw = float(prob)
             prob_raw = float(_aplicar_orientacion_prob(prob_raw))
             prob_raw = float(_ajustar_prob_por_evidencia_bot(bot, prob_raw))
+            prob_raw = float(_cap_prob_por_madurez(prob_raw, bot=bot))
             estado_bots[bot]["prob_ia_raw"] = prob_raw
 
             # Auditoría/calibración: calcular UNA sola vez por tick (evita leer CSV 6 veces)
