@@ -181,6 +181,9 @@ ORACULO_DELTA_PRE = 0.05
 
 # Umbral visual/alerta: alineado al mínimo operativo REAL
 IA_VERDE_THR = IA_ACTIVACION_REAL_THR
+IA_SUCESO_LOOKBACK = 16
+IA_SUCESO_DELTA_MIN = 0.035
+IA_SUCESO_EVENTO_MIN = 0.55
 AUTO_REAL_THR = IA_OBJETIVO_REAL_THR      # techo: mantener foco en acercarse al 70%
 AUTO_REAL_THR_MIN = IA_ACTIVACION_REAL_THR  # piso: permitir activación REAL desde 85%
 AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
@@ -207,6 +210,9 @@ IA_SHRINK_ALPHA = 0.60               # p_ajustada = alpha*p + (1-alpha)*tasa_bas
 IA_SHRINK_ALPHA_MIN = 0.45           # piso de mezcla (más conservador en descalibración fuerte)
 IA_SHRINK_ALPHA_MAX = 0.85           # techo de mezcla (más sensible cuando la calibración mejora)
 IA_BASE_RATE_WINDOW = 300            # cierres recientes para tasa base rolling
+# Cap conservador de probabilidad durante warmup para evitar inflado (ej. 99-100%).
+IA_WARMUP_PROB_CAP_MIN = 0.70
+IA_WARMUP_PROB_CAP_MAX = 0.85
 
 # Gate de calidad operativo (objetivo: mejorar precisión real, no volumen)
 GATE_RACHA_NEG_BLOQUEO = -2.0        # bloquear señales con racha <= -2
@@ -239,6 +245,7 @@ EVIDENCE_CACHE_TTL_S = 20.0
 DIAG_PATH = "diagnostico_pipeline_ia.json"
 ORIENTATION_RECHECK_S = 90.0
 ORIENTATION_FLIP_MIN_DELTA = 0.03
+ORIENTATION_MIN_CLOSED = 80
 HARD_GATE_MAX_GAP_HIGH_BINS = 0.10
 HARD_GATE_MIN_N_FOR_HIGH_THR = 200
 INCREMENTAL_DUP_SCAN_LINES = 6000
@@ -355,9 +362,21 @@ FEATURE_NAMES_INTERACCIONES = [
 # Gobernanza calidad>cantidad: entrenar solo con features que realmente aporten.
 FEATURE_ALWAYS_KEEP = ["racha_actual"]
 FEATURE_MAX_PROD = 4
+FEATURE_SET_PROD_WARMUP = ["racha_actual", "payout", "breakout", "rsi_14", "es_rebote", "puntaje_estrategia"]
+FEATURE_SET_CORE_EXT = [
+    "racha_actual", "payout", "rsi_14", "breakout",
+    "rsi_9", "cruce_sma", "rsi_reversion", "es_rebote",
+]
+FEATURE_SET_CORE_EXT_MIN_ROWS = 500
 FEATURE_MIN_AUC_DELTA = 0.015      # aporte mínimo (|AUC_uni - 0.5|)
 FEATURE_MAX_DOMINANCE_GATE = 0.965 # evita casi-constantes
 FEATURE_DYNAMIC_SELECTION = True
+# Durante warmup evitamos selección agresiva para no colapsar a 2-4 features.
+FEATURE_FREEZE_CORE_DURING_WARMUP = True
+FEATURE_FREEZE_CORE_MIN_ROWS = TRAIN_WARMUP_MIN_ROWS
+# Si el modelo anterior colapsó a muy pocas features, permitimos reemplazarlo
+# aunque la AUC temporal baje levemente en un reentreno puntual.
+FEATURE_MIN_ACCEPTED_COUNT = 6
 
 # Meta objetivo (calidad real en señales fuertes)
 IA_TARGET_PRECISION = 0.70
@@ -2485,11 +2504,21 @@ def calcular_hora_bucket(row_dict):
 
 def calcular_hora_features(row_dict: dict) -> tuple[float, float]:
     """
-    Contrato horario explícito para evitar fallback ambiguo:
-      - hora_bucket: 0..1 SOLO cuando hay timestamp/hora parseable.
+    Contrato horario explícito:
+      - hora_bucket: 0..1
       - hora_missing: 1.0 cuando falta hora parseable, 0.0 en caso contrario.
+
+    Si no hay timestamp parseable, usa hora local actual como fallback suave
+    para evitar colapsar hora_bucket en un valor constante histórico.
     """
     hb, parsed_ok = _parse_hora_bucket(row_dict)
+    if not bool(parsed_ok):
+        try:
+            lt = time.localtime()
+            idx48 = int(lt.tm_hour * 2 + (1 if lt.tm_min >= 30 else 0))
+            hb = float(max(0, min(47, idx48))) / 47.0
+        except Exception:
+            hb = 0.0
     try:
         hb = float(hb)
     except Exception:
@@ -2497,6 +2526,125 @@ def calcular_hora_features(row_dict: dict) -> tuple[float, float]:
     hb = float(max(0.0, min(1.0, hb)))
     hm = 0.0 if bool(parsed_ok) else 1.0
     return hb, hm
+
+
+def _calcular_sma_spread_robusto(row_dict: dict | None) -> float | None:
+    """Calcula sma_spread continuo con fallback de denominador para evitar constantes artificiales."""
+    try:
+        d = dict(row_dict or {})
+        sma5 = _safe_float_local(d.get("sma_5"))
+        sma20 = _safe_float_local(d.get("sma_20"))
+        px = None
+        for k in ("close", "cierre", "price", "precio"):
+            v = _safe_float_local(d.get(k))
+            if v is not None and math.isfinite(float(v)) and abs(float(v)) > 1e-12:
+                px = float(v)
+                break
+
+        if sma5 is None and sma20 is None:
+            return None
+
+        if sma5 is None:
+            sma5 = sma20
+        if sma20 is None:
+            sma20 = sma5
+
+        denom = abs(float(sma20))
+        if (not math.isfinite(denom)) or denom <= 1e-12:
+            denom = abs(float(px)) if px is not None else 1e-9
+
+        spread = abs(float(sma5) - float(sma20)) / max(denom, 1e-9)
+        if not math.isfinite(spread):
+            return None
+        return float(max(0.0, min(float(spread), 5.0)))
+    except Exception:
+        return None
+
+
+def _calcular_eventos_pretrade_desde_historial(df: pd.DataFrame, idx_ref: int, row_base: dict | None = None) -> dict:
+    """
+    Calcula señales de evento (no estado) para PRE_TRADE usando solo pasado <= idx_ref.
+    - cruce_sma: 1 solo si cambia el signo de (sma_5 - sma_20) entre vela previa y actual.
+    - breakout: 1 solo si el close rompe max/min de ventana previa (sin incluir vela actual).
+    - sma_spread: intensidad continua del spread SMA (0..5) para conservar información.
+    """
+    out = dict(row_base or {})
+    try:
+        if df is None or df.empty:
+            return out
+
+        if idx_ref not in df.index:
+            return out
+
+        pos = int(df.index.get_indexer([idx_ref])[0])
+        if pos < 0:
+            return out
+
+        d = df.copy()
+        for c in ("sma_5", "sma_20", "close", "cierre", "price", "precio", "high", "maximo", "low", "minimo"):
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+
+        row_now = d.iloc[pos]
+        sma5 = _safe_float_local(row_now.get("sma_5"))
+        sma20 = _safe_float_local(row_now.get("sma_20"))
+
+        # Intensidad de spread SMA (continua)
+        if sma5 is not None and sma20 is not None:
+            sp = _calcular_sma_spread_robusto({"sma_5": sma5, "sma_20": sma20, "close": row_now.get("close", None)})
+            if sp is not None:
+                out["sma_spread"] = float(sp)
+
+        # cruce_sma como evento (cambio de signo)
+        cruce_evt = 0.0
+        if pos >= 1 and sma5 is not None and sma20 is not None:
+            row_prev = d.iloc[pos - 1]
+            sma5_prev = _safe_float_local(row_prev.get("sma_5"))
+            sma20_prev = _safe_float_local(row_prev.get("sma_20"))
+            if sma5_prev is not None and sma20_prev is not None:
+                prev_diff = float(sma5_prev) - float(sma20_prev)
+                now_diff = float(sma5) - float(sma20)
+                if (prev_diff < 0.0 <= now_diff) or (prev_diff > 0.0 >= now_diff):
+                    cruce_evt = 1.0
+        out["cruce_sma"] = cruce_evt
+
+        # breakout como evento (rompe máximo/mínimo de ventana previa)
+        breakout_evt = 0.0
+        lookback = 20
+        if pos >= 2:
+            i0 = max(0, pos - lookback)
+            hist = d.iloc[i0:pos]
+            if not hist.empty:
+                close_now = None
+                for cc in ("close", "cierre", "price", "precio"):
+                    v = _safe_float_local(row_now.get(cc))
+                    if v is not None:
+                        close_now = float(v)
+                        break
+
+                hi_prev = None
+                lo_prev = None
+                for hc in ("high", "maximo", "close", "cierre"):
+                    if hc in hist.columns:
+                        s = pd.to_numeric(hist[hc], errors="coerce").dropna()
+                        if len(s) > 0:
+                            hi_prev = float(s.max())
+                            break
+                for lc in ("low", "minimo", "close", "cierre"):
+                    if lc in hist.columns:
+                        s = pd.to_numeric(hist[lc], errors="coerce").dropna()
+                        if len(s) > 0:
+                            lo_prev = float(s.min())
+                            break
+
+                if close_now is not None and hi_prev is not None and lo_prev is not None:
+                    if (close_now > hi_prev) or (close_now < lo_prev):
+                        breakout_evt = 1.0
+        out["breakout"] = breakout_evt
+
+    except Exception:
+        return out
+    return out
 
 
 def enriquecer_features_evento(row_dict: dict):
@@ -2826,6 +2974,13 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
 
         row_dict_full = canonicalizar_campos_bot_maestro(pre_row)
 
+        # Señales de evento reales (anti-saturación): usar solo historial pasado hasta PRE_TRADE.
+        try:
+            if pre_idx is not None:
+                row_dict_full = _calcular_eventos_pretrade_desde_historial(df, int(pre_idx), row_base=row_dict_full)
+        except Exception:
+            pass
+
         # 3) Asegurar monto (stake) desde PRE; si falta, tomar del cierre (monto NO filtra label)
         if ("monto" not in row_dict_full) or (row_dict_full.get("monto") in (None, "", 0, 0.0)):
             if "monto" in r_close:
@@ -2993,8 +3148,9 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
             sma5 = _safe_float_local(row_dict_full.get("sma_5"))
             sma20 = _safe_float_local(row_dict_full.get("sma_20"))
             if sma5 is not None and sma20 is not None:
-                base = max(abs(float(sma20)), 1e-9)
-                row_dict_full["sma_spread"] = float(max(0.0, min(abs(float(sma5) - float(sma20)) / base, 5.0)))
+                sp = _calcular_sma_spread_robusto({"sma_5": sma5, "sma_20": sma20, "close": row_dict_full.get("close", None)})
+                if sp is not None:
+                    row_dict_full["sma_spread"] = float(sp)
         except Exception:
             pass
 
@@ -3462,6 +3618,7 @@ def _leer_gate_desde_diagnostico(ttl_s: float = 60.0) -> dict:
 def _resolver_orientacion_runtime(ttl_s: float = ORIENTATION_RECHECK_S) -> dict:
     """
     Determina si conviene invertir p->1-p con evidencia cerrada (mismo set p vs 1-p).
+    Regla conservadora: jamás invertir por heurística de model_meta con n bajo.
     """
     global _IA_ORIENTATION_CACHE
     now = time.time()
@@ -3482,22 +3639,13 @@ def _resolver_orientacion_runtime(ttl_s: float = ORIENTATION_RECHECK_S) -> dict:
             m = y.isin([0, 1]) & p.notna()
             yy = y[m].astype(int)
             pp = p[m].astype(float)
-            if len(yy) >= 30 and len(set(yy.tolist())) >= 2:
+            n = int(len(yy))
+            if n >= int(ORIENTATION_MIN_CLOSED) and len(set(yy.tolist())) >= 2:
                 auc = float(roc_auc_score(yy, pp))
                 auc_flip = float(roc_auc_score(yy, 1.0 - pp))
                 if (auc_flip - auc) >= float(ORIENTATION_FLIP_MIN_DELTA):
                     inv = True
                 source = "signals"
-
-        # fallback al meta si no hay evidencia suficiente
-        if source == "none":
-            meta = leer_model_meta() or {}
-            a = float(meta.get("auc", 0.0) or 0.0)
-            if a > 0:
-                auc = a
-                auc_flip = 1.0 - a
-                inv = (auc_flip - auc) >= float(ORIENTATION_FLIP_MIN_DELTA)
-                source = "model_meta"
 
         _IA_ORIENTATION_CACHE = {"ts": now, "invert": bool(inv), "auc": auc, "auc_flip": auc_flip, "source": source}
         return dict(_IA_ORIENTATION_CACHE)
@@ -3571,6 +3719,79 @@ def _ajustar_prob_operativa(prob: float | None) -> float | None:
         return max(0.0, min(1.0, float(p_adj)))
     except Exception:
         return prob
+
+
+def _ajustar_prob_por_evidencia_bot(bot: str, prob: float | None) -> float | None:
+    """
+    Ajuste leve por evidencia específica del bot para mejorar discriminación
+    cuando el modelo queda plano entre varios bots.
+
+    - Usa WR suavizado (Beta(1,1)) del bot (ganancias/pérdidas en memoria).
+    - Si el input del bot fue marcado como redundante en el tick, reduce el efecto.
+    - Ajuste acotado: máximo ±2pp para no romper calibración global.
+    """
+    try:
+        if not isinstance(prob, (int, float)):
+            return prob
+        p = max(0.0, min(1.0, float(prob)))
+
+        st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
+        g = int(st.get("ganancias", 0) or 0)
+        d = int(st.get("perdidas", 0) or 0)
+        n = max(0, g + d)
+
+        # WR suavizado para no sobre-reaccionar con n bajo.
+        wr = float((g + 1.0) / (n + 2.0))
+        edge = float(max(-0.20, min(0.20, wr - 0.50)))
+
+        # Peso crece con muestra, saturando en n=120.
+        w = min(1.0, float(n) / 120.0)
+        delta = float(edge * w * 0.10)  # máx teórico ±2pp
+
+        # Si la entrada fue redundante este tick, hacemos el ajuste más conservador.
+        if bool(st.get("ia_input_redundante", False)):
+            delta *= 0.35
+
+        p2 = float(max(0.0, min(1.0, p + delta)))
+        return p2
+    except Exception:
+        return prob
+
+
+def _cap_prob_por_madurez(prob: float | None, bot: str | None = None) -> float | None:
+    """
+    Evita inflado irreal de Prob IA durante warmup (n bajo).
+    Mientras el modelo no alcanza madurez, limita la probabilidad máxima
+    con un techo progresivo entre IA_WARMUP_PROB_CAP_MIN y IA_WARMUP_PROB_CAP_MAX.
+    """
+    try:
+        if not isinstance(prob, (int, float)):
+            return prob
+        p = max(0.0, min(1.0, float(prob)))
+
+        meta = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+        n_samples = int(meta.get("n_samples", meta.get("n", 0)) or 0)
+        warmup = bool(meta.get("warmup_mode", n_samples < int(TRAIN_WARMUP_MIN_ROWS)))
+        if not warmup:
+            return p
+
+        ratio = max(0.0, min(1.0, float(n_samples) / float(max(1, int(TRAIN_WARMUP_MIN_ROWS)))))
+        cap = float(IA_WARMUP_PROB_CAP_MIN + (IA_WARMUP_PROB_CAP_MAX - IA_WARMUP_PROB_CAP_MIN) * ratio)
+
+        # Si el bot aún no tiene evidencia auditada mínima, mantener cap más conservador.
+        if isinstance(bot, str) and bot:
+            try:
+                st = estado_bots.get(bot, {})
+                cal_n = int(st.get("cal_n", 0) or 0)
+                if cal_n < 20:
+                    cap = min(cap, 0.80)
+            except Exception:
+                pass
+
+        return float(min(p, cap))
+    except Exception:
+        return prob
+
 
 def _ensure_ia_signals_log():
     """Crea el archivo con header si no existe."""
@@ -4431,12 +4652,14 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
 
     # 1) preferir PRE_TRADE/PENDIENTE
     pre = None
+    pre_idx = None
     if has_trade_status:
         df_pre = df[df["trade_status_norm"].isin(["PENDIENTE", "PRE_TRADE", "OPEN", "ABIERTO"])].copy()
         # evitar “filas basura”: no usar cierres
         if "resultado_norm" in df_pre.columns:
             df_pre = df_pre[~df_pre["resultado_norm"].isin(["GANANCIA", "PÉRDIDA"])].copy()
         if not df_pre.empty:
+            pre_idx = int(df_pre.index[-1])
             pre = df_pre.iloc[-1].to_dict()
 
     # 2) fallback: tomar última fila antes del último cierre que no sea cierre
@@ -4455,14 +4678,24 @@ def leer_ultima_fila_features_para_pred(bot: str) -> dict | None:
 
         cand = df_before[~df_before["resultado_norm"].isin(["GANANCIA", "PÉRDIDA"])].copy()
         if not cand.empty:
+            pre_idx = int(cand.index[-1])
             pre = cand.iloc[-1].to_dict()
         else:
+            pre_idx = int(df_before.index[-1])
             pre = df_before.iloc[-1].to_dict()
 
     if pre is None:
         return None
 
     row = dict(pre)
+
+    # Señales evento desde historial (sin futuro) para evitar cruce/breakout pegados.
+    try:
+        if pre_idx is None:
+            pre_idx = int(df.index[-1])
+        row = _calcular_eventos_pretrade_desde_historial(df, int(pre_idx), row_base=row)
+    except Exception:
+        pass
 
     # Meta trazable del origen (diagnóstico anti-clonado por bot/tick)
     try:
@@ -4724,7 +4957,9 @@ def predecir_prob_ia_bot(bot: str) -> tuple[float | None, str | None]:
         # 6) Predict proba
         try:
             proba = model.predict_proba(X_scaled)
-            p = float(proba[0][1])
+            p = _extraer_probabilidad_clase_positiva(model, proba, default_idx=1)
+            if p is None:
+                return None, "PRED_FAIL:BAD_PROBA"
         except Exception as e:
             return None, f"PRED_FAIL:{type(e).__name__}"
 
@@ -4742,6 +4977,36 @@ def predecir_prob_ia_bot(bot: str) -> tuple[float | None, str | None]:
     except Exception as e:
         return None, f"IA_ERR:{type(e).__name__}"
 
+def _extraer_probabilidad_clase_positiva(model, proba_arr, default_idx: int = 1) -> float | None:
+    """Extrae P(y=1) respetando model.classes_ cuando exista."""
+    try:
+        arr = np.asarray(proba_arr, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        if arr.ndim != 2 or arr.shape[0] < 1 or arr.shape[1] < 1:
+            return None
+
+        idx = int(default_idx)
+        try:
+            classes = list(getattr(model, "classes_", []) or [])
+            if classes:
+                # Forzamos búsqueda de etiqueta positiva 1 (ganancia)
+                if 1 in classes:
+                    idx = int(classes.index(1))
+                elif "1" in classes:
+                    idx = int(classes.index("1"))
+        except Exception:
+            pass
+
+        idx = max(0, min(int(idx), int(arr.shape[1]) - 1))
+        p = float(arr[0][idx])
+        if not np.isfinite(p):
+            return None
+        return float(max(0.0, min(1.0, p)))
+    except Exception:
+        return None
+
+
 # --- Updater: NO fuerces prob_ia=0 cuando falla ---
 IA_PRED_TTL_S = 180.0          # si falla por mucho tiempo, recién se limpia a None
 IA_PRED_MIN_INTERVAL_S = 2.0   # anti-spam de predicción
@@ -4751,6 +5016,7 @@ _IA_INPUT_DUP_INFO = {"signature": "", "ts": 0.0, "bots": []}
 _LAST_AUTO_RETRAIN_TICK = 0.0
 _IA_TRAIN_CLEAN_LOG = {"ts": 0.0, "sig": ""}
 _IA_NO_MODEL_LOG_TS = 0.0
+_IA_TIEBREAK_LOG_TS = 0.0
 
 def actualizar_prob_ia_bot(bot: str):
     """
@@ -4781,6 +5047,8 @@ def actualizar_prob_ia_bot(bot: str):
         if p is not None:
             p = _aplicar_orientacion_prob(float(p))
             p = _ajustar_prob_operativa(float(p))
+            p = _ajustar_prob_por_evidencia_bot(bot, float(p))
+            p = _cap_prob_por_madurez(float(p), bot=bot)
             estado_bots[bot]["prob_ia"] = float(p)
             estado_bots[bot]["ia_ready"] = True
             estado_bots[bot]["ia_last_err"] = None
@@ -4832,6 +5100,73 @@ def actualizar_prob_ia_bot(bot: str):
             estado_bots[bot]["ia_last_err"] = "UPD_ERR"
         except Exception:
             pass
+
+def _desempatar_probs_ia_por_bot() -> None:
+    """
+    Si varias Prob IA quedan prácticamente idénticas en un tick,
+    aplica un micro-ajuste por evidencia reciente del bot para romper empates.
+
+    Objetivo: evitar que todos los bots muestren exactamente el mismo valor (p. ej. 78.1%)
+    cuando el modelo queda temporalmente poco discriminante.
+    """
+    global _IA_TIEBREAK_LOG_TS
+    try:
+        live = []
+        for b in BOT_NAMES:
+            st = estado_bots.get(b, {})
+            p = st.get("prob_ia", None)
+            if not bool(st.get("ia_ready", False)):
+                continue
+            if not isinstance(p, (int, float)):
+                continue
+            pf = float(p)
+            if not np.isfinite(pf):
+                continue
+            live.append((b, pf))
+
+        if len(live) < 2:
+            return
+
+        try:
+            meta = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+            n_samples = int(meta.get("n_samples", meta.get("n", 0)) or 0)
+            warmup = bool(meta.get("warmup_mode", n_samples < int(TRAIN_WARMUP_MIN_ROWS)))
+            if warmup:
+                return
+        except Exception:
+            pass
+
+        probs = [x[1] for x in live]
+        spread = max(probs) - min(probs)
+        uniq4 = len({round(v, 4) for v in probs})
+
+        # Solo actuar en empate/casi empate real.
+        if spread >= 0.002 and uniq4 >= 3:
+            return
+
+        changed = []
+        for b, pb in live:
+            st = estado_bots.get(b, {})
+            g = int(st.get("ganancias", 0) or 0)
+            d = int(st.get("perdidas", 0) or 0)
+            # WR suavizado (Beta(1,1)) para no sobrecastigar n bajo.
+            wr = float((g + 1.0) / (g + d + 2.0))
+            edge = float(max(-0.5, min(0.5, wr - 0.5)))
+            # Micro-ajuste: máximo ±1pp.
+            delta = float(max(-0.01, min(0.01, edge * 0.02)))
+            p_new = float(max(0.0, min(1.0, pb + delta)))
+            estado_bots[b]["prob_ia"] = p_new
+            changed.append((b, pb, p_new))
+
+        now = time.time()
+        if changed and ((now - float(_IA_TIEBREAK_LOG_TS or 0.0)) >= 20.0):
+            _IA_TIEBREAK_LOG_TS = now
+            top = sorted(changed, key=lambda x: x[2], reverse=True)[:3]
+            txt = ", ".join([f"{b}:{o*100:.1f}→{n*100:.1f}%" for b, o, n in top])
+            agregar_evento(f"🧭 IA tiebreak: desempate leve por evidencia ({txt}).")
+    except Exception:
+        pass
+
 
 def actualizar_prob_ia_todos():
     """
@@ -4947,6 +5282,9 @@ def actualizar_prob_ia_todos():
         except Exception:
             pass
 
+    # 3.5) Desempate leve cuando el modelo deja todas las probs casi idénticas.
+    _desempatar_probs_ia_por_bot()
+
     # 4) Guardrail anti-clonado de probabilidades (síntoma downstream)
     try:
         div = _calcular_diversidad_prob_tick()
@@ -4962,6 +5300,45 @@ def actualizar_prob_ia_todos():
             _IA_CLONED_PROB_TICKS = 0
     except Exception:
         pass
+
+def _detectar_suceso_prob_bot(bot: str, p_now: float | None) -> tuple[bool, float]:
+    """Detecta salto relativo de probabilidad vs su línea base reciente."""
+    try:
+        if not isinstance(p_now, (int, float)):
+            return False, 0.0
+        p = float(max(0.0, min(1.0, p_now)))
+        st = estado_bots.get(bot, {})
+        hist = st.get("ia_prob_hist_raw", None)
+        if not isinstance(hist, list):
+            hist = []
+        hist.append(p)
+        max_len = int(max(6, IA_SUCESO_LOOKBACK * 3))
+        if len(hist) > max_len:
+            hist = hist[-max_len:]
+        st["ia_prob_hist_raw"] = hist
+        estado_bots[bot] = st
+
+        look = int(max(4, IA_SUCESO_LOOKBACK))
+        prev = hist[:-1][-look:]
+        if len(prev) < 4:
+            return False, 0.0
+        base = float(np.median(np.asarray(prev, dtype=float)))
+        delta = float(p - base)
+        return bool(delta >= float(IA_SUCESO_DELTA_MIN)), delta
+    except Exception:
+        return False, 0.0
+
+
+def _evento_contexto_activo(bot: str) -> bool:
+    """True si hay evento de mercado razonable para validar un suceso relativo."""
+    try:
+        row = leer_ultima_fila_features_para_pred(bot) or {}
+        brk = float(row.get("breakout", 0.0) or 0.0)
+        reb = float(row.get("es_rebote", 0.0) or 0.0)
+        return bool(max(brk, reb) >= float(IA_SUCESO_EVENTO_MIN))
+    except Exception:
+        return False
+
 
 def actualizar_prob_ia_bots_tick():
     """
@@ -4997,6 +5374,8 @@ def actualizar_prob_ia_bots_tick():
             # Guardar raw (modelo calibrado) y métricas SOLO como diagnóstico (NO ajustar prob_ia)
             prob_raw = float(prob)
             prob_raw = float(_aplicar_orientacion_prob(prob_raw))
+            prob_raw = float(_ajustar_prob_por_evidencia_bot(bot, prob_raw))
+            prob_raw = float(_cap_prob_por_madurez(prob_raw, bot=bot))
             estado_bots[bot]["prob_ia_raw"] = prob_raw
 
             # Auditoría/calibración: calcular UNA sola vez por tick (evita leer CSV 6 veces)
@@ -5026,9 +5405,23 @@ def actualizar_prob_ia_bots_tick():
         # IMPORTANTE: aquí SOLO marcamos "pendiente" (HUD / elegibilidad).
         # El LOG de auditoría (ia_signals_log) se escribe cuando HAY orden/operación real.
         try:
-            if prob is not None and float(prob) >= float(IA_VERDE_THR):
-                estado_bots[bot]["ia_senal_pendiente"] = True
-                estado_bots[bot]["ia_prob_senal"] = float(prob)
+            if prob is not None:
+                p_live = float(prob)
+                abs_gate = bool(p_live >= float(IA_VERDE_THR))
+                suc_ok, suc_delta = _detectar_suceso_prob_bot(bot, p_live)
+                evt_ok = _evento_contexto_activo(bot)
+                red_ok = not bool(estado_bots.get(bot, {}).get("ia_input_redundante", False))
+                suceso_gate = bool(suc_ok and evt_ok and red_ok)
+
+                estado_bots[bot]["ia_suceso_delta"] = float(suc_delta)
+                estado_bots[bot]["ia_suceso_ok"] = bool(suceso_gate)
+
+                if abs_gate or suceso_gate:
+                    estado_bots[bot]["ia_senal_pendiente"] = True
+                    estado_bots[bot]["ia_prob_senal"] = float(p_live)
+                else:
+                    estado_bots[bot]["ia_senal_pendiente"] = False
+                    estado_bots[bot]["ia_prob_senal"] = None
             else:
                 estado_bots[bot]["ia_senal_pendiente"] = False
                 estado_bots[bot]["ia_prob_senal"] = None
@@ -6410,8 +6803,8 @@ def oraculo_predict(fila_dict, modelo, scaler, meta, bot_name=""):
             try:
                 sma5 = float(fila_dict.get("sma_5", 0.0) or 0.0)
                 sma20 = float(fila_dict.get("sma_20", 0.0) or 0.0)
-                base = max(abs(sma20), 1e-9)
-                fila_dict["sma_spread"] = float(max(0.0, min(abs(sma5 - sma20) / base, 5.0)))
+                sp = _calcular_sma_spread_robusto({"sma_5": sma5, "sma_20": sma20, "close": fila_dict.get("close", None)})
+                fila_dict["sma_spread"] = float(sp) if sp is not None else 0.0
             except Exception:
                 fila_dict["sma_spread"] = 0.0
         if "racha_x_rebote" in feature_names and "racha_x_rebote" not in fila_dict:
@@ -7174,14 +7567,25 @@ def _seleccionar_features_calidad(X_df: pd.DataFrame, y_arr: np.ndarray, feats: 
                     y_late = y[cut:]
                     x_late = s.values[cut:]
 
-                    if len(y_early) >= 20 and len(np.unique(y_early)) == 2:
+                    early_has_2c = bool(len(y_early) >= 20 and len(np.unique(y_early)) == 2)
+                    late_has_2c = bool(len(y_late) >= 20 and len(np.unique(y_late)) == 2)
+
+                    if early_has_2c:
                         auc_early = float(roc_auc_score(y_early, x_early))
-                    if len(y_late) >= 20 and len(np.unique(y_late)) == 2:
+                    if late_has_2c:
                         auc_late = float(roc_auc_score(y_late, x_late))
 
                     d1 = abs(auc_early - 0.5)
                     d2 = abs(auc_late - 0.5)
-                    stable = (d1 >= float(FEATURE_MIN_AUC_DELTA) * 0.60 and d2 >= float(FEATURE_MIN_AUC_DELTA) * 0.60)
+
+                    # Regla anti-colapso: si una mitad no tiene ambas clases,
+                    # no penalizar estabilidad por ese lado (muestra insuficiente).
+                    if early_has_2c and late_has_2c:
+                        stable = (d1 >= float(FEATURE_MIN_AUC_DELTA) * 0.60 and d2 >= float(FEATURE_MIN_AUC_DELTA) * 0.60)
+                    elif early_has_2c or late_has_2c:
+                        stable = (auc_delta >= float(FEATURE_MIN_AUC_DELTA))
+                    else:
+                        stable = True
             except Exception:
                 pass
 
@@ -7297,6 +7701,7 @@ def _dataset_quality_gate_for_training(X_df: pd.DataFrame, feats: list[str]):
 def _fingerprint_features_row(row: dict, feats: list[str] | None = None, decimals: int = INPUT_DUP_FINGERPRINT_DECIMALS) -> str:
     """Huella estable por bot/tick para detectar inputs duplicados entre bots."""
     base_feats = list(feats) if feats else list(INCREMENTAL_FEATURES_V2)
+    base_feats = _features_vivas_para_redundancia(base_feats)
     parts = []
     for k in base_feats:
         v = (row or {}).get(k, 0.0)
@@ -7310,9 +7715,61 @@ def _fingerprint_features_row(row: dict, feats: list[str] | None = None, decimal
     return "|".join(parts)
 
 
+def _features_vivas_para_redundancia(base_feats: list[str]) -> list[str]:
+    """Usa features activas del modelo, evitando filtrar de más por metadatos viejos."""
+    try:
+        base = list(base_feats)
+
+        # 1) Priorizar feature_names.pkl (estado real más reciente del modelo)
+        model_feats = None
+        try:
+            fpath = globals().get("_FEATURES_PATH", "feature_names.pkl")
+            if os.path.exists(fpath):
+                raw = joblib.load(fpath)
+                if isinstance(raw, (list, tuple)):
+                    mf = [str(x) for x in raw if str(x).strip()]
+                    if len(mf) >= 4:
+                        model_feats = mf
+        except Exception:
+            model_feats = None
+
+        # 2) Fallback a meta
+        if not model_feats:
+            meta = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+            mf = meta.get("feature_names", []) if isinstance(meta, dict) else []
+            if isinstance(mf, list) and len(mf) >= 4:
+                model_feats = [str(x) for x in mf if str(x).strip()]
+
+        if not model_feats:
+            return base
+
+        # 3) Excluir solo features explícitamente rotas
+        health = {}
+        try:
+            meta2 = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+            health = meta2.get("feature_health", {}) if isinstance(meta2, dict) else {}
+        except Exception:
+            health = {}
+
+        out = []
+        for c in base:
+            if c not in model_feats:
+                continue
+            st = str((health.get(c, {}) if isinstance(health, dict) else {}).get("status", "OK") or "OK").upper()
+            if st == "ROTA":
+                continue
+            out.append(c)
+
+        # Anti-colapso: no degradar redundancia a 1-2 columnas por metadata stale.
+        return out if len(out) >= 4 else base
+    except Exception:
+        return list(base_feats)
+
+
 def _diagnosticar_inputs_duplicados(rows_by_bot: dict, dup_bots: list[str], feats: list[str] | None = None) -> dict:
     """Diagnóstico compacto de columnas idénticas/variables en grupos duplicados."""
     base_feats = list(feats) if feats else list(INCREMENTAL_FEATURES_V2)
+    base_feats = _features_vivas_para_redundancia(base_feats)
     same_cols, diff_cols = [], []
 
     for c in base_feats:
@@ -7328,7 +7785,8 @@ def _diagnosticar_inputs_duplicados(rows_by_bot: dict, dup_bots: list[str], feat
         else:
             diff_cols.append(c)
 
-    expected_diff = [c for c in ("payout", "rsi_9", "rsi_14", "sma_5", "sma_spread") if c in base_feats]
+    expected_pref = ["payout", "rsi_9", "rsi_14", "sma_5", "sma_spread", "volatilidad", "hora_bucket"]
+    expected_diff = [c for c in expected_pref if c in base_feats]
     source_info = {}
     for b in dup_bots:
         rv = rows_by_bot.get(b, {}) or {}
@@ -7594,7 +8052,8 @@ def maybe_retrain(force: bool = False):
                 pass
 
         # 4.3) Selección dinámica de calidad (features_prod vs shadow)
-        if FEATURE_DYNAMIC_SELECTION:
+        freeze_core_warmup = bool(FEATURE_FREEZE_CORE_DURING_WARMUP) and (len(X) < int(FEATURE_FREEZE_CORE_MIN_ROWS))
+        if FEATURE_DYNAMIC_SELECTION and (not freeze_core_warmup):
             try:
                 feats_quality, quality_report = _seleccionar_features_calidad(X, y, feats_used)
                 feats_quality = [c for c in feats_quality if c in X.columns]
@@ -7610,17 +8069,38 @@ def maybe_retrain(force: bool = False):
                         agregar_evento(f"🎯 IA quality-gate: prod={feats_used} | {txt}")
             except Exception:
                 pass
-
-        # 4.4) Modo temporal de simplificación: si casi todo está roto, entrenar solo con racha_actual
-        if ("racha_actual" in X.columns) and (len(feats_used) <= 2):
-            X = X[["racha_actual"]].copy()
-            feats_used = ["racha_actual"]
-            globals()["FEATURE_NAMES_PROD"] = ["racha_actual"]
-            globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f != "racha_actual"]
+        elif freeze_core_warmup:
             try:
-                agregar_evento("🧩 IA: modo simplificado activo (solo racha_actual) hasta reparar pipeline.")
+                keep_core = [f for f in FEATURE_NAMES_CORE_13 if f in X.columns]
+                if keep_core:
+                    X = X[keep_core].copy()
+                    feats_used = list(keep_core)
+                    globals()["FEATURE_NAMES_PROD"] = list(feats_used)
+                    globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f not in feats_used]
+                    agregar_evento(f"🧱 IA warmup: freeze CORE ({len(feats_used)} feats) hasta n>={int(FEATURE_FREEZE_CORE_MIN_ROWS)}.")
             except Exception:
                 pass
+
+        # 4.4) Capa de madurez: evitar colapso a 1 feature durante warmup.
+        try:
+            n_rows_cur = int(len(X))
+            if n_rows_cur < int(FEATURE_SET_CORE_EXT_MIN_ROWS):
+                pref = [f for f in FEATURE_SET_PROD_WARMUP if f in X.columns]
+                if len(pref) >= 3:
+                    X = X[pref].copy()
+                    feats_used = list(pref)
+                    globals()["FEATURE_NAMES_PROD"] = list(feats_used)
+                    globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f not in feats_used]
+                    agregar_evento(f"🧩 IA capa warmup: prod={feats_used} (n={n_rows_cur}).")
+            else:
+                pref_ext = [f for f in FEATURE_SET_CORE_EXT if f in X.columns]
+                if len(pref_ext) >= 5:
+                    X = X[pref_ext].copy()
+                    feats_used = list(pref_ext)
+                    globals()["FEATURE_NAMES_PROD"] = list(feats_used)
+                    globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f not in feats_used]
+        except Exception:
+            pass
 
         # 5) Recorte a MAX_DATASET_ROWS (manteniendo orden temporal)
         try:
@@ -7713,7 +8193,8 @@ def maybe_retrain(force: bool = False):
         y_test  = np.asarray(y)[i2:i3]
 
         # 8.1) Selección dinámica de calidad (SIN fuga: solo con TRAIN_BASE)
-        if FEATURE_DYNAMIC_SELECTION:
+        freeze_core_warmup_train = bool(FEATURE_FREEZE_CORE_DURING_WARMUP) and (n_total < int(FEATURE_FREEZE_CORE_MIN_ROWS))
+        if FEATURE_DYNAMIC_SELECTION and (not freeze_core_warmup_train):
             try:
                 feats_quality, quality_report = _seleccionar_features_calidad(X_train, y_train, feats_used)
                 feats_quality = [c for c in feats_quality if c in X_train.columns]
@@ -7730,6 +8211,19 @@ def maybe_retrain(force: bool = False):
                     if quality_report:
                         txt = ", ".join([f"{k}:{r}" for k, r in quality_report[:8]])
                         agregar_evento(f"🎯 IA quality-gate(train): prod={feats_used} | {txt}")
+            except Exception:
+                pass
+        elif freeze_core_warmup_train:
+            try:
+                keep_core = [f for f in FEATURE_NAMES_CORE_13 if f in X_train.columns]
+                if keep_core:
+                    X_train = X_train[keep_core].copy()
+                    if X_calib is not None and len(X_calib) > 0:
+                        X_calib = X_calib[keep_core].copy()
+                    X_test = X_test[keep_core].copy()
+                    feats_used = list(keep_core)
+                    globals()["FEATURE_NAMES_PROD"] = list(feats_used)
+                    globals()["FEATURE_NAMES_SHADOW"] = [f for f in FEATURE_NAMES_CORE_13 if f not in feats_used]
             except Exception:
                 pass
 
@@ -7942,6 +8436,7 @@ def maybe_retrain(force: bool = False):
 
         # 16) Anti “machacar” si baja AUC vs modelo anterior (salvo force)
         prev_auc = None
+        prev_feat_count = 0
         try:
             meta_path = globals().get("_META_PATH", "model_meta.json")
             if os.path.exists(meta_path):
@@ -7950,15 +8445,32 @@ def maybe_retrain(force: bool = False):
                 if isinstance(meta_old, dict):
                     prev_auc = meta_old.get("auc", None)
                     prev_auc = float(prev_auc) if isinstance(prev_auc, (int, float)) else None
+                    prev_feats = meta_old.get("feature_names", meta_old.get("FEATURE_NAMES_USADAS", []))
+                    if isinstance(prev_feats, list):
+                        prev_feat_count = int(len(prev_feats))
         except Exception:
             prev_auc = None
+            prev_feat_count = 0
 
-        if (not force) and (prev_auc is not None) and (auc < (prev_auc - float(AUC_DROP_TOL))):
+        allow_replace_collapsed = (
+            (prev_feat_count > 0)
+            and (prev_feat_count < int(FEATURE_MIN_ACCEPTED_COUNT))
+            and (len(feats_used) >= int(FEATURE_MIN_ACCEPTED_COUNT))
+        )
+
+        if (not force) and (prev_auc is not None) and (auc < (prev_auc - float(AUC_DROP_TOL))) and (not allow_replace_collapsed):
             try:
                 agregar_evento(f"🛡️ IA: NO actualizo (AUC bajó {prev_auc:.3f}→{auc:.3f}).")
             except Exception:
                 pass
             return False
+        elif allow_replace_collapsed:
+            try:
+                agregar_evento(
+                    f"🛠️ IA: reemplazo permitido (modelo colapsado {prev_feat_count}f → nuevo {len(feats_used)}f)."
+                )
+            except Exception:
+                pass
 
         # 17) Guardado atómico (compatible con tu función si existe)
         meta = {
@@ -8499,8 +9011,8 @@ def mostrar_panel():
     else:
         print(Fore.CYAN + " IA ACIERTOS: sin cierres auditados todavía.")
 
-    # Contadores IA ≥70% por bot
-        # HISTÓRICO: señales IA (>=70%) que llegaron a ejecutarse y cerraron con resultado
+    # HISTÓRICO: señales IA que llegaron a ejecutarse y cerraron con resultado
+    # (se mantiene con IA_METRIC_THRESHOLD para comparabilidad histórica de auditoría)
     print(Fore.YELLOW + f" IA HISTÓRICO (señales cerradas, ≥{IA_METRIC_THRESHOLD*100:.0f}%):")
     has_hist = False
     for bot in BOT_NAMES:
@@ -8511,8 +9023,9 @@ def mostrar_panel():
     if not has_hist:
         print(Fore.YELLOW + f"   (Aún no hay operaciones cerradas con señal IA ≥{IA_METRIC_THRESHOLD*100:.0f}%.)")
 
-    # ACTUAL: quién está >= umbral operativo ahora mismo (tick actual)
-    print(Fore.YELLOW + f"\nIA SEÑALES ACTUALES (≥{IA_METRIC_THRESHOLD*100:.0f}% ahora):")
+    # ACTUAL: quién está >= umbral vigente para compuerta REAL en este tick.
+    umbral_actual_hud = float(_umbral_senal_actual_hud())
+    print(Fore.YELLOW + f"\nIA SEÑALES ACTUALES (≥{umbral_actual_hud*100:.0f}% ahora):")
     now = []
     for bot in BOT_NAMES:
         st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
@@ -8524,11 +9037,24 @@ def mostrar_panel():
 
         modo = (st.get("modo_ia") or "off").lower()
         p = st.get("prob_ia", None)
-        if modo != "off" and isinstance(p, (int, float)) and p >= float(IA_METRIC_THRESHOLD):
+        if modo != "off" and isinstance(p, (int, float)) and p >= float(umbral_actual_hud):
             now.append((bot, float(p)))
 
+    if bool(REAL_CLASSIC_GATE):
+        try:
+            roof_h = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
+            cbot_h = DYN_ROOF_STATE.get("confirm_bot")
+            cst_h = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
+            print(
+                Fore.YELLOW
+                + f" Compuerta REAL: roof={roof_h*100:.1f}% | floor={float(DYN_ROOF_FLOOR)*100:.1f}% | "
+                  f"confirm={cst_h}/{int(DYN_ROOF_CONFIRM_TICKS)}" + (f" ({cbot_h})" if cbot_h else "")
+            )
+        except Exception:
+            pass
+
     if not now:
-        print(Fore.YELLOW + f"(Ningún bot ≥{IA_METRIC_THRESHOLD*100:.0f}% en este tick.)")
+        print(Fore.YELLOW + f"(Ningún bot ≥{umbral_actual_hud*100:.0f}% en este tick.)")
     else:
         for b, p in sorted(now, key=lambda x: x[1], reverse=True):
             print(Fore.YELLOW + f"  {b}: {p*100:.1f}%")
@@ -8887,10 +9413,13 @@ def evaluar_semaforo():
 RESET_ON_START = False  # Cambiado a False para mantener historial entre sesiones
 
 def _csv_header_bot():
-    return ["fecha","activo","direction","monto","resultado","ganancia_perdida",
-            "rsi_9","rsi_14","sma_5","sma_20","cruce_sma","breakout",
-            "rsi_reversion","racha_actual","payout","puntaje_estrategia",
-            "result_bin","payout_decimal_rounded"]
+    return [
+        "fecha","ts","epoch","activo","direction","monto","resultado","ganancia_perdida","trade_status",
+        "rsi_9","rsi_14","sma_5","sma_20","sma_spread","cruce_sma","breakout",
+        "rsi_reversion","racha_actual","payout","puntaje_estrategia",
+        "volatilidad","es_rebote","hora_bucket","result_bin",
+        "payout_decimal_rounded","payout_multiplier","payout_total","close","high","low"
+    ]
 
 def resetear_csv_bot(nombre_bot: str):
     ruta = f"registro_enriquecido_{nombre_bot}.csv"
@@ -9004,8 +9533,12 @@ def backfill_incremental(ultimas=500):
             for _, r in sub.iterrows():
                 # base mínima
                 fila = {k: float(r[k]) for k in req}
-                base = max(abs(float(r.get("sma_20", 0.0) or 0.0)), 1e-9)
-                fila["sma_spread"] = float(max(0.0, min(abs(float(r.get("sma_5", 0.0) or 0.0) - float(r.get("sma_20", 0.0) or 0.0)) / base, 5.0)))
+                sp = _calcular_sma_spread_robusto({
+                    "sma_5": r.get("sma_5", 0.0),
+                    "sma_20": r.get("sma_20", 0.0),
+                    "close": r.get("close", r.get("cierre", None)),
+                })
+                fila["sma_spread"] = float(sp) if sp is not None else 0.0
 
                 # Diccionario completo para helpers enriquecidos
                 row_dict_full = r.to_dict()
@@ -9151,6 +9684,178 @@ def set_etapa(codigo, detalle_extra=None, anunciar=False):
 REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme
 REAL_STUCK_FORCE_RELEASE_S = 90  # segundos extra tras aviso para liberar REAL si no hay cierre
 REAL_TRIGGER_MIN = IA_ACTIVACION_REAL_THR  # regla operativa: entrada REAL desde 85% o mayor
+
+# =========================================================
+# TECHO DINÁMICO + COMPUERTA REAL (anti-bug de activación baja)
+# =========================================================
+# Lote de actualización del maestro (ticks de lectura IA)
+DYN_ROOF_BATCH_TICKS = 15
+# Paciencia dura antes de empezar a bajar el techo (4 lotes = 60 ticks)
+DYN_ROOF_HOLD_BATCHES = 4
+DYN_ROOF_HOLD_TICKS = DYN_ROOF_BATCH_TICKS * DYN_ROOF_HOLD_BATCHES
+# Derretido lento del techo: -0.5pp por lote tras la paciencia
+DYN_ROOF_STEP = 0.005
+# Piso duro para REAL
+DYN_ROOF_FLOOR = 0.70
+# Ventaja mínima del mejor vs segundo mejor
+DYN_ROOF_GAP = 0.03
+# Confirmación mínima (ticks consecutivos del MISMO bot)
+DYN_ROOF_CONFIRM_TICKS = 2
+# Tolerancia para considerar "tocado" el techo (near-roof)
+DYN_ROOF_NEAR_TOL = 0.005
+# Penalización por evidencia corta (n < 30): requiere +2pp al techo
+DYN_ROOF_LOW_N_MIN = 30
+DYN_ROOF_LOW_N_PENALTY = 0.02
+
+DYN_ROOF_STATE = {
+    "tick": 0,
+    "roof": float(max(DYN_ROOF_FLOOR, IA_OBJETIVO_REAL_THR)),
+    "last_touch_tick": 0,
+    "melt_batches_applied": 0,
+    "confirm_bot": None,
+    "confirm_streak": 0,
+    "last_open_tick": 0,
+}
+
+
+def _actualizar_compuerta_techo_dinamico() -> dict:
+    """
+    Actualiza el techo dinámico y evalúa la compuerta REAL del mejor bot del tick.
+
+    Reglas clave:
+    - roof sube rápido por máximos (roof=max(roof, p_best)).
+    - roof baja lento tras paciencia (hold), por lotes de batch ticks.
+    - compuerta REAL exige: piso duro, techo efectivo, GAP y confirmación doble.
+    """
+    out = {
+        "best_bot": None,
+        "p_best": 0.0,
+        "p_second": 0.0,
+        "gap_ok": False,
+        "roof": float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR)),
+        "roof_eff": float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR)),
+        "confirm_streak": int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0),
+        "allow_real": False,
+        "n_best": 0,
+        "new_open": False,
+    }
+    try:
+        DYN_ROOF_STATE["tick"] = int(DYN_ROOF_STATE.get("tick", 0) or 0) + 1
+        tick_now = int(DYN_ROOF_STATE["tick"])
+
+        live = []
+        for b in BOT_NAMES:
+            try:
+                if str(estado_bots.get(b, {}).get("modo_ia", "off")).lower() == "off":
+                    continue
+                if not ia_prob_valida(b, max_age_s=12.0):
+                    continue
+                p = float(estado_bots.get(b, {}).get("prob_ia", 0.0) or 0.0)
+                n = int(estado_bots.get(b, {}).get("tamano_muestra", 0) or 0)
+                if np.isfinite(p):
+                    live.append((b, p, n))
+            except Exception:
+                continue
+
+        if not live:
+            DYN_ROOF_STATE["confirm_bot"] = None
+            DYN_ROOF_STATE["confirm_streak"] = 0
+            return out
+
+        live.sort(key=lambda x: x[1], reverse=True)
+        best_bot, p_best, n_best = live[0]
+        p_second = float(live[1][1]) if len(live) > 1 else 0.0
+
+        roof = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
+        last_touch = int(DYN_ROOF_STATE.get("last_touch_tick", 0) or 0)
+
+        # Regla A: tocar/romper techo resetea paciencia; romperlo además lo eleva.
+        near_touch = float(p_best) >= float(roof - DYN_ROOF_NEAR_TOL)
+        if near_touch:
+            roof = max(float(roof), float(p_best))
+            DYN_ROOF_STATE["roof"] = float(roof)
+            DYN_ROOF_STATE["last_touch_tick"] = int(tick_now)
+            DYN_ROOF_STATE["melt_batches_applied"] = 0
+            last_touch = int(tick_now)
+        else:
+            # Regla B: derretido lento solo después de hold y por lotes.
+            elapsed = int(tick_now - last_touch)
+            if elapsed > int(DYN_ROOF_HOLD_TICKS):
+                batches_now = int((elapsed - int(DYN_ROOF_HOLD_TICKS)) // int(DYN_ROOF_BATCH_TICKS))
+                batches_applied = int(DYN_ROOF_STATE.get("melt_batches_applied", 0) or 0)
+                if batches_now > batches_applied:
+                    delta_batches = int(batches_now - batches_applied)
+                    roof = max(float(DYN_ROOF_FLOOR), float(roof - (delta_batches * DYN_ROOF_STEP)))
+                    DYN_ROOF_STATE["roof"] = float(roof)
+                    DYN_ROOF_STATE["melt_batches_applied"] = int(batches_now)
+
+        roof = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
+        penalty = float(DYN_ROOF_LOW_N_PENALTY) if int(n_best) < int(DYN_ROOF_LOW_N_MIN) else 0.0
+        roof_eff = float(roof + penalty)
+
+        # GAP con fallback: si solo hay 1 bot válido, no se bloquea por GAP.
+        if len(live) <= 1:
+            gap_ok = True
+        else:
+            gap_ok = (float(p_best) - float(p_second)) >= float(DYN_ROOF_GAP)
+
+        pass_gate = (
+            (float(p_best) >= float(roof_eff))
+            and (float(p_best) >= float(DYN_ROOF_FLOOR))
+            and bool(gap_ok)
+        )
+
+        # Confirmación: 2 ticks consecutivos del mismo bot.
+        confirm_bot = DYN_ROOF_STATE.get("confirm_bot")
+        confirm_streak = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
+        if pass_gate:
+            if confirm_bot == best_bot:
+                confirm_streak += 1
+            else:
+                confirm_bot = best_bot
+                confirm_streak = 1
+        else:
+            confirm_bot = None
+            confirm_streak = 0
+
+        DYN_ROOF_STATE["confirm_bot"] = confirm_bot
+        DYN_ROOF_STATE["confirm_streak"] = int(confirm_streak)
+
+        allow_real = bool(pass_gate and (confirm_streak >= int(DYN_ROOF_CONFIRM_TICKS)))
+        last_open_tick = int(DYN_ROOF_STATE.get("last_open_tick", 0) or 0)
+        new_open = bool(allow_real and (last_open_tick != tick_now))
+        if new_open:
+            DYN_ROOF_STATE["last_open_tick"] = int(tick_now)
+
+        out.update({
+            "best_bot": best_bot,
+            "p_best": float(p_best),
+            "p_second": float(p_second),
+            "gap_ok": bool(gap_ok),
+            "roof": float(roof),
+            "roof_eff": float(roof_eff),
+            "confirm_streak": int(confirm_streak),
+            "allow_real": bool(allow_real),
+            "n_best": int(n_best),
+            "new_open": bool(new_open),
+        })
+        return out
+    except Exception:
+        return out
+
+
+def _umbral_senal_actual_hud() -> float:
+    """
+    Umbral visual para "IA SEÑALES ACTUALES".
+    - En compuerta clásica dinámica: el candado duro es FLOOR (70%).
+    - Fuera de ese modo: conserva IA_METRIC_THRESHOLD.
+    """
+    try:
+        if bool(REAL_CLASSIC_GATE):
+            return float(DYN_ROOF_FLOOR)
+        return float(IA_METRIC_THRESHOLD)
+    except Exception:
+        return float(IA_METRIC_THRESHOLD)
 
 # Cargar datos bot
 # Cargar datos bot
@@ -9570,6 +10275,44 @@ def _auditar_calidad_incremental(path: str = "dataset_incremental.csv") -> dict:
     out["ok"] = True
     return out
 
+def _auditar_salud_features_incremental(path: str = "dataset_incremental.csv") -> dict:
+    """Diagnóstico de presencia/variación para core-13 en incremental."""
+    core13 = [
+        "rsi_9","rsi_14","sma_5","sma_spread","cruce_sma","breakout",
+        "rsi_reversion","racha_actual","payout","puntaje_estrategia",
+        "volatilidad","es_rebote","hora_bucket",
+    ]
+    out = {"ok": False, "path": path, "rows": 0, "missing": [], "dominance": {}, "low_var": []}
+    if not os.path.exists(path):
+        return out
+    try:
+        df = pd.read_csv(path, sep=",", encoding="utf-8", engine="python", on_bad_lines="skip")
+    except Exception:
+        return out
+    if df is None or df.empty:
+        out["ok"] = True
+        return out
+
+    out["rows"] = int(len(df))
+    out["missing"] = [c for c in core13 if c not in df.columns]
+    for c in core13:
+        if c not in df.columns:
+            continue
+        s = pd.to_numeric(df[c], errors="coerce").dropna()
+        if s.empty:
+            out["low_var"].append(c)
+            out["dominance"][c] = 1.0
+            continue
+        top = float(s.value_counts(normalize=True, dropna=True).iloc[0])
+        uniq = int(s.nunique(dropna=True))
+        out["dominance"][c] = top
+        if uniq <= 2:
+            out["low_var"].append(c)
+
+    out["ok"] = True
+    return out
+
+
 
 def _boot_health_check():
     msgs = []
@@ -9603,6 +10346,21 @@ def _boot_health_check():
             valid = int(incq.get("valid", 0) or 0)
             if rows > 0 and invalid > 0:
                 msgs.append(f"⚠️ Incremental con labels inválidas: valid={valid}, invalid={invalid}, total={rows}.")
+
+        # Salud de features core-13: presencia + variación + dominancia
+        featq = _auditar_salud_features_incremental("dataset_incremental.csv")
+        if featq.get("ok", False):
+            miss = featq.get("missing", []) or []
+            low = featq.get("low_var", []) or []
+            dom = featq.get("dominance", {}) or {}
+            hot = [k for k, v in dom.items() if isinstance(v, (int, float)) and v >= FEATURE_MAX_DOMINANCE]
+            if miss:
+                msgs.append("⚠️ Incremental core-13 faltantes: " + ", ".join(miss))
+            if low:
+                msgs.append("⚠️ Incremental features con baja variación (nunique<=2): " + ", ".join(low))
+            if hot:
+                tops = [f"{k}={float(dom.get(k, 0.0))*100:.1f}%" for k in hot]
+                msgs.append("⚠️ Incremental features dominantes (>90%): " + ", ".join(tops))
     except Exception as e:
         msgs.append(f"⚠️ Health-check parcial con error: {e}")
     return msgs
@@ -9807,8 +10565,19 @@ async def main():
                         # usando los valores altos observados recientemente.
                         if REAL_CLASSIC_GATE:
                             umbral_ia_real = float(IA_ACTIVACION_REAL_THR)
+                            dyn_gate = _actualizar_compuerta_techo_dinamico()
+                            if isinstance(dyn_gate, dict) and bool(dyn_gate.get("new_open", False)):
+                                agregar_evento(
+                                    "🧭 Compuerta REAL abierta: "
+                                    f"{dyn_gate.get('best_bot','--')} | "
+                                    f"p_best={float(dyn_gate.get('p_best',0.0))*100:.1f}% "
+                                    f"roof_eff={float(dyn_gate.get('roof_eff',0.0))*100:.1f}% "
+                                    f"gap_ok={'sí' if dyn_gate.get('gap_ok') else 'no'} "
+                                    f"confirm={int(dyn_gate.get('confirm_streak',0))}/{int(DYN_ROOF_CONFIRM_TICKS)}"
+                                )
                         else:
                             umbral_ia_real = max(float(REAL_TRIGGER_MIN), float(get_umbral_real_calibrado()))
+                            dyn_gate = None
 
                         # Bloqueo por saldo (no abras ventanas si no puedes ejecutar ciclo1)
                         try:
@@ -9828,17 +10597,29 @@ async def main():
                                         continue
                                     if not ia_prob_valida(b, max_age_s=12.0):
                                         continue
+                                    # Evitar promover señales ambiguas cuando el input del bot
+                                    # fue marcado como redundante en este tick.
+                                    if bool(estado_bots.get(b, {}).get("ia_input_redundante", False)):
+                                        continue
 
                                     p = estado_bots[b].get("prob_ia", None)
                                     if not isinstance(p, (int, float)):
                                         continue
                                     # Primer filtro suave: evitar basura por debajo del piso operativo.
-                                    if float(p) < float(IA_ACTIVACION_REAL_THR):
+                                    piso_operativo = float(DYN_ROOF_FLOOR) if REAL_CLASSIC_GATE else float(IA_ACTIVACION_REAL_THR)
+                                    if float(p) < float(piso_operativo):
                                         continue
 
-                                    # Modo clásico: si hay 85% o más, el bot es elegible sin gates extra.
-                                    # Mantiene el lock de un único bot REAL a la vez en el flujo superior.
+                                    # Modo clásico reforzado: compuerta dinámica anti-bug.
+                                    # Solo el mejor bot del tick puede pasar, con piso duro + GAP + confirmación doble.
                                     if REAL_CLASSIC_GATE:
+                                        if not isinstance(dyn_gate, dict):
+                                            continue
+                                        if b != dyn_gate.get("best_bot"):
+                                            continue
+                                        if not bool(dyn_gate.get("allow_real", False)):
+                                            continue
+
                                         regime_score = _score_regimen_contexto(_ultimo_contexto_operativo_bot(b))
                                         p_post = float(p)
                                         score_final = float(p_post)
