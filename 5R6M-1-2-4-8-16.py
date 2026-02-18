@@ -184,6 +184,9 @@ IA_VERDE_THR = IA_ACTIVACION_REAL_THR
 IA_SUCESO_LOOKBACK = 16
 IA_SUCESO_DELTA_MIN = 0.035
 IA_SUCESO_EVENTO_MIN = 0.55
+IA_SENSOR_DOM_HOT = 0.95
+IA_SENSOR_MIN_HOT_FEATS = 3
+IA_REDUNDANCY_SCORE_PENALTY = 0.03
 AUTO_REAL_THR = IA_OBJETIVO_REAL_THR      # techo: mantener foco en acercarse al 70%
 AUTO_REAL_THR_MIN = IA_ACTIVACION_REAL_THR  # piso: permitir activación REAL desde 85%
 AUTO_REAL_TOP_Q = 0.80    # cuantíl de probs históricas para calibrar el gate REAL
@@ -5301,6 +5304,62 @@ def actualizar_prob_ia_todos():
     except Exception:
         pass
 
+def _sensor_plano_bot(bot: str, lookback: int = 80) -> tuple[bool, dict]:
+    """Detecta si un bot tiene demasiadas features pegadas (dominancia alta)."""
+    try:
+        rep = _auditar_saturacion_features_bot(bot, lookback=int(lookback)) or {}
+        dom = rep.get("dominance", {}) if isinstance(rep, dict) else {}
+        hot = [k for k, v in dom.items() if isinstance(v, (int, float)) and float(v) >= float(IA_SENSOR_DOM_HOT)]
+        return bool(len(hot) >= int(IA_SENSOR_MIN_HOT_FEATS)), {"hot": hot, "dominance": dom}
+    except Exception:
+        return False, {"hot": [], "dominance": {}}
+
+
+def _calcular_indice_suceso_bot(bot: str, p_live: float | None = None, suceso_delta: float | None = None) -> float:
+    """
+    Índice Suceso 0..100 (momentum+ruptura+régimen+asimetría), robusto en warmup.
+    """
+    try:
+        row = leer_ultima_fila_features_para_pred(bot) or {}
+
+        def _f(k, d=0.0):
+            try:
+                return float(row.get(k, d) or d)
+            except Exception:
+                return float(d)
+
+        breakout_strength = max(0.0, min(1.0, _f("breakout", 0.0)))
+        rebote = max(0.0, min(1.0, _f("es_rebote", 0.0)))
+        payout = max(0.0, min(1.5, _f("payout", 0.0))) / 1.5
+        rsi14 = max(0.0, min(100.0, _f("rsi_14", 50.0)))
+        momentum = abs(rsi14 - 50.0) / 50.0
+
+        try:
+            vol = max(0.0, min(1.0, _f("volatilidad", 0.0)))
+        except Exception:
+            vol = 0.0
+
+        delta_term = 0.0
+        if isinstance(suceso_delta, (int, float)):
+            delta_term = max(0.0, min(1.0, float(suceso_delta) / max(1e-6, float(IA_SUCESO_DELTA_MIN))))
+
+        p_term = 0.0
+        if isinstance(p_live, (int, float)):
+            p_term = max(0.0, min(1.0, (float(p_live) - 0.50) / 0.20))
+
+        score = (
+            0.26 * breakout_strength +
+            0.20 * max(rebote, delta_term) +
+            0.16 * momentum +
+            0.14 * vol +
+            0.14 * payout +
+            0.10 * p_term
+        )
+        return float(max(0.0, min(100.0, score * 100.0)))
+    except Exception:
+        return 0.0
+
+
 def _detectar_suceso_prob_bot(bot: str, p_now: float | None) -> tuple[bool, float]:
     """Detecta salto relativo de probabilidad vs su línea base reciente."""
     try:
@@ -5410,11 +5469,18 @@ def actualizar_prob_ia_bots_tick():
                 abs_gate = bool(p_live >= float(IA_VERDE_THR))
                 suc_ok, suc_delta = _detectar_suceso_prob_bot(bot, p_live)
                 evt_ok = _evento_contexto_activo(bot)
-                red_ok = not bool(estado_bots.get(bot, {}).get("ia_input_redundante", False))
-                suceso_gate = bool(suc_ok and evt_ok and red_ok)
+                redundante_tick = bool(estado_bots.get(bot, {}).get("ia_input_redundante", False))
+                suceso_gate = bool(suc_ok and evt_ok)
+
+                suceso_idx = _calcular_indice_suceso_bot(bot, p_live=p_live, suceso_delta=suc_delta)
+                sensor_plano, sensor_meta = _sensor_plano_bot(bot, lookback=80)
 
                 estado_bots[bot]["ia_suceso_delta"] = float(suc_delta)
                 estado_bots[bot]["ia_suceso_ok"] = bool(suceso_gate)
+                estado_bots[bot]["ia_suceso_idx"] = float(suceso_idx)
+                estado_bots[bot]["ia_suceso_redundante"] = bool(redundante_tick)
+                estado_bots[bot]["ia_sensor_plano"] = bool(sensor_plano)
+                estado_bots[bot]["ia_sensor_hot_feats"] = list(sensor_meta.get("hot", []))
 
                 if abs_gate or suceso_gate:
                     estado_bots[bot]["ia_senal_pendiente"] = True
@@ -8679,7 +8745,10 @@ def mostrar_panel():
         owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
         owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
         mejor_txt = "--" if mejor is None else f"{mejor[0]} {mejor[1]*100:.1f}%"
-        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥{umbral_real_vigente*100:.1f}%: {bots_75} | Mejor: {mejor_txt} | Token: {owner_txt}")
+        suceso_vals = [float(estado_bots.get(b, {}).get("ia_suceso_idx", 0.0) or 0.0) for b in BOT_NAMES]
+        best_suceso = max(suceso_vals) if suceso_vals else 0.0
+        sensores_planos = sum(1 for b in BOT_NAMES if bool(estado_bots.get(b, {}).get("ia_sensor_plano", False)))
+        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | ≥{umbral_real_vigente*100:.1f}%: {bots_75} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} | Token: {owner_txt}")
 
         if owner not in (None, "none") and mejor is not None and owner != mejor[0]:
             print(padding + Fore.YELLOW + f"⛓️ Token bloqueado en {owner}; mejor IA actual es {mejor[0]} ({mejor[1]*100:.1f}%).")
@@ -8897,7 +8966,10 @@ def mostrar_panel():
             else:
                 modo_color = Fore.LIGHTBLACK_EX
 
-            modo_str = modo_color + modo_str + Fore.RESET
+            su_idx = int(round(float(estado_bots.get(bot, {}).get("ia_suceso_idx", 0.0) or 0.0)))
+            is_plano = bool(estado_bots.get(bot, {}).get("ia_sensor_plano", False))
+            modo_tag = f" S{max(0, min(99, su_idx)):02d}" + ("⚠" if is_plano else "")
+            modo_str = modo_color + modo_str + Fore.RESET + modo_tag
 
         # --- Audio IA "es hora de invertir" (umbral fijo) ---
         audio_thr = float(globals().get("AUDIO_IA53_THR", high_thr_ui))
@@ -10597,10 +10669,8 @@ async def main():
                                         continue
                                     if not ia_prob_valida(b, max_age_s=12.0):
                                         continue
-                                    # Evitar promover señales ambiguas cuando el input del bot
-                                    # fue marcado como redundante en este tick.
-                                    if bool(estado_bots.get(b, {}).get("ia_input_redundante", False)):
-                                        continue
+                                    # Redundancia: no bloquear en seco; aplicar penalización de score y desempate posterior.
+                                    redundante_tick = bool(estado_bots.get(b, {}).get("ia_input_redundante", False))
 
                                     p = estado_bots[b].get("prob_ia", None)
                                     if not isinstance(p, (int, float)):
@@ -10699,6 +10769,8 @@ async def main():
                                         + float(REGIME_GATE_WEIGHT_REGIME) * float(regime_score)
                                         + float(REGIME_GATE_WEIGHT_EVIDENCE) * float(evidence_score)
                                     )
+                                    if redundante_tick:
+                                        score_final = float(score_final) - float(IA_REDUNDANCY_SCORE_PENALTY)
 
                                     estado_bots[b]["ia_regime_score"] = float(regime_score)
                                     estado_bots[b]["ia_evidence_n"] = int(ev_n)
