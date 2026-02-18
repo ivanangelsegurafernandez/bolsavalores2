@@ -361,6 +361,9 @@ FEATURE_DYNAMIC_SELECTION = True
 # Durante warmup evitamos selección agresiva para no colapsar a 2-4 features.
 FEATURE_FREEZE_CORE_DURING_WARMUP = True
 FEATURE_FREEZE_CORE_MIN_ROWS = TRAIN_WARMUP_MIN_ROWS
+# Si el modelo anterior colapsó a muy pocas features, permitimos reemplazarlo
+# aunque la AUC temporal baje levemente en un reentreno puntual.
+FEATURE_MIN_ACCEPTED_COUNT = 6
 
 # Meta objetivo (calidad real en señales fuertes)
 IA_TARGET_PRECISION = 0.70
@@ -2488,11 +2491,21 @@ def calcular_hora_bucket(row_dict):
 
 def calcular_hora_features(row_dict: dict) -> tuple[float, float]:
     """
-    Contrato horario explícito para evitar fallback ambiguo:
-      - hora_bucket: 0..1 SOLO cuando hay timestamp/hora parseable.
+    Contrato horario explícito:
+      - hora_bucket: 0..1
       - hora_missing: 1.0 cuando falta hora parseable, 0.0 en caso contrario.
+
+    Si no hay timestamp parseable, usa hora local actual como fallback suave
+    para evitar colapsar hora_bucket en un valor constante histórico.
     """
     hb, parsed_ok = _parse_hora_bucket(row_dict)
+    if not bool(parsed_ok):
+        try:
+            lt = time.localtime()
+            idx48 = int(lt.tm_hour * 2 + (1 if lt.tm_min >= 30 else 0))
+            hb = float(max(0, min(47, idx48))) / 47.0
+        except Exception:
+            hb = 0.0
     try:
         hb = float(hb)
     except Exception:
@@ -8084,6 +8097,7 @@ def maybe_retrain(force: bool = False):
 
         # 16) Anti “machacar” si baja AUC vs modelo anterior (salvo force)
         prev_auc = None
+        prev_feat_count = 0
         try:
             meta_path = globals().get("_META_PATH", "model_meta.json")
             if os.path.exists(meta_path):
@@ -8092,15 +8106,32 @@ def maybe_retrain(force: bool = False):
                 if isinstance(meta_old, dict):
                     prev_auc = meta_old.get("auc", None)
                     prev_auc = float(prev_auc) if isinstance(prev_auc, (int, float)) else None
+                    prev_feats = meta_old.get("feature_names", meta_old.get("FEATURE_NAMES_USADAS", []))
+                    if isinstance(prev_feats, list):
+                        prev_feat_count = int(len(prev_feats))
         except Exception:
             prev_auc = None
+            prev_feat_count = 0
 
-        if (not force) and (prev_auc is not None) and (auc < (prev_auc - float(AUC_DROP_TOL))):
+        allow_replace_collapsed = (
+            (prev_feat_count > 0)
+            and (prev_feat_count < int(FEATURE_MIN_ACCEPTED_COUNT))
+            and (len(feats_used) >= int(FEATURE_MIN_ACCEPTED_COUNT))
+        )
+
+        if (not force) and (prev_auc is not None) and (auc < (prev_auc - float(AUC_DROP_TOL))) and (not allow_replace_collapsed):
             try:
                 agregar_evento(f"🛡️ IA: NO actualizo (AUC bajó {prev_auc:.3f}→{auc:.3f}).")
             except Exception:
                 pass
             return False
+        elif allow_replace_collapsed:
+            try:
+                agregar_evento(
+                    f"🛠️ IA: reemplazo permitido (modelo colapsado {prev_feat_count}f → nuevo {len(feats_used)}f)."
+                )
+            except Exception:
+                pass
 
         # 17) Guardado atómico (compatible con tu función si existe)
         meta = {
