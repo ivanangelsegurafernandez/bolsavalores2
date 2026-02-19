@@ -188,6 +188,7 @@ IA_SUCESO_DELTA_MIN = 0.035
 IA_SUCESO_EVENTO_MIN = 0.55
 IA_SENSOR_DOM_HOT = 0.95
 IA_SENSOR_MIN_HOT_FEATS = 3
+IA_SENSOR_MIN_SAMPLE = 30
 IA_REDUNDANCY_SCORE_PENALTY = 0.03
 IA_SENSOR_PLANO_SCORE_PENALTY = 0.04
 IA_SUCESO_SCORE_WEIGHT = 0.08
@@ -5323,10 +5324,13 @@ def _sensor_plano_bot(bot: str, lookback: int = 80) -> tuple[bool, dict]:
     try:
         rep = _auditar_saturacion_features_bot(bot, lookback=int(lookback)) or {}
         dom = rep.get("dominance", {}) if isinstance(rep, dict) else {}
+        n_rep = int(rep.get("n", 0) or 0) if isinstance(rep, dict) else 0
         hot = [k for k, v in dom.items() if isinstance(v, (int, float)) and float(v) >= float(IA_SENSOR_DOM_HOT)]
-        return bool(len(hot) >= int(IA_SENSOR_MIN_HOT_FEATS)), {"hot": hot, "dominance": dom}
+        if n_rep < int(IA_SENSOR_MIN_SAMPLE):
+            return False, {"hot": hot, "dominance": dom, "n": n_rep, "warmup": True}
+        return bool(len(hot) >= int(IA_SENSOR_MIN_HOT_FEATS)), {"hot": hot, "dominance": dom, "n": n_rep, "warmup": False}
     except Exception:
-        return False, {"hot": [], "dominance": {}}
+        return False, {"hot": [], "dominance": {}, "n": 0, "warmup": True}
 
 
 def _calcular_indice_suceso_bot(bot: str, p_live: float | None = None, suceso_delta: float | None = None) -> float:
@@ -5440,6 +5444,8 @@ def _actualizar_estado_suceso_bot(bot: str, prob_live: float | None) -> None:
         estado_bots[bot]["ia_suceso_redundante"] = bool(redundante_tick)
         estado_bots[bot]["ia_sensor_plano"] = bool(sensor_plano)
         estado_bots[bot]["ia_sensor_hot_feats"] = list(sensor_meta.get("hot", []))
+        estado_bots[bot]["ia_sensor_sample_n"] = int(sensor_meta.get("n", 0) or 0)
+        estado_bots[bot]["ia_sensor_warmup"] = bool(sensor_meta.get("warmup", False))
 
         if abs_gate or suceso_gate:
             estado_bots[bot]["ia_senal_pendiente"] = True
@@ -8007,7 +8013,9 @@ def maybe_retrain(force: bool = False):
     - TimeSeriesSplit sobre TRAIN_BASE para CV AUC (diagnóstico, no toca el split final)
     - Guardado atómico: modelo_xgb.pkl, scaler.pkl, feature_names.pkl, model_meta.json
     """
-    global last_retrain_count, last_retrain_ts, _ORACLE_CACHE
+    global last_retrain_count, last_retrain_ts, _ORACLE_CACHE, LAST_RETRAIN_ERROR
+
+    LAST_RETRAIN_ERROR = ""
 
     # 0) XGBoost disponible
     if not _XGBOOST_OK or xgb is None:
@@ -8657,6 +8665,14 @@ def maybe_retrain(force: bool = False):
 
         return True
 
+    except Exception as e:
+        LAST_RETRAIN_ERROR = f"{type(e).__name__}: {e}"
+        try:
+            agregar_evento(f"⚠️ IA train fail: {LAST_RETRAIN_ERROR}")
+        except Exception:
+            pass
+        return False
+
     finally:
         try:
             _entrenando_lock.release()
@@ -8730,6 +8746,8 @@ def mostrar_panel():
 
     # Saldo inicial y meta
     try:
+        if SALDO_INICIAL is None and isinstance(valor, (int, float)):
+            inicializar_saldo_real(float(valor))
         inicial_str = f"{float(SALDO_INICIAL):.2f}" if SALDO_INICIAL is not None else "--"
     except Exception:
         inicial_str = "--"
@@ -8765,7 +8783,9 @@ def mostrar_panel():
         suceso_vals = [float(estado_bots.get(b, {}).get("ia_suceso_idx", 0.0) or 0.0) for b in BOT_NAMES]
         best_suceso = max(suceso_vals) if suceso_vals else 0.0
         sensores_planos = sum(1 for b in BOT_NAMES if bool(estado_bots.get(b, {}).get("ia_sensor_plano", False)))
-        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | OBS≥{umbral_obs*100:.1f}%: {bots_obs} | REAL≥{umbral_real_vigente*100:.1f}%: {bots_real} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} | Token: {owner_txt}")
+        sensores_warmup = sum(1 for b in BOT_NAMES if bool(estado_bots.get(b, {}).get("ia_sensor_warmup", False)))
+        n_min_real, n_req_real = _n_minimo_real_status()
+        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | OBS≥{umbral_obs*100:.1f}%: {bots_obs} | REAL≥{umbral_real_vigente*100:.1f}%: {bots_real} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} (warmup:{sensores_warmup}) | n_min_real: {n_min_real}/{n_req_real} | Token: {owner_txt}")
 
         if owner not in (None, "none") and mejor is not None and owner != mejor[0]:
             print(padding + Fore.YELLOW + f"⛓️ Token bloqueado en {owner}; mejor IA actual es {mejor[0]} ({mejor[1]*100:.1f}%).")
@@ -9053,6 +9073,16 @@ def mostrar_panel():
         print(Fore.CYAN + "      Se entrenará automáticamente por tick o al usar [E].")
         print(Fore.CYAN + f"      Requisitos mínimos: filas útiles >= {MIN_FIT_ROWS_LOW}, 2 clases (GAN/PERD), y features válidas.")
         print(Fore.CYAN + f"      Modo confiable recomendado desde n >= {TRAIN_WARMUP_MIN_ROWS}.")
+        try:
+            df_diag = pd.read_csv(ruta_inc, encoding="utf-8", on_bad_lines="skip") if os.path.exists(ruta_inc) else pd.DataFrame()
+            y_diag = pd.to_numeric(df_diag.get("result_bin", pd.Series(dtype=float)), errors="coerce")
+            pos_diag = int((y_diag == 1).sum())
+            neg_diag = int((y_diag == 0).sum())
+            feats_validas = int(len([c for c in df_diag.columns if c in INCREMENTAL_FEATURES_V2]))
+            last_err = str(globals().get("LAST_RETRAIN_ERROR", "") or "--")
+            print(Fore.CYAN + f"      Diagnóstico: clases pos/neg={pos_diag}/{neg_diag} | features válidas={feats_validas}/{len(INCREMENTAL_FEATURES_V2)} | último error train={last_err}")
+        except Exception:
+            pass
     else:
         pos = int(meta.get("pos", meta.get("n_pos", 0)) or 0)
         neg = int(meta.get("neg", meta.get("n_neg", 0)) or 0)
@@ -9114,7 +9144,7 @@ def mostrar_panel():
 
     # ACTUAL: quién está >= umbral vigente para compuerta REAL en este tick.
     umbral_actual_hud = float(_umbral_senal_actual_hud())
-    print(Fore.YELLOW + f"\nIA SEÑALES ACTUALES (≥{umbral_actual_hud*100:.0f}% ahora):")
+    print(Fore.YELLOW + f"\nIA SEÑALES OBSERVACIÓN (≥{umbral_actual_hud*100:.0f}% ahora):")
     now = []
     for bot in BOT_NAMES:
         st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
@@ -9134,10 +9164,13 @@ def mostrar_panel():
             roof_h = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
             cbot_h = DYN_ROOF_STATE.get("confirm_bot")
             cst_h = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
+            n_min_real, n_req_real = _n_minimo_real_status()
+            bloqueado_txt = "bloqueado" if n_min_real < n_req_real else "ok"
             print(
                 Fore.YELLOW
-                + f" Compuerta REAL: roof={roof_h*100:.1f}% | floor={float(_umbral_real_operativo_actual())*100:.1f}% | "
+                + f" Compuerta REAL (operativa): roof={roof_h*100:.1f}% | floor={float(_umbral_real_operativo_actual())*100:.1f}% | "
                   f"confirm={cst_h}/{int(DYN_ROOF_CONFIRM_TICKS)}" + (f" ({cbot_h})" if cbot_h else "")
+                  + f" | n_min_real={n_min_real}/{n_req_real} ({bloqueado_txt})"
             )
         except Exception:
             pass
@@ -9147,6 +9180,18 @@ def mostrar_panel():
     else:
         for b, p in sorted(now, key=lambda x: x[1], reverse=True):
             print(Fore.YELLOW + f"  {b}: {p*100:.1f}%")
+
+    try:
+        hot_rows = []
+        for b in BOT_NAMES:
+            st = estado_bots.get(b, {})
+            hot = list(st.get("ia_sensor_hot_feats", []) or [])[:3]
+            if hot:
+                hot_rows.append(f"{b}:{','.join(hot)}")
+        if hot_rows:
+            print(Fore.YELLOW + " SENSOR_PLANO hot-features: " + " | ".join(hot_rows))
+    except Exception:
+        pass
 
         # Calibración detallada movida a reporte externo (menos ruido en HUD principal)
     print(Fore.MAGENTA + "\nℹ️ Calibración IA detallada desactivada en HUD (usar: python reporte_real_vs_ficticio_ia.py --session debug).")
@@ -9469,7 +9514,7 @@ def evaluar_semaforo():
     owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
     try: saldo_val = float(obtener_valor_saldo() or 0.0)
     except: saldo_val = 0.0
-    costo = float(MARTI_ESCALADO[0])
+    costo = float(sum(MARTI_ESCALADO[:max(1, int(MAX_CICLOS))]))
 
     detalle = ""
     if owner and owner not in (None, "none"):
@@ -9477,7 +9522,7 @@ def evaluar_semaforo():
         return "🟡", "AVISO", detalle
     if saldo_val < costo:
         falta = costo - saldo_val
-        detalle = f"Saldo < requerido para ciclo1 ({costo:.2f}). Faltan {falta:.2f} USD para cubrir el ciclo1 de Martingala."
+        detalle = f"Saldo < colchón Martingala ({costo:.2f} para C1..C{int(MAX_CICLOS)}). Faltan {falta:.2f} USD."
         return "🟡", "AVISO", detalle
 
     n_inc = contar_filas_incremental()
@@ -9802,6 +9847,7 @@ PROB_CLONE_STD_MIN = 0.01
 PROB_CLONE_GAP_MIN = 0.005
 REAL_POST_TRADE_COOLDOWN_S = 45
 REAL_COOLDOWN_UNTIL_TS = 0.0
+LAST_RETRAIN_ERROR = ""
 
 DYN_ROOF_STATE = {
     "tick": 0,
@@ -9840,6 +9886,17 @@ def _umbral_real_operativo_actual() -> float:
     except Exception:
         pass
     return float(IA_ACTIVACION_REAL_THR)
+
+
+def _n_minimo_real_status() -> tuple[int, int]:
+    """Retorna (mínimo n actual entre bots, n requerido) para diagnóstico en HUD."""
+    try:
+        n_req = int(IA_ACTIVACION_REAL_MIN_N_POR_BOT)
+        n_vals = [int(estado_bots.get(b, {}).get("tamano_muestra", 0) or 0) for b in BOT_NAMES]
+        n_min = min(n_vals) if n_vals else 0
+        return int(n_min), int(n_req)
+    except Exception:
+        return 0, int(IA_ACTIVACION_REAL_MIN_N_POR_BOT)
 
 
 def _actualizar_compuerta_techo_dinamico() -> dict:
@@ -10740,12 +10797,13 @@ async def main():
                             umbral_ia_real = max(float(REAL_TRIGGER_MIN), float(get_umbral_real_calibrado()))
                             dyn_gate = None
 
-                        # Bloqueo por saldo (no abras ventanas si no puedes ejecutar ciclo1)
+                        # Bloqueo por saldo (evita abrir REAL sin colchón mínimo de martingala)
                         try:
                             saldo_val = float(obtener_valor_saldo() or 0.0)
                         except Exception:
                             saldo_val = 0.0
                         costo_ciclo1 = float(MARTI_ESCALADO[0])
+                        costo_plan = float(sum(MARTI_ESCALADO[:max(1, int(MAX_CICLOS))]))
 
                         # Candidatos: prob válida, reciente, IA activa (no OFF)
                         candidatos = []
@@ -10879,9 +10937,9 @@ async def main():
                             # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
 
                         # Si hay señal pero saldo insuficiente -> avisar y NO abrir ventana
-                        if candidatos and saldo_val < costo_ciclo1:
-                            falta = costo_ciclo1 - saldo_val
-                            agregar_evento(f"🚫 Señal IA bloqueada por saldo: falta {falta:.2f} USD para ciclo1 ({costo_ciclo1:.2f}).")
+                        if candidatos and saldo_val < costo_plan:
+                            falta = costo_plan - saldo_val
+                            agregar_evento(f"🚫 Señal IA bloqueada por saldo: falta {falta:.2f} USD para cubrir C1..C{int(MAX_CICLOS)} ({costo_plan:.2f}).")
                             candidatos = []
 
                         # ==================== AUTO-PRESELECCIÓN (MODO MANUAL) ====================
