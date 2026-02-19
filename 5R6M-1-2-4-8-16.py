@@ -173,6 +173,8 @@ HUD_VISIBLE = True       # Para ocultarlo con tecla
 # --- Objetivos / umbrales globales de IA ---
 IA_OBJETIVO_REAL_THR = 0.70   # objetivo de calidad REAL (meta: 70% aprox)
 IA_ACTIVACION_REAL_THR = 0.85 # mínimo operativo para activar señal REAL
+IA_ACTIVACION_REAL_THR_POST_N15 = 0.55  # al cumplir n mínimo por bot, baja el umbral operativo a 55%
+IA_ACTIVACION_REAL_MIN_N_POR_BOT = 15   # condición: todos los bots deben tener al menos n=15
 
 # --- Oráculo visual ---
 ORACULO_THR_MIN   = IA_ACTIVACION_REAL_THR
@@ -9125,7 +9127,7 @@ def mostrar_panel():
             cst_h = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
             print(
                 Fore.YELLOW
-                + f" Compuerta REAL: roof={roof_h*100:.1f}% | floor={float(DYN_ROOF_FLOOR)*100:.1f}% | "
+                + f" Compuerta REAL: roof={roof_h*100:.1f}% | floor={float(_umbral_real_operativo_actual())*100:.1f}% | "
                   f"confirm={cst_h}/{int(DYN_ROOF_CONFIRM_TICKS)}" + (f" ({cbot_h})" if cbot_h else "")
             )
         except Exception:
@@ -9793,7 +9795,35 @@ DYN_ROOF_STATE = {
     "confirm_bot": None,
     "confirm_streak": 0,
     "last_open_tick": 0,
+    "last_floor": None,
 }
+
+
+def _todos_bots_con_n_minimo_real(min_n: int | None = None) -> bool:
+    """True si TODOS los bots alcanzaron el mínimo de muestra para habilitar umbral REAL reducido."""
+    try:
+        n_req = int(IA_ACTIVACION_REAL_MIN_N_POR_BOT if min_n is None else min_n)
+        for b in BOT_NAMES:
+            n_b = int(estado_bots.get(b, {}).get("tamano_muestra", 0) or 0)
+            if n_b < n_req:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _umbral_real_operativo_actual() -> float:
+    """
+    Umbral REAL dinámico:
+    - Base 85%
+    - Baja a 55% cuando TODOS los bots tienen n>=15
+    """
+    try:
+        if _todos_bots_con_n_minimo_real():
+            return float(IA_ACTIVACION_REAL_THR_POST_N15)
+    except Exception:
+        pass
+    return float(IA_ACTIVACION_REAL_THR)
 
 
 def _actualizar_compuerta_techo_dinamico() -> dict:
@@ -9805,13 +9835,15 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
     - roof baja lento tras paciencia (hold), por lotes de batch ticks.
     - compuerta REAL exige: piso duro, techo efectivo, GAP y confirmación doble.
     """
+    floor_now = float(_umbral_real_operativo_actual())
+    modo_relajado_n15 = bool(_todos_bots_con_n_minimo_real())
     out = {
         "best_bot": None,
         "p_best": 0.0,
         "p_second": 0.0,
         "gap_ok": False,
-        "roof": float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR)),
-        "roof_eff": float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR)),
+        "roof": float(DYN_ROOF_STATE.get("roof", floor_now)),
+        "roof_eff": float(DYN_ROOF_STATE.get("roof", floor_now)),
         "confirm_streak": int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0),
         "allow_real": False,
         "n_best": 0,
@@ -9844,7 +9876,14 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         best_bot, p_best, n_best = live[0]
         p_second = float(live[1][1]) if len(live) > 1 else 0.0
 
-        roof = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
+        prev_floor = DYN_ROOF_STATE.get("last_floor", None)
+        if not isinstance(prev_floor, (int, float)) or abs(float(prev_floor) - float(floor_now)) > 1e-12:
+            DYN_ROOF_STATE["roof"] = float(floor_now)
+            DYN_ROOF_STATE["last_floor"] = float(floor_now)
+            DYN_ROOF_STATE["last_touch_tick"] = int(tick_now)
+            DYN_ROOF_STATE["melt_batches_applied"] = 0
+
+        roof = float(DYN_ROOF_STATE.get("roof", floor_now) or floor_now)
         last_touch = int(DYN_ROOF_STATE.get("last_touch_tick", 0) or 0)
 
         # Regla A: tocar/romper techo resetea paciencia; romperlo además lo eleva.
@@ -9863,25 +9902,32 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
                 batches_applied = int(DYN_ROOF_STATE.get("melt_batches_applied", 0) or 0)
                 if batches_now > batches_applied:
                     delta_batches = int(batches_now - batches_applied)
-                    roof = max(float(DYN_ROOF_FLOOR), float(roof - (delta_batches * DYN_ROOF_STEP)))
+                    roof = max(float(floor_now), float(roof - (delta_batches * DYN_ROOF_STEP)))
                     DYN_ROOF_STATE["roof"] = float(roof)
                     DYN_ROOF_STATE["melt_batches_applied"] = int(batches_now)
 
-        roof = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
+        roof = float(DYN_ROOF_STATE.get("roof", floor_now) or floor_now)
         penalty = float(DYN_ROOF_LOW_N_PENALTY) if int(n_best) < int(DYN_ROOF_LOW_N_MIN) else 0.0
         roof_eff = float(roof + penalty)
 
-        # GAP con fallback: si solo hay 1 bot válido, no se bloquea por GAP.
-        if len(live) <= 1:
+        # GAP con fallback:
+        # - Si solo hay 1 bot válido, no se bloquea por GAP.
+        # - En modo relajado (todos con n>=15), no exigir GAP para evitar congelamiento
+        #   cuando varios bots se agrupan cerca de 55%-60%.
+        if modo_relajado_n15 or len(live) <= 1:
             gap_ok = True
         else:
             gap_ok = (float(p_best) - float(p_second)) >= float(DYN_ROOF_GAP)
 
-        pass_gate = (
-            (float(p_best) >= float(roof_eff))
-            and (float(p_best) >= float(DYN_ROOF_FLOOR))
-            and bool(gap_ok)
-        )
+        # En modo relajado (n>=15 en todos): entrar con piso 55% sin depender del roof.
+        if modo_relajado_n15:
+            pass_gate = bool((float(p_best) >= float(floor_now)) and bool(gap_ok))
+        else:
+            pass_gate = (
+                (float(p_best) >= float(roof_eff))
+                and (float(p_best) >= float(floor_now))
+                and bool(gap_ok)
+            )
 
         # Confirmación: 2 ticks consecutivos del mismo bot.
         confirm_bot = DYN_ROOF_STATE.get("confirm_bot")
@@ -9899,7 +9945,8 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         DYN_ROOF_STATE["confirm_bot"] = confirm_bot
         DYN_ROOF_STATE["confirm_streak"] = int(confirm_streak)
 
-        allow_real = bool(pass_gate and (confirm_streak >= int(DYN_ROOF_CONFIRM_TICKS)))
+        confirm_need = 1 if modo_relajado_n15 else int(DYN_ROOF_CONFIRM_TICKS)
+        allow_real = bool(pass_gate and (confirm_streak >= int(confirm_need)))
         last_open_tick = int(DYN_ROOF_STATE.get("last_open_tick", 0) or 0)
         new_open = bool(allow_real and (last_open_tick != tick_now))
         if new_open:
@@ -10642,7 +10689,7 @@ async def main():
                         # acotado por [AUTO_REAL_THR_MIN .. AUTO_REAL_THR] para activar REAL
                         # usando los valores altos observados recientemente.
                         if REAL_CLASSIC_GATE:
-                            umbral_ia_real = float(IA_ACTIVACION_REAL_THR)
+                            umbral_ia_real = float(_umbral_real_operativo_actual())
                             dyn_gate = _actualizar_compuerta_techo_dinamico()
                             if isinstance(dyn_gate, dict) and bool(dyn_gate.get("new_open", False)):
                                 agregar_evento(
@@ -10682,7 +10729,7 @@ async def main():
                                     if not isinstance(p, (int, float)):
                                         continue
                                     # Primer filtro suave: evitar basura por debajo del piso operativo.
-                                    piso_operativo = float(DYN_ROOF_FLOOR) if REAL_CLASSIC_GATE else float(IA_ACTIVACION_REAL_THR)
+                                    piso_operativo = float(_umbral_real_operativo_actual()) if REAL_CLASSIC_GATE else float(IA_ACTIVACION_REAL_THR)
                                     if float(p) < float(piso_operativo):
                                         continue
 
