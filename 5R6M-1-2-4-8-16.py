@@ -319,6 +319,10 @@ marti_ciclos_perdidos = 0
 # - Si el HUD está en C2..C{MAX_CICLOS}, se evita reusar el último bot REAL.
 ultimo_bot_real = None
 
+# Rotación estricta por corrida de martingala REAL (C1..C5)
+# Guarda el orden de bots usados en la corrida activa para evitar repeticiones.
+bots_usados_en_esta_marti = []
+
 # Nueva: Umbrales mínimos para historial IA
 MIN_IA_SENIALES_CONF = 10  # Mínimo señales cerradas para confiar en prob_hist
 MIN_AUC_CONF = 0.65        # AUC mínimo para audios/colores verdes
@@ -5811,7 +5815,7 @@ def detectar_martingala_perdida_completa(bot):
 
 # Reinicio completo - Corregido para no resetear métricas en modo suave
 def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True):
-    global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos, ultimo_bot_real, REAL_OWNER_LOCK
+    global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos, ultimo_bot_real, bots_usados_en_esta_marti, REAL_OWNER_LOCK, MDE_LAST_ENTRY
     with file_lock():
         write_token_atomic(TOKEN_FILE, "REAL:none")
     
@@ -5871,7 +5875,9 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
     marti_activa = False
     marti_ciclos_perdidos = 0
     ultimo_bot_real = None
+    bots_usados_en_esta_marti = []
     REAL_OWNER_LOCK = None
+    MDE_LAST_ENTRY = False
     LIMPIEZA_PANEL_HASTA = time.time() + limpiar_visual_segundos
 
 # Reinicio de bot individual - Corregido similar
@@ -6007,13 +6013,21 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
     - GANANCIA: resetea a ciclo #1 (contador de pérdidas = 0).
     - PÉRDIDA: incrementa ciclo hasta MAX_CICLOS (tope de blindaje).
     """
-    global marti_ciclos_perdidos, marti_paso, ultimo_bot_real
+    global marti_ciclos_perdidos, marti_paso, ultimo_bot_real, bots_usados_en_esta_marti, MDE_STATE, MDE_LAST_ENTRY
 
     res = normalizar_resultado(resultado)
+    if bot in BOT_NAMES:
+        ultimo_bot_real = bot
+
     if res == "GANANCIA":
         marti_ciclos_perdidos = 0
         marti_paso = 0
+        bots_usados_en_esta_marti = []
     elif res == "PÉRDIDA":
+        # Registrar el bot operado en la corrida activa para forzar rotación C2..C5.
+        if bot in BOT_NAMES and bot not in bots_usados_en_esta_marti:
+            bots_usados_en_esta_marti.append(bot)
+
         # Robustez anti-desincronización:
         # si conocemos el ciclo realmente operado, el próximo estado de pérdidas
         # debe ser al menos ese ciclo (p.ej. perder en C2 => pérdidas=2 => próximo C3).
@@ -6029,6 +6043,7 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
         if int(marti_ciclos_perdidos) >= int(MAX_CICLOS):
             marti_ciclos_perdidos = 0
             marti_paso = 0
+            bots_usados_en_esta_marti = []
             try:
                 agregar_evento("🧯 Martingala 5/5 completada: reinicio automático a ciclo 1.")
             except Exception:
@@ -6038,11 +6053,33 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
     else:
         return
 
-    if bot in BOT_NAMES:
-        ultimo_bot_real = bot
+    # MDE: se apaga tras un turno REAL; si hubo pérdidas consecutivas bajo MDE,
+    # activa cooldown para no quedarse en modo kamikaze.
+    try:
+        if bool(MDE_LAST_ENTRY):
+            if res == "PÉRDIDA":
+                MDE_STATE["losses"] = int(MDE_STATE.get("losses", 0) or 0) + 1
+                if int(MDE_STATE.get("losses", 0) or 0) >= int(MDE_LOSSES_TO_COOLDOWN):
+                    MDE_STATE["cooldown_until"] = time.time() + float(MDE_COOLDOWN_S)
+                    MDE_STATE["losses"] = 0
+                    _mde_set_active(False, "pérdidas consecutivas en MDE (cooldown)")
+                else:
+                    _mde_set_active(False, "turno MDE ejecutado")
+            else:
+                MDE_STATE["losses"] = 0
+                _mde_set_active(False, "turno MDE ejecutado")
+            MDE_LAST_ENTRY = False
+    except Exception:
+        pass
 
     ciclo_sig = int(marti_paso) + 1
     bot_msg = f" [{bot}]" if bot else ""
+    if res == "PÉRDIDA" and bots_usados_en_esta_marti:
+        try:
+            usados = ",".join(bots_usados_en_esta_marti)
+            agregar_evento(f"🔁 Rotación martingala activa: usados={usados} | próximo ciclo=C{ciclo_sig}")
+        except Exception:
+            pass
     agregar_evento(
         f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo={ciclo_sig}"
     )
@@ -6056,6 +6093,66 @@ def ciclo_martingala_siguiente() -> int:
         return max(1, min(int(MAX_CICLOS), int(marti_ciclos_perdidos) + 1))
     except Exception:
         return 1
+
+
+def elegir_candidato_rotacion_marti(candidatos: list, ciclo_objetivo: int):
+    """
+    Rotación estricta para REAL en C2..C5:
+    - Excluye bots ya usados en la corrida activa (bots_usados_en_esta_marti).
+    - Si hay empate (p.ej. todos ~80%), desempata con señales secundarias
+      y evita repetir el último bot REAL cuando exista alternativa.
+    - Si no hay elegibles, anti-stall: permite reusar sin repetir inmediato
+      cuando sea posible.
+    """
+    try:
+        ciclo = int(ciclo_objetivo)
+    except Exception:
+        ciclo = 1
+
+    if not candidatos:
+        return None
+
+    def _key(c):
+        try:
+            _, b, p_model, p_post, reg_score, ev_n, _ev_wr, ev_lb = c
+        except Exception:
+            b = ""
+            p_model = p_post = reg_score = ev_lb = 0.0
+            ev_n = 0
+        bonus_no_repetir = 1 if b != ultimo_bot_real else 0
+        try:
+            idx_bot = BOT_NAMES.index(b)
+        except Exception:
+            idx_bot = len(BOT_NAMES)
+        # Orden total determinista para evitar arbitrariedad cuando todos están iguales.
+        return (
+            float(c[0]),                # score_final
+            float(p_post),              # prob posterior
+            float(p_model),             # prob modelo
+            float(reg_score),           # score de régimen
+            float(ev_lb),               # evidence lower bound
+            int(ev_n),                  # evidencia n
+            int(bonus_no_repetir),      # evita repetir último owner REAL
+            -int(idx_bot),              # orden estable por lista canónica
+        )
+
+    candidatos_ordenados = sorted(candidatos, key=_key, reverse=True)
+
+    if ciclo <= 1:
+        return candidatos_ordenados[0]
+
+    usados = [b for b in bots_usados_en_esta_marti if b in BOT_NAMES]
+    usados_set = set(usados)
+    candidatos_nuevos = [c for c in candidatos_ordenados if c[1] not in usados_set]
+    if candidatos_nuevos:
+        return candidatos_nuevos[0]
+
+    # Degradación anti-stall: evitar freeze total si todos los elegibles ya se usaron.
+    ultimo = usados[-1] if usados else None
+    no_ultimo = [c for c in candidatos_ordenados if c[1] != ultimo]
+    if no_ultimo:
+        return no_ultimo[0]
+    return candidatos_ordenados[0]
 
 # === FIN BLOQUE 9 ===
 
@@ -9749,6 +9846,175 @@ DYN_ROOF_STATE = {
     "last_open_tick": 0,
 }
 
+# =========================================================
+# MODO DESBLOQUEO POR ESTANCAMIENTO (MDE)
+# =========================================================
+MDE_ENABLED = True
+MDE_BOOT_THR = 0.55
+MDE_MIN_N_BOT = 15
+MDE_STALL_WINDOW_S = 12 * 60
+MDE_STALL_MIN_COVERAGE_S = 8 * 60
+MDE_EARLY_N_MAX = 25
+MDE_EARLY_WINDOW_S = 3 * 60
+MDE_EARLY_COVERAGE_S = 2 * 60
+MDE_SPREAD_EPS = 0.005
+MDE_DRIFT_EPS = 0.005
+MDE_CONFIRM_TICKS = 3
+MDE_MAX_ON_S = 15 * 60
+MDE_LOSSES_TO_COOLDOWN = 2
+MDE_COOLDOWN_S = 3 * 60
+
+MDE_PROB_HISTORY = {b: deque(maxlen=1200) for b in BOT_NAMES}
+MDE_STATE = {
+    "active": False,
+    "active_since": 0.0,
+    "confirm_bot": None,
+    "confirm_streak": 0,
+    "cooldown_until": 0.0,
+    "losses": 0,
+}
+MDE_LAST_ENTRY = False
+
+
+def _mde_set_active(active: bool, motivo: str = ""):
+    now = time.time()
+    was_active = bool(MDE_STATE.get("active", False))
+    if active:
+        MDE_STATE["active"] = True
+        if float(MDE_STATE.get("active_since", 0.0) or 0.0) <= 0.0:
+            MDE_STATE["active_since"] = now
+        if not was_active:
+            agregar_evento(f"🟠 MDE ON: {motivo or 'estancamiento detectado'} | thr_boot={MDE_BOOT_THR*100:.1f}%")
+    else:
+        MDE_STATE["active"] = False
+        MDE_STATE["active_since"] = 0.0
+        MDE_STATE["confirm_bot"] = None
+        MDE_STATE["confirm_streak"] = 0
+        if was_active:
+            agregar_evento(f"🟢 MDE OFF: {motivo or 'retorno a lógica base'}")
+
+
+def _mde_live_snapshot(max_age_s: float = 12.0):
+    live = []
+    for b in BOT_NAMES:
+        try:
+            if str(estado_bots.get(b, {}).get("modo_ia", "off")).lower() == "off":
+                continue
+            if not ia_prob_valida(b, max_age_s=max_age_s):
+                continue
+            p = float(estado_bots.get(b, {}).get("prob_ia", 0.0) or 0.0)
+            n = int(estado_bots.get(b, {}).get("tamano_muestra", 0) or estado_bots.get(b, {}).get("ia_seniales", 0) or 0)
+            if np.isfinite(p):
+                live.append((b, p, n))
+        except Exception:
+            continue
+    return live
+
+
+def _mde_track_probs(live_rows):
+    now = time.time()
+    for b, p, _n in live_rows:
+        dq = MDE_PROB_HISTORY.get(b)
+        if dq is None:
+            continue
+        dq.append((now, float(p)))
+
+
+def _mde_is_stalled(live_rows, umbral_normal: float):
+    if len(live_rows) < 3:
+        return False
+    probs = [float(x[1]) for x in live_rows]
+    ns = [int(x[2]) for x in live_rows]
+    if max(probs) >= float(umbral_normal):
+        return False
+    if min(ns) < int(MDE_MIN_N_BOT):
+        return False
+
+    spread = max(probs) - min(probs)
+    if spread > float(MDE_SPREAD_EPS):
+        return False
+
+    # Arranque temprano: cuando recién se supera n>=15 en todos los bots,
+    # permitimos detectar estancamiento con ventana más corta para no esperar 8-12 min.
+    min_n = min(ns) if ns else 0
+    window_s = float(MDE_STALL_WINDOW_S)
+    coverage_s = float(MDE_STALL_MIN_COVERAGE_S)
+    if int(min_n) <= int(MDE_EARLY_N_MAX):
+        window_s = float(MDE_EARLY_WINDOW_S)
+        coverage_s = float(MDE_EARLY_COVERAGE_S)
+
+    now = time.time()
+    for b, _p, _n in live_rows:
+        dq = MDE_PROB_HISTORY.get(b) or deque()
+        vals = [v for (t, v) in dq if (now - float(t)) <= window_s]
+        if len(vals) < 3:
+            return False
+        ts = [t for (t, _v) in dq if (now - float(t)) <= window_s]
+        if not ts or (max(ts) - min(ts)) < coverage_s:
+            return False
+        drift = max(vals) - min(vals)
+        if drift > float(MDE_DRIFT_EPS):
+            return False
+    return True
+
+
+def _mde_refresh_state(no_real_activo: bool, umbral_normal: float):
+    if not bool(MDE_ENABLED):
+        _mde_set_active(False, "deshabilitado")
+        return False
+
+    now = time.time()
+    live_rows = _mde_live_snapshot(max_age_s=12.0)
+    _mde_track_probs(live_rows)
+
+    cooldown_until = float(MDE_STATE.get("cooldown_until", 0.0) or 0.0)
+    if now < cooldown_until:
+        _mde_set_active(False, f"cooldown {max(1, int(cooldown_until - now))}s")
+        return False
+
+    if not no_real_activo:
+        _mde_set_active(False, "REAL activo")
+        return False
+
+    probs = [float(x[1]) for x in live_rows] if live_rows else [0.0]
+    spread = (max(probs) - min(probs)) if len(probs) >= 2 else 0.0
+
+    if bool(MDE_STATE.get("active", False)):
+        active_since = float(MDE_STATE.get("active_since", 0.0) or 0.0)
+        if active_since > 0 and (now - active_since) >= float(MDE_MAX_ON_S):
+            _mde_set_active(False, "TTL agotado")
+            return False
+        if max(probs) >= float(umbral_normal):
+            _mde_set_active(False, "señal normal >= 85%")
+            return False
+        if spread > float(MDE_SPREAD_EPS * 1.6):
+            _mde_set_active(False, "mercado dejó de estar plano")
+            return False
+        return True
+
+    stalled = _mde_is_stalled(live_rows, umbral_normal=float(umbral_normal))
+    if stalled:
+        _mde_set_active(True, f"estancamiento (spread={spread*100:.2f}pp)")
+        return True
+    return False
+
+
+def _mde_confirma_top(bot_top: str | None):
+    if not bool(MDE_STATE.get("active", False)):
+        return True
+    if bot_top not in BOT_NAMES:
+        MDE_STATE["confirm_bot"] = None
+        MDE_STATE["confirm_streak"] = 0
+        return False
+
+    if MDE_STATE.get("confirm_bot") == bot_top:
+        MDE_STATE["confirm_streak"] = int(MDE_STATE.get("confirm_streak", 0) or 0) + 1
+    else:
+        MDE_STATE["confirm_bot"] = bot_top
+        MDE_STATE["confirm_streak"] = 1
+
+    return int(MDE_STATE.get("confirm_streak", 0) or 0) >= int(MDE_CONFIRM_TICKS)
+
 
 def _actualizar_compuerta_techo_dinamico() -> dict:
     """
@@ -10592,10 +10858,15 @@ async def main():
                             activo_real = owner_lock if owner_lock in BOT_NAMES else holder_memoria
                             _enforce_single_real_standby(activo_real)
 
+                        mde_activo = _mde_refresh_state(
+                            no_real_activo=(not lock_activo),
+                            umbral_normal=float(IA_ACTIVACION_REAL_THR),
+                        )
+
                         # Umbral maestro calibrado con históricos de Prob IA (top quantil),
                         # acotado por [AUTO_REAL_THR_MIN .. AUTO_REAL_THR] para activar REAL
                         # usando los valores altos observados recientemente.
-                        if REAL_CLASSIC_GATE:
+                        if REAL_CLASSIC_GATE and (not mde_activo):
                             umbral_ia_real = float(IA_ACTIVACION_REAL_THR)
                             dyn_gate = _actualizar_compuerta_techo_dinamico()
                             if isinstance(dyn_gate, dict) and bool(dyn_gate.get("new_open", False)):
@@ -10636,13 +10907,13 @@ async def main():
                                     if not isinstance(p, (int, float)):
                                         continue
                                     # Primer filtro suave: evitar basura por debajo del piso operativo.
-                                    piso_operativo = float(DYN_ROOF_FLOOR) if REAL_CLASSIC_GATE else float(IA_ACTIVACION_REAL_THR)
+                                    piso_operativo = float(MDE_BOOT_THR) if mde_activo else (float(DYN_ROOF_FLOOR) if REAL_CLASSIC_GATE else float(IA_ACTIVACION_REAL_THR))
                                     if float(p) < float(piso_operativo):
                                         continue
 
                                     # Modo clásico reforzado: compuerta dinámica anti-bug.
                                     # Solo el mejor bot del tick puede pasar, con piso duro + GAP + confirmación doble.
-                                    if REAL_CLASSIC_GATE:
+                                    if REAL_CLASSIC_GATE and (not mde_activo):
                                         if not isinstance(dyn_gate, dict):
                                             continue
                                         if b != dyn_gate.get("best_bot"):
@@ -10710,7 +10981,7 @@ async def main():
                                     p_post = _prob_real_posterior(float(p), float(regime_score), int(ev_n), float(ev_wr), float(ev_lb))
 
                                     # Candado final: el umbral REAL se valida sobre la probabilidad posterior (no p_model)
-                                    thr_post = float(umbral_ia_real)
+                                    thr_post = float(MDE_BOOT_THR) if mde_activo else float(umbral_ia_real)
                                     if ev_n < int(EVIDENCE_MIN_N_SOFT):
                                         thr_post = min(0.99, thr_post + float(EVIDENCE_LOW_N_EXTRA_MARGIN))
                                     if float(p_post) < float(thr_post):
@@ -10718,7 +10989,7 @@ async def main():
 
                                     # Candado anti-overconfidence global: si el diagnóstico reporta gap alto,
                                     # solo promover con evidencia fuerte (LB + N) aunque p_post supere umbral.
-                                    if bool(diag_gate.get("force_evidence", False)):
+                                    if (not mde_activo) and bool(diag_gate.get("force_evidence", False)):
                                         if not ((ev_n >= int(EVIDENCE_MIN_N_HARD)) and (ev_lb >= float(EVIDENCE_MIN_LB_HARD))):
                                             continue
 
@@ -10749,6 +11020,10 @@ async def main():
 
                             # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
 
+                        if mde_activo and not candidatos:
+                            MDE_STATE["confirm_bot"] = None
+                            MDE_STATE["confirm_streak"] = 0
+
                         # Si hay señal pero saldo insuficiente -> avisar y NO abrir ventana
                         if candidatos and saldo_val < costo_ciclo1:
                             falta = costo_ciclo1 - saldo_val
@@ -10770,44 +11045,63 @@ async def main():
 
                             owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
                             if candidatos and (PENDIENTE_FORZAR_BOT is None) and (owner in (None, "none")):
-                                candidatos.sort(reverse=True)
-                                score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = candidatos[0]
-                                agregar_evento(f"🧠 Embudo IA: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
-                                PENDIENTE_FORZAR_BOT = mejor_bot
-                                PENDIENTE_FORZAR_INICIO = ahora
-                                PENDIENTE_FORZAR_EXPIRA = ahora + VENTANA_DECISION_IA_S
+                                ciclo_auto = ciclo_martingala_siguiente()
+                                mejor = elegir_candidato_rotacion_marti(candidatos, ciclo_auto)
+                                if mejor is not None:
+                                    score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
+                                    if mde_activo and (not _mde_confirma_top(mejor_bot)):
+                                        agregar_evento(f"⏳ MDE confirmando top: {mejor_bot} ({int(MDE_STATE.get('confirm_streak',0))}/{int(MDE_CONFIRM_TICKS)})")
+                                    else:
+                                        agregar_evento(f"🧠 Embudo IA{ ' [MDE]' if mde_activo else ''}: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
+                                        PENDIENTE_FORZAR_BOT = mejor_bot
+                                        PENDIENTE_FORZAR_INICIO = ahora
+                                        PENDIENTE_FORZAR_EXPIRA = ahora + VENTANA_DECISION_IA_S
 
-                                # marcamos señal pendiente (sirve para contabilidad IA luego)
-                                estado_bots[mejor_bot]["ia_senal_pendiente"] = True
-                                estado_bots[mejor_bot]["ia_prob_senal"] = prob
+                                        # marcamos señal pendiente (sirve para contabilidad IA luego)
+                                        estado_bots[mejor_bot]["ia_senal_pendiente"] = True
+                                        estado_bots[mejor_bot]["ia_prob_senal"] = prob
 
-                                agregar_evento(
-                                    f"🟢 Señal IA en {mejor_bot} ({prob*100:.1f}%). "
-                                    f"Tienes {VENTANA_DECISION_IA_S}s para elegir ciclo [1..{MAX_CICLOS}] o ESC."
-                                )
+                                        agregar_evento(
+                                            f"🟢 Señal IA en {mejor_bot} ({prob*100:.1f}%). "
+                                            f"Tienes {VENTANA_DECISION_IA_S}s para elegir ciclo [1..{MAX_CICLOS}] o ESC."
+                                        )
                         # ==================== /AUTO-PRESELECCIÓN ====================
 
                         if candidatos and not MODO_REAL_MANUAL:
-                            candidatos.sort(reverse=True)
-                            score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = candidatos[0]
-                            agregar_evento(f"⚙️ IA AUTO: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
                             ciclo_auto = ciclo_martingala_siguiente()
-                            monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
-                            val = obtener_valor_saldo()
-                            if val is None or val < monto:
-                                pass
-                            else:
-                                estado_bots[mejor_bot]["ia_senal_pendiente"] = True
-                                estado_bots[mejor_bot]["ia_prob_senal"] = prob
-                                ok_real = escribir_orden_real(mejor_bot, ciclo_auto)
-                                if ok_real:
-                                    estado_bots[mejor_bot]["fuente"] = "IA_AUTO"
-                                    estado_bots[mejor_bot]["ciclo_actual"] = ciclo_auto
-                                    activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else mejor_bot
-                                    marti_activa = True
+                            mejor = elegir_candidato_rotacion_marti(candidatos, ciclo_auto)
+                            if mejor is not None:
+                                score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
+                                if mde_activo and (not _mde_confirma_top(mejor_bot)):
+                                    agregar_evento(f"⏳ MDE confirmando top: {mejor_bot} ({int(MDE_STATE.get('confirm_streak',0))}/{int(MDE_CONFIRM_TICKS)})")
                                 else:
-                                    estado_bots[mejor_bot]["ia_senal_pendiente"] = False
-                                    estado_bots[mejor_bot]["ia_prob_senal"] = None
+                                    agregar_evento(f"⚙️ IA AUTO{' [MDE]' if mde_activo else ''}: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
+                                    monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
+                                    val = obtener_valor_saldo()
+                                    if val is None or val < monto:
+                                        pass
+                                    else:
+                                        estado_bots[mejor_bot]["ia_senal_pendiente"] = True
+                                        estado_bots[mejor_bot]["ia_prob_senal"] = prob
+
+                                        # Handoff entre ciclos REAL: si quedó lock residual de otro bot,
+                                        # liberarlo antes de emitir la nueva orden para no bloquear rotación.
+                                        owner_prev = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+                                        if owner_prev and owner_prev != mejor_bot and ciclo_auto > 1:
+                                            cerrar_por_fin_de_ciclo(owner_prev, f"Handoff rotación C{ciclo_auto}→{mejor_bot}")
+
+                                        ok_real = escribir_orden_real(mejor_bot, ciclo_auto)
+                                        if ok_real:
+                                            estado_bots[mejor_bot]["fuente"] = "MDE_AUTO" if mde_activo else "IA_AUTO"
+                                            estado_bots[mejor_bot]["ciclo_actual"] = ciclo_auto
+                                            activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else mejor_bot
+                                            marti_activa = True
+                                            if mde_activo:
+                                                globals()["MDE_LAST_ENTRY"] = True
+                                                _mde_set_active(False, "turno bootstrap enviado a REAL")
+                                        else:
+                                            estado_bots[mejor_bot]["ia_senal_pendiente"] = False
+                                            estado_bots[mejor_bot]["ia_prob_senal"] = None
                         else:
                             max_prob = max((estado_bots[bot]["prob_ia"] for bot in BOT_NAMES if estado_bots[bot]["ia_ready"]), default=0)
                             if max_prob < umbral_ia_real:
