@@ -350,6 +350,8 @@ MIN_TRAIN_ROWS  = 250
 TEST_SIZE_FRAC  = 0.20
 MIN_TEST_ROWS   = 40
 THR_DEFAULT = 0.50
+MIN_TRAIN_ROWS_ADAPTIVE = 40  # evita entrenar con train ridículo cuando el dataset aún es chico
+MIN_TRAIN_SHARE_ADAPTIVE = 0.60
 
 # Split honesto: TRAIN_BASE (pasado) / CALIB (más reciente) / TEST (último)
 CALIB_SIZE_FRAC = 0.15
@@ -1910,7 +1912,7 @@ def activar_remate(bot: str, reason: str):
 
 # Cerrar por WIN
 def cerrar_por_win(bot: str, reason: str):
-    global REAL_OWNER_LOCK
+    global REAL_OWNER_LOCK, REAL_COOLDOWN_UNTIL_TS
     # Limpieza total de “estado REAL” para evitar REAL fantasma
     try:
         estado_bots[bot]["token"] = "DEMO"
@@ -1936,6 +1938,7 @@ def cerrar_por_win(bot: str, reason: str):
 
     # Liberar token global REAL
     REAL_OWNER_LOCK = None
+    REAL_COOLDOWN_UNTIL_TS = time.time() + float(REAL_POST_TRADE_COOLDOWN_S)
     try:
         with file_lock():
             write_token_atomic(TOKEN_FILE, "REAL:none")
@@ -5934,7 +5937,7 @@ def reiniciar_bot(bot, borrar_csv=False):
         huellas_usadas[bot] = set()
 
 def cerrar_por_fin_de_ciclo(bot: str, reason: str):
-    global REAL_OWNER_LOCK
+    global REAL_OWNER_LOCK, REAL_COOLDOWN_UNTIL_TS
     # Limpieza total de “estado REAL” para evitar HUD/estado fantasma
     try:
         estado_bots[bot]["token"] = "DEMO"
@@ -5962,6 +5965,7 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
 
     # Liberar token global REAL
     REAL_OWNER_LOCK = None
+    REAL_COOLDOWN_UNTIL_TS = time.time() + float(REAL_POST_TRADE_COOLDOWN_S)
     try:
         with file_lock():
             write_token_atomic(TOKEN_FILE, "REAL:none")
@@ -8218,6 +8222,11 @@ def maybe_retrain(force: bool = False):
 
         # 8) Split temporal TRAIN/CALIB/TEST
         def _calc_sizes(n):
+            min_train_req = int(max(
+                MIN_FIT_ROWS_LOW,
+                MIN_TRAIN_ROWS_ADAPTIVE,
+                int(round(float(n) * float(MIN_TRAIN_SHARE_ADAPTIVE))),
+            ))
             n_test = int(max(MIN_TEST_ROWS, int(round(n * float(TEST_SIZE_FRAC)))))
             n_cal  = int(max(MIN_CALIB_ROWS, int(round(n * float(CALIB_SIZE_FRAC)))))
 
@@ -8226,8 +8235,8 @@ def maybe_retrain(force: bool = False):
                 n_cal  = max(0, int(round(n * 0.15)))
 
             n_train = n - n_cal - n_test
-            if n_train < int(MIN_FIT_ROWS_LOW):
-                falta = int(MIN_FIT_ROWS_LOW) - n_train
+            if n_train < int(min_train_req):
+                falta = int(min_train_req) - n_train
                 if n_cal > 0:
                     cut = min(n_cal, falta)
                     n_cal -= cut
@@ -8238,7 +8247,7 @@ def maybe_retrain(force: bool = False):
                     falta -= cut
                 n_train = n - n_cal - n_test
 
-            if n_train < int(MIN_FIT_ROWS_LOW):
+            if n_train < int(min_train_req):
                 return None
 
             return n_train, n_cal, n_test
@@ -9618,7 +9627,10 @@ def backfill_incremental(ultimas=500):
                     "sma_20": r.get("sma_20", 0.0),
                     "close": r.get("close", r.get("cierre", None)),
                 })
-                fila["sma_spread"] = float(sp) if sp is not None else 0.0
+                if sp is None or not np.isfinite(float(sp)):
+                    descartadas += 1
+                    continue
+                fila["sma_spread"] = float(sp)
 
                 # Diccionario completo para helpers enriquecidos
                 row_dict_full = r.to_dict()
@@ -9786,6 +9798,10 @@ DYN_ROOF_NEAR_TOL = 0.005
 # Penalización por evidencia corta (n < 30): requiere +2pp al techo
 DYN_ROOF_LOW_N_MIN = 30
 DYN_ROOF_LOW_N_PENALTY = 0.02
+PROB_CLONE_STD_MIN = 0.01
+PROB_CLONE_GAP_MIN = 0.005
+REAL_POST_TRADE_COOLDOWN_S = 45
+REAL_COOLDOWN_UNTIL_TS = 0.0
 
 DYN_ROOF_STATE = {
     "tick": 0,
@@ -9875,6 +9891,8 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         live.sort(key=lambda x: x[1], reverse=True)
         best_bot, p_best, n_best = live[0]
         p_second = float(live[1][1]) if len(live) > 1 else 0.0
+        probs_live = [float(x[1]) for x in live]
+        spread_std = float(np.std(probs_live)) if probs_live else 0.0
 
         prev_floor = DYN_ROOF_STATE.get("last_floor", None)
         if not isinstance(prev_floor, (int, float)) or abs(float(prev_floor) - float(floor_now)) > 1e-12:
@@ -9918,6 +9936,16 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             gap_ok = True
         else:
             gap_ok = (float(p_best) - float(p_second)) >= float(DYN_ROOF_GAP)
+
+        clone_flat = bool(
+            (len(live) >= 2)
+            and (
+                (spread_std < float(PROB_CLONE_STD_MIN))
+                or ((float(p_best) - float(p_second)) < float(PROB_CLONE_GAP_MIN))
+            )
+        )
+        if clone_flat:
+            gap_ok = False
 
         # En modo relajado (n>=15 en todos): entrar con piso 55% sin depender del roof.
         if modo_relajado_n15:
@@ -9963,6 +9991,8 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             "allow_real": bool(allow_real),
             "n_best": int(n_best),
             "new_open": bool(new_open),
+            "clone_flat": bool(clone_flat),
+            "spread_std": float(spread_std),
         })
         return out
     except Exception:
@@ -10020,9 +10050,15 @@ async def cargar_datos_bot(bot, token_actual):
         SNAPSHOT_FILAS[bot] = len(df)
 
         required_cols = [
-            "rsi_9", "rsi_14", "sma_5", "sma_20", "cruce_sma", "breakout",
+            "rsi_9", "rsi_14", "sma_5", "cruce_sma", "breakout",
             "rsi_reversion", "racha_actual", "puntaje_estrategia"
         ]
+        try:
+            _, _, features_live, _ = get_oracle_assets()
+            if isinstance(features_live, list) and "sma_20" in features_live:
+                required_cols.append("sma_20")
+        except Exception:
+            pass
 
         for _, row in nuevas.iterrows():
             fila_dict = row.to_dict()
@@ -10881,6 +10917,17 @@ async def main():
                                         f"Tienes {VENTANA_DECISION_IA_S}s para elegir ciclo [1..{MAX_CICLOS}] o ESC."
                                     )
                         # ==================== /AUTO-PRESELECCIÓN ====================
+
+                        if candidatos and not MODO_REAL_MANUAL:
+                            meta_live = leer_model_meta() or {}
+                            modelo_reliable = bool(meta_live.get("reliable", False))
+                            if not modelo_reliable:
+                                agregar_evento("🛡️ IA AUTO bloqueado: modelo no confiable (reliable=false).")
+                                candidatos = []
+                            elif time.time() < float(REAL_COOLDOWN_UNTIL_TS):
+                                restantes = max(0.0, float(REAL_COOLDOWN_UNTIL_TS) - time.time())
+                                agregar_evento(f"⏳ IA AUTO cooldown post-trade activo ({restantes:.0f}s).")
+                                candidatos = []
 
                         if candidatos and not MODO_REAL_MANUAL:
                             ciclo_auto = ciclo_martingala_siguiente()
