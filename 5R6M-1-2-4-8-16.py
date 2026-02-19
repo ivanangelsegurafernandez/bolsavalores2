@@ -308,6 +308,7 @@ RELIABLE_NEG_MIN  = 20
 # Modo manual desactivado: priorizamos automatización completa por Prob IA.
 # Si luego quieres volver al modo manual, ponlo en True.
 MODO_REAL_MANUAL = False
+MODO_EJECUCION = "DEMO_ONLY"  # DEMO_ONLY = REAL sombra (nunca token real), REAL_LIVE = dinero real
 
 # Martingala global
 marti_paso = 0
@@ -1497,12 +1498,19 @@ def _enforce_single_real_standby(owner: str | None):
     except Exception:
         pass
 
+def _modo_ejecucion_demo_only() -> bool:
+    try:
+        return str(MODO_EJECUCION or "REAL_LIVE").strip().upper() == "DEMO_ONLY"
+    except Exception:
+        return False
+
+
 def _escribir_orden_real_raw(bot: str, ciclo: int):
     """
     Escritura RAW de orden_real (sin activar_real_inmediato, sin recursión).
     """
     ciclo = max(1, min(int(ciclo), MAX_CICLOS))
-    payload = {"bot": bot, "ciclo": ciclo, "ts": time.time()}
+    payload = {"bot": bot, "ciclo": ciclo, "ts": time.time(), "exec_mode": str(MODO_EJECUCION or "REAL_LIVE").upper()}
     try:
         _atomic_write(path_orden(bot), json.dumps(payload, ensure_ascii=False))
         agregar_evento(f"📝 Orden REAL escrita para {bot}: ciclo #{ciclo}")
@@ -1585,16 +1593,25 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
         except Exception:
             prev_holder = None
 
-        # Reservar lock owner en memoria + token REAL en archivo
+        # Reservar lock owner en memoria (owner operativo)
         REAL_OWNER_LOCK = bot
 
-        # Reservar token REAL en archivo SOLO cuando corresponde:
-        # - orden_real: orden explícita ya escrita por wrapper
-        # - manual: el propio activar_real_inmediato puede escribir orden_real
-        # - token_sync: sincroniza token sin tocar orden_real.json
-        if origen in ("orden_real", "manual", "token_sync"):
+        # En DEMO_ONLY, nunca escribimos token REAL (cortafuegos).
+        if _modo_ejecucion_demo_only():
             with file_lock():
-                write_token_atomic(TOKEN_FILE, f"REAL:{bot}")
+                write_token_atomic(TOKEN_FILE, f"DEMO:{bot}")
+            try:
+                estado_bots[bot]["fuente"] = "REAL_SOMBRA"
+            except Exception:
+                pass
+        else:
+            # Reservar token REAL en archivo SOLO cuando corresponde:
+            # - orden_real: orden explícita ya escrita por wrapper
+            # - manual: el propio activar_real_inmediato puede escribir orden_real
+            # - token_sync: sincroniza token sin tocar orden_real.json
+            if origen in ("orden_real", "manual", "token_sync"):
+                with file_lock():
+                    write_token_atomic(TOKEN_FILE, f"REAL:{bot}")
 
 
 
@@ -1716,7 +1733,7 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
         pass
 
     _escribir_orden_real_raw(bot, ciclo)
-    activar_real_inmediato(bot, ciclo, origen="orden_real")
+    activar_real_inmediato(bot, ciclo, origen="shadow_demo" if _modo_ejecucion_demo_only() else "orden_real")
 
     owner_after = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
     return owner_after == bot
@@ -1948,7 +1965,7 @@ def cerrar_por_win(bot: str, reason: str):
     REAL_COOLDOWN_UNTIL_TS = time.time() + float(REAL_POST_TRADE_COOLDOWN_S)
     try:
         with file_lock():
-            write_token_atomic(TOKEN_FILE, "REAL:none")
+            write_token_atomic(TOKEN_FILE, "DEMO:none" if _modo_ejecucion_demo_only() else "REAL:none")
     except Exception:
         pass
     # Limpiar orden REAL para evitar re-entradas fantasma
@@ -5834,7 +5851,7 @@ def detectar_martingala_perdida_completa(bot):
 def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True):
     global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos, ultimo_bot_real, bots_usados_en_esta_marti, REAL_OWNER_LOCK
     with file_lock():
-        write_token_atomic(TOKEN_FILE, "REAL:none")
+        write_token_atomic(TOKEN_FILE, "DEMO:none" if _modo_ejecucion_demo_only() else "REAL:none")
     
     if borrar_csv and os.path.exists("dataset_incremental.csv"):
         os.remove("dataset_incremental.csv")
@@ -5980,7 +5997,7 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     REAL_COOLDOWN_UNTIL_TS = time.time() + float(REAL_POST_TRADE_COOLDOWN_S)
     try:
         with file_lock():
-            write_token_atomic(TOKEN_FILE, "REAL:none")
+            write_token_atomic(TOKEN_FILE, "DEMO:none" if _modo_ejecucion_demo_only() else "REAL:none")
     except Exception:
         pass
 
@@ -8756,6 +8773,8 @@ def mostrar_panel():
         modo_op, saldo_op, _ = _saldo_operativo_info()
         saldo_op_txt = f"{float(saldo_op):.2f}" if saldo_op is not None else "--"
         print(padding + Fore.CYAN + f"💳 SALDO OPERATIVO: {modo_op} {saldo_op_txt}")
+        fw_txt = "ON (DEMO_ONLY)" if _modo_ejecucion_demo_only() else "OFF (REAL_LIVE)"
+        print(padding + Fore.YELLOW + f"🧯 FIREWALL REAL: {fw_txt}")
     except Exception:
         pass
 
@@ -10717,6 +10736,10 @@ async def main():
             inicializar_saldo_real(valor)
 
         _real_sim_load_state()
+        try:
+            agregar_evento(f"🧯 Modo ejecución: {str(MODO_EJECUCION or 'REAL_LIVE').upper()} (token real bloqueado)." if _modo_ejecucion_demo_only() else f"🧯 Modo ejecución: {str(MODO_EJECUCION or 'REAL_LIVE').upper()}.")
+        except Exception:
+            pass
 
         set_etapa("BOOT_03", "Backfill y primer entrenamiento")
         # Backfill IA desde los logs enriquecidos
@@ -10758,7 +10781,7 @@ async def main():
                 # liberamos lock fantasma para permitir nuevas asignaciones REAL correctas.
                 owner_mem_now = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
                 owner_file_now = leer_token_archivo_raw()
-                if owner_mem_now and (owner_file_now is None):
+                if owner_mem_now and (owner_file_now is None) and (not _modo_ejecucion_demo_only()):
                     if REAL_LOCK_MISMATCH_SINCE <= 0.0:
                         REAL_LOCK_MISMATCH_SINCE = time.time()
                     elif (time.time() - REAL_LOCK_MISMATCH_SINCE) >= float(REAL_LOCK_RECONCILE_S):
@@ -11089,7 +11112,7 @@ async def main():
                             mejor = elegir_candidato_rotacion_marti(candidatos, ciclo_auto)
                             if mejor is not None:
                                 score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
-                                agregar_evento(f"⚙️ IA AUTO: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
+                                agregar_evento(f"⚙️ IA AUTO[{str(MODO_EJECUCION or 'REAL_LIVE').upper()}]: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
                                 monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
                                 val = _saldo_operativo_valor()
                                 if val is None or val < monto:
