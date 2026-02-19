@@ -572,6 +572,12 @@ DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 saldo_real = "--"
 SALDO_INICIAL = None
 META = None
+REAL_SIM_ENABLED = True
+MODO_SALDO_OPERATIVO = "REAL_SIM"  # REAL | REAL_SIM
+REAL_SIM_STATE_PATH = "real_sim_state.json"
+REAL_SIM_BALANCE = 35.0
+REAL_SIM_META = round(float(REAL_SIM_BALANCE) * 1.15, 2)
+REAL_SIM_LAST_DELTA = 0.0
 meta_mostrada = False
 eventos_recentes = deque(maxlen=8)
 reinicio_forzado = asyncio.Event()
@@ -8743,6 +8749,15 @@ def mostrar_panel():
         saldo_str = "--"
 
     print(padding + Fore.GREEN + f"💰 SALDO EN CUENTA REAL DERIV: {saldo_str}")
+    try:
+        sim_str = f"{float(REAL_SIM_BALANCE):.2f}" if REAL_SIM_ENABLED else "--"
+        sim_meta_str = f"{float(REAL_SIM_META):.2f}" if REAL_SIM_ENABLED else "--"
+        print(padding + Fore.MAGENTA + f"🧪 SALDO REAL_SIM: {sim_str} 🎯 META_SIM {sim_meta_str}")
+        modo_op, saldo_op, _ = _saldo_operativo_info()
+        saldo_op_txt = f"{float(saldo_op):.2f}" if saldo_op is not None else "--"
+        print(padding + Fore.CYAN + f"💳 SALDO OPERATIVO: {modo_op} {saldo_op_txt}")
+    except Exception:
+        pass
 
     # Saldo inicial y meta
     try:
@@ -9512,7 +9527,7 @@ def evaluar_semaforo():
     prob, bbest, n = mejor
 
     owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-    try: saldo_val = float(obtener_valor_saldo() or 0.0)
+    try: saldo_val = float(_saldo_operativo_valor() or 0.0)
     except: saldo_val = 0.0
     costo = float(sum(MARTI_ESCALADO[:max(1, int(MAX_CICLOS))]))
 
@@ -9522,7 +9537,8 @@ def evaluar_semaforo():
         return "🟡", "AVISO", detalle
     if saldo_val < costo:
         falta = costo - saldo_val
-        detalle = f"Saldo < colchón Martingala ({costo:.2f} para C1..C{int(MAX_CICLOS)}). Faltan {falta:.2f} USD."
+        modo_op, _, _ = _saldo_operativo_info()
+        detalle = f"Saldo operativo {modo_op} < colchón Martingala ({costo:.2f} para C1..C{int(MAX_CICLOS)}). Faltan {falta:.2f} USD."
         return "🟡", "AVISO", detalle
 
     n_inc = contar_filas_incremental()
@@ -10221,6 +10237,8 @@ async def cargar_datos_bot(bot, token_actual):
             if total > 0:
                 estado_bots[bot]["porcentaje_exito"] = (estado_bots[bot]["ganancias"] / total) * 100
 
+            _real_sim_aplicar_cierre(bot, fila_dict, resultado)
+
             # Cierre especial para REAL manual: SIEMPRE 1 sola operación
             if (
                 MODO_REAL_MANUAL
@@ -10268,6 +10286,82 @@ async def cargar_datos_bot(bot, token_actual):
 
     except Exception as e:
         print(f"⚠️ Error cargando datos para {bot}: {e}")
+
+def _real_sim_load_state():
+    global REAL_SIM_BALANCE, REAL_SIM_META
+    try:
+        if not os.path.exists(REAL_SIM_STATE_PATH):
+            return
+        with open(REAL_SIM_STATE_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            bal = d.get("balance", REAL_SIM_BALANCE)
+            REAL_SIM_BALANCE = float(bal)
+            REAL_SIM_META = float(d.get("meta", round(float(REAL_SIM_BALANCE) * 1.15, 2)))
+    except Exception:
+        pass
+
+
+def _real_sim_save_state():
+    try:
+        payload = {
+            "balance": float(REAL_SIM_BALANCE),
+            "meta": float(REAL_SIM_META),
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        _atomic_write(REAL_SIM_STATE_PATH, json.dumps(payload, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+
+def _saldo_operativo_info() -> tuple[str, float | None, float | None]:
+    """Retorna (modo, saldo, meta) del bolsillo operativo actual."""
+    try:
+        modo = str(MODO_SALDO_OPERATIVO or "REAL").strip().upper()
+    except Exception:
+        modo = "REAL"
+    if REAL_SIM_ENABLED and modo == "REAL_SIM":
+        try:
+            return "REAL_SIM", float(REAL_SIM_BALANCE), float(REAL_SIM_META)
+        except Exception:
+            return "REAL_SIM", None, None
+    return "REAL", obtener_valor_saldo(), (float(META) if META is not None else None)
+
+
+def _saldo_operativo_valor() -> float | None:
+    try:
+        _, v, _ = _saldo_operativo_info()
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def _real_sim_aplicar_cierre(bot: str, fila_dict: dict, resultado: str):
+    global REAL_SIM_BALANCE, REAL_SIM_LAST_DELTA
+    if not (REAL_SIM_ENABLED and str(MODO_SALDO_OPERATIVO).upper() == "REAL_SIM"):
+        return
+    try:
+        delta = None
+        gp = fila_dict.get("ganancia_perdida", None)
+        if gp not in (None, ""):
+            delta = float(gp)
+        if delta is None:
+            monto = fila_dict.get("monto", None)
+            if monto not in (None, ""):
+                mv = float(monto)
+                delta = mv if resultado == "GANANCIA" else -mv
+        if delta is None:
+            ciclo = int(estado_bots.get(bot, {}).get("ciclo_actual", 1) or 1)
+            ciclo = max(1, min(int(ciclo), int(MAX_CICLOS)))
+            mv = float(MARTI_ESCALADO[ciclo - 1])
+            delta = mv if resultado == "GANANCIA" else -mv
+
+        REAL_SIM_BALANCE = float(REAL_SIM_BALANCE) + float(delta)
+        REAL_SIM_LAST_DELTA = float(delta)
+        _real_sim_save_state()
+    except Exception:
+        pass
+
 
 # Obtener saldo real
 async def obtener_saldo_real():
@@ -10622,6 +10716,8 @@ async def main():
         if valor is not None:
             inicializar_saldo_real(valor)
 
+        _real_sim_load_state()
+
         set_etapa("BOOT_03", "Backfill y primer entrenamiento")
         # Backfill IA desde los logs enriquecidos
         try:
@@ -10799,7 +10895,7 @@ async def main():
 
                         # Bloqueo por saldo (evita abrir REAL sin colchón mínimo de martingala)
                         try:
-                            saldo_val = float(obtener_valor_saldo() or 0.0)
+                            saldo_val = float(_saldo_operativo_valor() or 0.0)
                         except Exception:
                             saldo_val = 0.0
                         costo_ciclo1 = float(MARTI_ESCALADO[0])
@@ -10939,7 +11035,8 @@ async def main():
                         # Si hay señal pero saldo insuficiente -> avisar y NO abrir ventana
                         if candidatos and saldo_val < costo_plan:
                             falta = costo_plan - saldo_val
-                            agregar_evento(f"🚫 Señal IA bloqueada por saldo: falta {falta:.2f} USD para cubrir C1..C{int(MAX_CICLOS)} ({costo_plan:.2f}).")
+                            modo_op, _, _ = _saldo_operativo_info()
+                            agregar_evento(f"🚫 Señal IA bloqueada por saldo {modo_op}: falta {falta:.2f} USD para cubrir C1..C{int(MAX_CICLOS)} ({costo_plan:.2f}).")
                             candidatos = []
 
                         # ==================== AUTO-PRESELECCIÓN (MODO MANUAL) ====================
@@ -10994,7 +11091,7 @@ async def main():
                                 score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
                                 agregar_evento(f"⚙️ IA AUTO: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
                                 monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
-                                val = obtener_valor_saldo()
+                                val = _saldo_operativo_valor()
                                 if val is None or val < monto:
                                     pass
                                 else:
