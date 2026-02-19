@@ -9854,9 +9854,12 @@ MDE_BOOT_THR = 0.55
 MDE_MIN_N_BOT = 15
 MDE_STALL_WINDOW_S = 12 * 60
 MDE_STALL_MIN_COVERAGE_S = 8 * 60
+<<<<<<< codex/add-bot-rotation-for-cycles-7qy4ca
 MDE_EARLY_N_MAX = 25
 MDE_EARLY_WINDOW_S = 3 * 60
 MDE_EARLY_COVERAGE_S = 2 * 60
+=======
+>>>>>>> main
 MDE_SPREAD_EPS = 0.005
 MDE_DRIFT_EPS = 0.005
 MDE_CONFIRM_TICKS = 3
@@ -9934,6 +9937,7 @@ def _mde_is_stalled(live_rows, umbral_normal: float):
     if spread > float(MDE_SPREAD_EPS):
         return False
 
+<<<<<<< codex/add-bot-rotation-for-cycles-7qy4ca
     # Arranque temprano: cuando recién se supera n>=15 en todos los bots,
     # permitimos detectar estancamiento con ventana más corta para no esperar 8-12 min.
     min_n = min(ns) if ns else 0
@@ -9951,6 +9955,16 @@ def _mde_is_stalled(live_rows, umbral_normal: float):
             return False
         ts = [t for (t, _v) in dq if (now - float(t)) <= window_s]
         if not ts or (max(ts) - min(ts)) < coverage_s:
+=======
+    now = time.time()
+    for b, _p, _n in live_rows:
+        dq = MDE_PROB_HISTORY.get(b) or deque()
+        vals = [v for (t, v) in dq if (now - float(t)) <= float(MDE_STALL_WINDOW_S)]
+        if len(vals) < 3:
+            return False
+        ts = [t for (t, _v) in dq if (now - float(t)) <= float(MDE_STALL_WINDOW_S)]
+        if not ts or (max(ts) - min(ts)) < float(MDE_STALL_MIN_COVERAGE_S):
+>>>>>>> main
             return False
         drift = max(vals) - min(vals)
         if drift > float(MDE_DRIFT_EPS):
