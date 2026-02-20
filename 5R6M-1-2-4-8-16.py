@@ -1620,6 +1620,9 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
         estado_bots[bot]["trigger_real"] = True
         estado_bots[bot]["ciclo_actual"] = ciclo_obj
 
+        if REAL_SIM_ENABLED and str(MODO_SALDO_OPERATIVO).upper() == "REAL_SIM":
+            _abrir_ticket_real_sim(bot, ciclo_obj)
+
         # Congelar probabilidad de señal al entrar REAL (si no estaba ya fijada)
         # para evitar divergencia visual/ACK durante toda la operación.
         try:
@@ -1951,6 +1954,7 @@ def cerrar_por_win(bot: str, reason: str):
         # Flags IA/pending (si quedó algo colgado)
         estado_bots[bot]["ia_senal_pendiente"] = False
         estado_bots[bot]["ia_prob_senal"] = None
+        _cerrar_ticket_real_sim(bot)
 
         # Remate limpio
         estado_bots[bot]["remate_active"] = False
@@ -10355,11 +10359,45 @@ def _saldo_operativo_valor() -> float | None:
         return None
 
 
+def _abrir_ticket_real_sim(bot: str, ciclo: int | None = None):
+    """Abre un ticket sombra: solo este cierre podrá mover REAL_SIM."""
+    try:
+        for b in BOT_NAMES:
+            try:
+                estado_bots[b]["real_sim_ticket_open"] = False
+            except Exception:
+                pass
+
+        estado_bots[bot]["real_sim_ticket_open"] = True
+        estado_bots[bot]["real_sim_ticket_ciclo"] = int(ciclo or estado_bots.get(bot, {}).get("ciclo_actual", 1) or 1)
+        estado_bots[bot]["real_sim_ticket_opened_ts"] = time.time()
+        estado_bots[bot]["real_sim_ticket_baseline"] = int(REAL_ENTRY_BASELINE.get(bot, contar_filas_csv(bot) or 0) or 0)
+        try:
+            agregar_evento(
+                f"🧾 Ticket sombra abierto: {bot} C{int(estado_bots[bot]['real_sim_ticket_ciclo'])} "
+                f"(baseline={int(estado_bots[bot]['real_sim_ticket_baseline'])})."
+            )
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _cerrar_ticket_real_sim(bot: str):
+    try:
+        estado_bots[bot]["real_sim_ticket_open"] = False
+    except Exception:
+        pass
+
+
 def _real_sim_aplicar_cierre(bot: str, fila_dict: dict, resultado: str):
     global REAL_SIM_BALANCE, REAL_SIM_LAST_DELTA
     if not (REAL_SIM_ENABLED and str(MODO_SALDO_OPERATIVO).upper() == "REAL_SIM"):
         return
     try:
+        if not bool(estado_bots.get(bot, {}).get("real_sim_ticket_open", False)):
+            return
+
         delta = None
         gp = fila_dict.get("ganancia_perdida", None)
         if gp not in (None, ""):
@@ -10375,9 +10413,18 @@ def _real_sim_aplicar_cierre(bot: str, fila_dict: dict, resultado: str):
             mv = float(MARTI_ESCALADO[ciclo - 1])
             delta = mv if resultado == "GANANCIA" else -mv
 
+        before = float(REAL_SIM_BALANCE)
         REAL_SIM_BALANCE = float(REAL_SIM_BALANCE) + float(delta)
         REAL_SIM_LAST_DELTA = float(delta)
         _real_sim_save_state()
+        _cerrar_ticket_real_sim(bot)
+        try:
+            agregar_evento(
+                f"🧾 Ticket sombra cerrado: {bot} {resultado} | Δ={float(delta):+.2f} | "
+                f"REAL_SIM {before:.2f}→{float(REAL_SIM_BALANCE):.2f}"
+            )
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -10856,7 +10903,7 @@ async def main():
                                 bot,
                                 min_fila=REAL_ENTRY_BASELINE.get(bot, 0),
                                 require_closed=True,
-                                require_real_token=True,
+                                require_real_token=(not _modo_ejecucion_demo_only()),
                                 expected_ciclo=estado_bots.get(bot, {}).get("ciclo_actual", None),
                             )
 
