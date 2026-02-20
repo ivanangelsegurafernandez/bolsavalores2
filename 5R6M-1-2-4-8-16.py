@@ -9210,6 +9210,8 @@ def mostrar_panel():
                   f"confirm={cst_h}/{int(DYN_ROOF_CONFIRM_TICKS)}" + (f" ({cbot_h})" if cbot_h else "")
                   + f" | n_min_real={n_min_real}/{n_req_real} ({bloqueado_txt})"
             )
+            if str(globals().get("LAST_GATE_BLOCK_REASON", "") or "") not in ("", "--", "OK"):
+                print(Fore.YELLOW + f" Bloqueo actual: {str(globals().get('LAST_GATE_BLOCK_REASON'))}")
         except Exception:
             pass
 
@@ -9884,9 +9886,11 @@ DYN_ROOF_LOW_N_MIN = 30
 DYN_ROOF_LOW_N_PENALTY = 0.02
 PROB_CLONE_STD_MIN = 0.01
 PROB_CLONE_GAP_MIN = 0.005
+CLONE_OVERRIDE_TICKS_DEMO = 3
 REAL_POST_TRADE_COOLDOWN_S = 45
 REAL_COOLDOWN_UNTIL_TS = 0.0
 LAST_RETRAIN_ERROR = ""
+LAST_GATE_BLOCK_REASON = "--"
 
 DYN_ROOF_STATE = {
     "tick": 0,
@@ -9897,6 +9901,7 @@ DYN_ROOF_STATE = {
     "confirm_streak": 0,
     "last_open_tick": 0,
     "last_floor": None,
+    "clone_streak": 0,
 }
 
 
@@ -9960,6 +9965,9 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         "allow_real": False,
         "n_best": 0,
         "new_open": False,
+        "clone_override": False,
+        "clone_streak": int(DYN_ROOF_STATE.get("clone_streak", 0) or 0),
+        "block_reason": "NO_LIVE",
     }
     try:
         DYN_ROOF_STATE["tick"] = int(DYN_ROOF_STATE.get("tick", 0) or 0) + 1
@@ -10040,7 +10048,15 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
                 or ((float(p_best) - float(p_second)) < float(PROB_CLONE_GAP_MIN))
             )
         )
+        clone_streak = int(DYN_ROOF_STATE.get("clone_streak", 0) or 0)
         if clone_flat:
+            clone_streak += 1
+        else:
+            clone_streak = 0
+        DYN_ROOF_STATE["clone_streak"] = int(clone_streak)
+
+        clone_override = bool(_modo_ejecucion_demo_only() and clone_flat and (clone_streak >= int(CLONE_OVERRIDE_TICKS_DEMO)))
+        if clone_flat and (not clone_override):
             gap_ok = False
 
         # En modo relajado (n>=15 en todos): entrar con piso 55% sin depender del roof.
@@ -10076,6 +10092,19 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         if new_open:
             DYN_ROOF_STATE["last_open_tick"] = int(tick_now)
 
+        block_reason = "OK" if allow_real else ""
+        if not allow_real:
+            if clone_flat and (not clone_override):
+                block_reason = f"CLONE_FLAT std={spread_std:.4f}"
+            elif float(p_best) < float(floor_now):
+                block_reason = f"P_BEST<{floor_now*100:.1f}%"
+            elif not bool(gap_ok):
+                block_reason = "GAP"
+            elif confirm_streak < int(confirm_need):
+                block_reason = f"CONFIRM {confirm_streak}/{int(confirm_need)}"
+            else:
+                block_reason = "GATE"
+
         out.update({
             "best_bot": best_bot,
             "p_best": float(p_best),
@@ -10088,7 +10117,10 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             "n_best": int(n_best),
             "new_open": bool(new_open),
             "clone_flat": bool(clone_flat),
+            "clone_override": bool(clone_override),
+            "clone_streak": int(clone_streak),
             "spread_std": float(spread_std),
+            "block_reason": str(block_reason),
         })
         return out
     except Exception:
@@ -10747,7 +10779,7 @@ def _boot_health_check():
 async def main():
     global salir, pausado, reinicio_manual, SALDO_INICIAL
     global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA, REAL_OWNER_LOCK
-    global REAL_LOCK_MISMATCH_SINCE
+    global REAL_LOCK_MISMATCH_SINCE, LAST_GATE_BLOCK_REASON
 
     try:
         set_etapa("BOOT_01", "Inicializando main()", anunciar=True)
@@ -10950,6 +10982,8 @@ async def main():
                         if REAL_CLASSIC_GATE:
                             umbral_ia_real = float(_umbral_real_operativo_actual())
                             dyn_gate = _actualizar_compuerta_techo_dinamico()
+                            if isinstance(dyn_gate, dict):
+                                LAST_GATE_BLOCK_REASON = str(dyn_gate.get("block_reason", "--") or "--")
                             if isinstance(dyn_gate, dict) and bool(dyn_gate.get("new_open", False)):
                                 agregar_evento(
                                     "🧭 Compuerta REAL abierta: "
@@ -11106,6 +11140,7 @@ async def main():
                         if candidatos and saldo_val < costo_plan:
                             falta = costo_plan - saldo_val
                             modo_op, _, _ = _saldo_operativo_info()
+                            LAST_GATE_BLOCK_REASON = f"SALDO<{costo_plan:.2f} ({modo_op})"
                             agregar_evento(f"🚫 Señal IA bloqueada por saldo {modo_op}: falta {falta:.2f} USD para cubrir C1..C{int(MAX_CICLOS)} ({costo_plan:.2f}).")
                             candidatos = []
 
@@ -11146,10 +11181,12 @@ async def main():
                         if candidatos and not MODO_REAL_MANUAL:
                             meta_live = leer_model_meta() or {}
                             modelo_reliable = bool(meta_live.get("reliable", False))
-                            if not modelo_reliable:
+                            if (not modelo_reliable) and (not _modo_ejecucion_demo_only()):
+                                LAST_GATE_BLOCK_REASON = "RELIABLE_FALSE"
                                 agregar_evento("🛡️ IA AUTO bloqueado: modelo no confiable (reliable=false).")
                                 candidatos = []
                             elif time.time() < float(REAL_COOLDOWN_UNTIL_TS):
+                                LAST_GATE_BLOCK_REASON = "COOLDOWN"
                                 restantes = max(0.0, float(REAL_COOLDOWN_UNTIL_TS) - time.time())
                                 agregar_evento(f"⏳ IA AUTO cooldown post-trade activo ({restantes:.0f}s).")
                                 candidatos = []
