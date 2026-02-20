@@ -1513,7 +1513,7 @@ def _escribir_orden_real_raw(bot: str, ciclo: int):
     payload = {"bot": bot, "ciclo": ciclo, "ts": time.time(), "exec_mode": str(MODO_EJECUCION or "REAL_LIVE").upper()}
     try:
         _atomic_write(path_orden(bot), json.dumps(payload, ensure_ascii=False))
-        agregar_evento(f"📝 Orden REAL escrita para {bot}: ciclo #{ciclo}")
+        agregar_evento(f"📝 Orden {'SOMBRA' if _modo_ejecucion_demo_only() else 'REAL'} escrita para {bot}: ciclo #{ciclo}")
     except Exception as e:
         try:
             agregar_evento(f"⚠️ Falló escritura de orden para {bot}: {e}")
@@ -9540,7 +9540,8 @@ def forzar_real_manual(bot: str, ciclo: int):
         FORZAR_LOCK.release()
 
 def evaluar_semaforo():
-    thr = get_umbral_operativo()
+    thr = float(_umbral_real_operativo_actual()) if _modo_ejecucion_demo_only() else float(get_umbral_operativo())
+    thr_pct = int(round(thr * 100))
 
     mejor = (None, None, 0)
     for b in BOT_NAMES:
@@ -9574,11 +9575,14 @@ def evaluar_semaforo():
     if prob is None or n < 10:
         return "🟡", "EN ESPERA", "Pocos datos útiles aún."
     if n < ORACULO_N_MIN and (prob or 0) < thr:
-        return "🟡", "EN ESPERA", f"n={n}<{ORACULO_N_MIN} y prob={prob:.0%}<{int(thr*100)}%"
+        return "🟡", "EN ESPERA", f"n={n}<{ORACULO_N_MIN} y prob={prob:.0%}<{thr_pct}%"
     if n < ORACULO_N_MIN:
         return "🟡", "EN ESPERA", f"n={n}<{ORACULO_N_MIN}"
     if (prob or 0) < thr:
-        return "🟡", "EN ESPERA", f"prob={prob:.0%}<{int(thr*100)}%"
+        extra = str(globals().get("LAST_GATE_BLOCK_REASON", "") or "").strip()
+        if extra and extra not in ("--", "OK"):
+            return "🟡", "EN ESPERA", f"prob={prob:.0%}<{thr_pct}% | {extra}"
+        return "🟡", "EN ESPERA", f"prob={prob:.0%}<{thr_pct}%"
 
     tecla = (bbest or "?")[-2:]
     detalle = f"{bbest} • Prob={prob:.0%} • n={n} → pulsa [{tecla}] y el ciclo."
@@ -10094,10 +10098,10 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
 
         block_reason = "OK" if allow_real else ""
         if not allow_real:
-            if clone_flat and (not clone_override):
-                block_reason = f"CLONE_FLAT std={spread_std:.4f}"
-            elif float(p_best) < float(floor_now):
+            if float(p_best) < float(floor_now):
                 block_reason = f"P_BEST<{floor_now*100:.1f}%"
+            elif clone_flat and (not clone_override):
+                block_reason = f"CLONE_FLAT std={spread_std:.4f}"
             elif not bool(gap_ok):
                 block_reason = "GAP"
             elif confirm_streak < int(confirm_need):
