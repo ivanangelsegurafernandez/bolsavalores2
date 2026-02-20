@@ -11279,10 +11279,11 @@ async def main():
                             # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
 
                         # Si hay señal pero saldo insuficiente -> avisar y NO abrir ventana
-                        if candidatos and saldo_val < saldo_req_apertura:
-                            falta = saldo_req_apertura - saldo_val
-                            LAST_GATE_BLOCK_REASON = f"SALDO<{saldo_req_apertura:.2f} ({modo_op})"
-                            agregar_evento(f"🚫 Señal IA bloqueada por saldo {modo_op}: falta {falta:.2f} USD para cubrir {regla_req_apertura} ({saldo_req_apertura:.2f}).")
+                        if candidatos and saldo_val < costo_plan:
+                            falta = costo_plan - saldo_val
+                            modo_op, _, _ = _saldo_operativo_info()
+                            LAST_GATE_BLOCK_REASON = f"SALDO<{costo_plan:.2f} ({modo_op})"
+                            agregar_evento(f"🚫 Señal IA bloqueada por saldo {modo_op}: falta {falta:.2f} USD para cubrir C1..C{int(MAX_CICLOS)} ({costo_plan:.2f}).")
                             candidatos = []
 
                         # ==================== AUTO-PRESELECCIÓN (MODO MANUAL) ====================
