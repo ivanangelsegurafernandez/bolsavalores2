@@ -9870,6 +9870,7 @@ def set_etapa(codigo, detalle_extra=None, anunciar=False):
 REAL_TIMEOUT_S = 120  # 2 minutos sin actividad para aviso/rearme
 REAL_STUCK_FORCE_RELEASE_S = 90  # segundos extra tras aviso para liberar REAL si no hay cierre
 REAL_TRIGGER_MIN = IA_ACTIVACION_REAL_THR  # regla operativa: entrada REAL desde 85% o mayor
+REAL_LIVE_MIN_FLOOR = 0.65  # REAL_LIVE: no usar piso de exploración (55%) sin evidencia sólida
 
 # =========================================================
 # TECHO DINÁMICO + COMPUERTA REAL (anti-bug de activación baja)
@@ -9928,16 +9929,35 @@ def _todos_bots_con_n_minimo_real(min_n: int | None = None) -> bool:
 
 def _umbral_real_operativo_actual() -> float:
     """
-    Umbral REAL dinámico:
-    - Base 85%
-    - Baja a 55% cuando TODOS los bots tienen n>=15
+    Umbral REAL dinámico por perfil de riesgo:
+    - DEMO_ONLY/REAL_SIM (exploración): base 85%, baja a 55% cuando TODOS los bots tienen n>=15.
+    - REAL_LIVE (conservador): no relaja a 55%; mantiene umbral alto/calibrado.
     """
     try:
-        if _todos_bots_con_n_minimo_real():
-            return float(IA_ACTIVACION_REAL_THR_POST_N15)
+        modo_demo = bool(_modo_ejecucion_demo_only())
+        modo_saldo, _, _ = _saldo_operativo_info()
+        exploracion = bool(modo_demo or str(modo_saldo).upper() == "REAL_SIM")
+
+        if exploracion:
+            if _todos_bots_con_n_minimo_real():
+                return float(IA_ACTIVACION_REAL_THR_POST_N15)
+            return float(IA_ACTIVACION_REAL_THR)
+
+        thr_live = max(float(REAL_LIVE_MIN_FLOOR), float(get_umbral_operativo()))
+        return float(max(float(IA_ACTIVACION_REAL_THR), float(thr_live)))
     except Exception:
-        pass
-    return float(IA_ACTIVACION_REAL_THR)
+        return float(IA_ACTIVACION_REAL_THR)
+
+
+def _n_minimo_real_status() -> tuple[int, int]:
+    """Retorna (mínimo n actual entre bots, n requerido) para diagnóstico en HUD."""
+    try:
+        n_req = int(IA_ACTIVACION_REAL_MIN_N_POR_BOT)
+        n_vals = [int(estado_bots.get(b, {}).get("tamano_muestra", 0) or 0) for b in BOT_NAMES]
+        n_min = min(n_vals) if n_vals else 0
+        return int(n_min), int(n_req)
+    except Exception:
+        return 0, int(IA_ACTIVACION_REAL_MIN_N_POR_BOT)
 
 
 def _n_minimo_real_status() -> tuple[int, int]:
@@ -10093,7 +10113,8 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         DYN_ROOF_STATE["confirm_bot"] = confirm_bot
         DYN_ROOF_STATE["confirm_streak"] = int(confirm_streak)
 
-        confirm_need = 1 if modo_relajado_n15 else int(DYN_ROOF_CONFIRM_TICKS)
+        exploracion = bool(_modo_ejecucion_demo_only() or str(_saldo_operativo_info()[0]).upper() == "REAL_SIM")
+        confirm_need = 1 if (modo_relajado_n15 and exploracion) else int(DYN_ROOF_CONFIRM_TICKS)
         allow_real = bool(pass_gate and (confirm_streak >= int(confirm_need)))
         last_open_tick = int(DYN_ROOF_STATE.get("last_open_tick", 0) or 0)
         new_open = bool(allow_real and (last_open_tick != tick_now))
