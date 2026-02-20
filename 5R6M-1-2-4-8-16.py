@@ -579,6 +579,9 @@ REAL_SIM_STATE_PATH = "real_sim_state.json"
 REAL_SIM_BALANCE = 35.0
 REAL_SIM_META = round(float(REAL_SIM_BALANCE) * 1.15, 2)
 REAL_SIM_LAST_DELTA = 0.0
+REAL_SIM_RESERVED = 0.0
+REAL_SIM_COLCHON_STEPS = 2  # REAL_SIM: exigir Ck + C(k+1) para abrir (evita candado C1..C5 completo)
+IA_TICK_LOG_PATH = "ia_signal_ticks_log.csv"
 meta_mostrada = False
 eventos_recentes = deque(maxlen=8)
 reinicio_forzado = asyncio.Event()
@@ -8777,7 +8780,8 @@ def mostrar_panel():
     try:
         sim_str = f"{float(REAL_SIM_BALANCE):.2f}" if REAL_SIM_ENABLED else "--"
         sim_meta_str = f"{float(REAL_SIM_META):.2f}" if REAL_SIM_ENABLED else "--"
-        print(padding + Fore.MAGENTA + f"🧪 SALDO REAL_SIM: {sim_str} 🎯 META_SIM {sim_meta_str}")
+        sim_res_str = f"{float(REAL_SIM_RESERVED):.2f}" if REAL_SIM_ENABLED else "--"
+        print(padding + Fore.MAGENTA + f"🧪 SALDO REAL_SIM: {sim_str} (reservado {sim_res_str}) 🎯 META_SIM {sim_meta_str}")
         modo_op, saldo_op, _ = _saldo_operativo_info()
         saldo_op_txt = f"{float(saldo_op):.2f}" if saldo_op is not None else "--"
         print(padding + Fore.CYAN + f"💳 SALDO OPERATIVO: {modo_op} {saldo_op_txt}")
@@ -9559,16 +9563,17 @@ def evaluar_semaforo():
     owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
     try: saldo_val = float(_saldo_operativo_valor() or 0.0)
     except: saldo_val = 0.0
-    costo = float(sum(MARTI_ESCALADO[:max(1, int(MAX_CICLOS))]))
+    ciclo_req = ciclo_martingala_siguiente()
+    modo_op, _, _ = _saldo_operativo_info()
+    saldo_req, regla_req = _saldo_requerido_apertura(ciclo_req, modo_op)
 
     detalle = ""
     if owner and owner not in (None, "none"):
         detalle = f"Token en uso por {owner}. Puedes forzar 5–0 → 1..5."
         return "🟡", "AVISO", detalle
-    if saldo_val < costo:
-        falta = costo - saldo_val
-        modo_op, _, _ = _saldo_operativo_info()
-        detalle = f"Saldo operativo {modo_op} < colchón Martingala ({costo:.2f} para C1..C{int(MAX_CICLOS)}). Faltan {falta:.2f} USD."
+    if saldo_val < saldo_req:
+        falta = saldo_req - saldo_val
+        detalle = f"Saldo operativo {modo_op} < colchón requerido ({saldo_req:.2f} para {regla_req}). Faltan {falta:.2f} USD."
         return "🟡", "AVISO", detalle
 
     n_inc = contar_filas_incremental()
@@ -9947,17 +9952,6 @@ def _umbral_real_operativo_actual() -> float:
         return float(max(float(IA_ACTIVACION_REAL_THR), float(thr_live)))
     except Exception:
         return float(IA_ACTIVACION_REAL_THR)
-
-
-def _n_minimo_real_status() -> tuple[int, int]:
-    """Retorna (mínimo n actual entre bots, n requerido) para diagnóstico en HUD."""
-    try:
-        n_req = int(IA_ACTIVACION_REAL_MIN_N_POR_BOT)
-        n_vals = [int(estado_bots.get(b, {}).get("tamano_muestra", 0) or 0) for b in BOT_NAMES]
-        n_min = min(n_vals) if n_vals else 0
-        return int(n_min), int(n_req)
-    except Exception:
-        return 0, int(IA_ACTIVACION_REAL_MIN_N_POR_BOT)
 
 
 def _n_minimo_real_status() -> tuple[int, int]:
@@ -10372,7 +10366,7 @@ async def cargar_datos_bot(bot, token_actual):
         print(f"⚠️ Error cargando datos para {bot}: {e}")
 
 def _real_sim_load_state():
-    global REAL_SIM_BALANCE, REAL_SIM_META
+    global REAL_SIM_BALANCE, REAL_SIM_META, REAL_SIM_RESERVED
     try:
         if not os.path.exists(REAL_SIM_STATE_PATH):
             return
@@ -10382,6 +10376,7 @@ def _real_sim_load_state():
             bal = d.get("balance", REAL_SIM_BALANCE)
             REAL_SIM_BALANCE = float(bal)
             REAL_SIM_META = float(d.get("meta", round(float(REAL_SIM_BALANCE) * 1.15, 2)))
+            REAL_SIM_RESERVED = max(0.0, float(d.get("reserved", 0.0) or 0.0))
     except Exception:
         pass
 
@@ -10391,6 +10386,8 @@ def _real_sim_save_state():
         payload = {
             "balance": float(REAL_SIM_BALANCE),
             "meta": float(REAL_SIM_META),
+            "reserved": float(REAL_SIM_RESERVED),
+            "available": float(max(0.0, float(REAL_SIM_BALANCE) - float(REAL_SIM_RESERVED))),
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         _atomic_write(REAL_SIM_STATE_PATH, json.dumps(payload, ensure_ascii=False, indent=2))
@@ -10406,7 +10403,8 @@ def _saldo_operativo_info() -> tuple[str, float | None, float | None]:
         modo = "REAL"
     if REAL_SIM_ENABLED and modo == "REAL_SIM":
         try:
-            return "REAL_SIM", float(REAL_SIM_BALANCE), float(REAL_SIM_META)
+            saldo_disponible = float(REAL_SIM_BALANCE) - float(REAL_SIM_RESERVED)
+            return "REAL_SIM", float(max(0.0, saldo_disponible)), float(REAL_SIM_META)
         except Exception:
             return "REAL_SIM", None, None
     return "REAL", obtener_valor_saldo(), (float(META) if META is not None else None)
@@ -10420,23 +10418,90 @@ def _saldo_operativo_valor() -> float | None:
         return None
 
 
+def _saldo_requerido_apertura(ciclo: int, modo_op: str | None = None) -> tuple[float, str]:
+    """Retorna saldo mínimo requerido para abrir ciclo según modo de riesgo."""
+    c = max(1, min(int(ciclo or 1), int(MAX_CICLOS)))
+    modo = str(modo_op or _saldo_operativo_info()[0] or "REAL").upper()
+    if modo == "REAL_SIM":
+        pasos = max(1, int(REAL_SIM_COLCHON_STEPS))
+        req = 0.0
+        for i in range(c, min(int(MAX_CICLOS), c + pasos - 1) + 1):
+            req += float(MARTI_ESCALADO[i - 1])
+        return float(req), f"C{c}" if pasos == 1 else f"C{c}..C{min(int(MAX_CICLOS), c + pasos - 1)}"
+
+    req = float(sum(MARTI_ESCALADO[:max(1, int(MAX_CICLOS))]))
+    return float(req), f"C1..C{int(MAX_CICLOS)}"
+
+
+def _real_sim_release_ticket_reserve(bot: str):
+    global REAL_SIM_RESERVED
+    try:
+        amt = float(estado_bots.get(bot, {}).get("real_sim_ticket_reserved", 0.0) or 0.0)
+        if amt > 0:
+            REAL_SIM_RESERVED = max(0.0, float(REAL_SIM_RESERVED) - amt)
+    except Exception:
+        pass
+    try:
+        estado_bots[bot]["real_sim_ticket_reserved"] = 0.0
+    except Exception:
+        pass
+
+
+def _log_ia_tick_snapshot(bot: str, prob: float, piso: float, dyn_gate: dict | None, redundante: bool = False):
+    """Log por tick para auditar prob IA>=X por bot/hora con razones de bloqueo."""
+    try:
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "bot": str(bot),
+            "prob": float(prob),
+            "piso": float(piso),
+            "roof_eff": float((dyn_gate or {}).get("roof_eff", 0.0) or 0.0),
+            "confirm_streak": int((dyn_gate or {}).get("confirm_streak", 0) or 0),
+            "block_reason": str(globals().get("LAST_GATE_BLOCK_REASON", "--") or "--"),
+            "sensor_plano": int(bool(estado_bots.get(bot, {}).get("ia_sensor_plano", False))),
+            "redundante": int(bool(redundante)),
+            "modo_exec": str(MODO_EJECUCION or "REAL_LIVE").upper(),
+            "modo_saldo": str(MODO_SALDO_OPERATIVO or "REAL").upper(),
+        }
+        exists = os.path.exists(IA_TICK_LOG_PATH)
+        with open(IA_TICK_LOG_PATH, "a", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if not exists:
+                w.writeheader()
+            w.writerow(row)
+    except Exception:
+        pass
+
+
 def _abrir_ticket_real_sim(bot: str, ciclo: int | None = None):
-    """Abre un ticket sombra: solo este cierre podrá mover REAL_SIM."""
+    """Abre ticket sombra y reserva saldo operativo para reflejar gasto inmediato."""
+    global REAL_SIM_RESERVED
     try:
         for b in BOT_NAMES:
             try:
+                if bool(estado_bots[b].get("real_sim_ticket_open", False)):
+                    _real_sim_release_ticket_reserve(b)
                 estado_bots[b]["real_sim_ticket_open"] = False
             except Exception:
                 pass
 
+        c = int(ciclo or estado_bots.get(bot, {}).get("ciclo_actual", 1) or 1)
+        c = max(1, min(c, int(MAX_CICLOS)))
+        reserve_amt = float(MARTI_ESCALADO[c - 1])
+        available_before = max(0.0, float(REAL_SIM_BALANCE) - float(REAL_SIM_RESERVED))
+        REAL_SIM_RESERVED = float(REAL_SIM_RESERVED) + reserve_amt
+
         estado_bots[bot]["real_sim_ticket_open"] = True
-        estado_bots[bot]["real_sim_ticket_ciclo"] = int(ciclo or estado_bots.get(bot, {}).get("ciclo_actual", 1) or 1)
+        estado_bots[bot]["real_sim_ticket_ciclo"] = c
         estado_bots[bot]["real_sim_ticket_opened_ts"] = time.time()
         estado_bots[bot]["real_sim_ticket_baseline"] = int(REAL_ENTRY_BASELINE.get(bot, contar_filas_csv(bot) or 0) or 0)
+        estado_bots[bot]["real_sim_ticket_reserved"] = float(reserve_amt)
+        _real_sim_save_state()
         try:
+            available_after = max(0.0, float(REAL_SIM_BALANCE) - float(REAL_SIM_RESERVED))
             agregar_evento(
-                f"🧾 Ticket sombra abierto: {bot} C{int(estado_bots[bot]['real_sim_ticket_ciclo'])} "
-                f"(baseline={int(estado_bots[bot]['real_sim_ticket_baseline'])})."
+                f"🧾 Ticket sombra abierto: {bot} C{c} (baseline={int(estado_bots[bot]['real_sim_ticket_baseline'])}) "
+                f"| reserva -{reserve_amt:.2f} | disp {available_before:.2f}→{available_after:.2f}"
             )
         except Exception:
             pass
@@ -10446,7 +10511,9 @@ def _abrir_ticket_real_sim(bot: str, ciclo: int | None = None):
 
 def _cerrar_ticket_real_sim(bot: str):
     try:
+        _real_sim_release_ticket_reserve(bot)
         estado_bots[bot]["real_sim_ticket_open"] = False
+        _real_sim_save_state()
     except Exception:
         pass
 
@@ -10457,6 +10524,10 @@ def _real_sim_aplicar_cierre(bot: str, fila_dict: dict, resultado: str):
         return
     try:
         if not bool(estado_bots.get(bot, {}).get("real_sim_ticket_open", False)):
+            try:
+                agregar_evento(f"🧯 FALLA DE CONTABILIDAD REAL_SIM: cierre sin ticket abierto para {bot}.")
+            except Exception:
+                pass
             return
 
         delta = None
@@ -11070,7 +11141,9 @@ async def main():
                         except Exception:
                             saldo_val = 0.0
                         costo_ciclo1 = float(MARTI_ESCALADO[0])
-                        costo_plan = float(sum(MARTI_ESCALADO[:max(1, int(MAX_CICLOS))]))
+                        ciclo_auto_pre = ciclo_martingala_siguiente()
+                        modo_op, _, _ = _saldo_operativo_info()
+                        saldo_req_apertura, regla_req_apertura = _saldo_requerido_apertura(ciclo_auto_pre, modo_op)
 
                         # Candidatos: prob válida, reciente, IA activa (no OFF)
                         candidatos = []
@@ -11093,6 +11166,8 @@ async def main():
                                     piso_operativo = float(_umbral_real_operativo_actual()) if REAL_CLASSIC_GATE else float(IA_ACTIVACION_REAL_THR)
                                     if float(p) < float(piso_operativo):
                                         continue
+
+                                    _log_ia_tick_snapshot(b, float(p), float(piso_operativo), dyn_gate, redundante=redundante_tick)
 
                                     # Modo clásico reforzado: compuerta dinámica anti-bug.
                                     # Solo el mejor bot del tick puede pasar, con piso duro + GAP + confirmación doble.
