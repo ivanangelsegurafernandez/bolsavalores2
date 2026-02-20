@@ -590,6 +590,10 @@ reinicio_manual = False
 LIMPIEZA_PANEL_HASTA = 0
 ULTIMA_ACT_SALDO = 0
 REFRESCO_SALDO = 12
+AUTH_ERROR_LOG_COOLDOWN_S = 45.0
+AUTH_TRANSIENT_RETRY_S = 6.0
+ULTIMO_ERROR_AUTH_MSG = ""
+ULTIMO_ERROR_AUTH_TS = 0.0
 MAX_CICLOS = len(MARTI_ESCALADO)
 huellas_usadas = {bot: set() for bot in BOT_NAMES}
 SNAPSHOT_FILAS = {bot: 0 for bot in BOT_NAMES}
@@ -10465,6 +10469,34 @@ def _real_sim_aplicar_cierre(bot: str, fila_dict: dict, resultado: str):
         pass
 
 
+
+def _auth_error_es_transitorio(msg: str) -> bool:
+    txt = str(msg or "").strip().lower()
+    if not txt:
+        return False
+    patterns = (
+        "while processing your request",
+        "temporar",
+        "try again",
+        "too many requests",
+        "rate limit",
+        "timeout",
+        "service unavailable",
+    )
+    return any(p in txt for p in patterns)
+
+
+def _debe_loggear_auth_error(msg: str) -> bool:
+    global ULTIMO_ERROR_AUTH_MSG, ULTIMO_ERROR_AUTH_TS
+    now = time.time()
+    clean = str(msg or "").strip()
+    if clean != ULTIMO_ERROR_AUTH_MSG or (now - float(ULTIMO_ERROR_AUTH_TS or 0.0)) >= float(AUTH_ERROR_LOG_COOLDOWN_S):
+        ULTIMO_ERROR_AUTH_MSG = clean
+        ULTIMO_ERROR_AUTH_TS = now
+        return True
+    return False
+
+
 # Obtener saldo real
 async def obtener_saldo_real():
     global saldo_real, ULTIMA_ACT_SALDO
@@ -10479,7 +10511,13 @@ async def obtener_saldo_real():
             await ws.send(auth_msg)
             resp = json.loads(await ws.recv())
             if "error" in resp:
-                print(f"⚠️ Error en auth: {resp['error']['message']}")
+                err_msg = str(resp.get("error", {}).get("message", "Error desconocido en auth"))
+                transitorio = _auth_error_es_transitorio(err_msg)
+                if _debe_loggear_auth_error(err_msg):
+                    pref = "⚠️ Error transitorio en auth" if transitorio else "⚠️ Error en auth"
+                    print(f"{pref}: {err_msg}")
+                if transitorio:
+                    ULTIMA_ACT_SALDO = time.time() - max(0.0, float(REFRESCO_SALDO) - float(AUTH_TRANSIENT_RETRY_S))
                 return
             bal_msg = json.dumps({"balance": 1, "subscribe": 1})
             await ws.send(bal_msg)
@@ -10744,13 +10782,17 @@ def _boot_health_check():
         # Señales congeladas: diagnóstico operativo rápido por bot (no bloqueante)
         sat_all = _auditar_saturacion_todos_bots(lookback=900)
         hot_bots = sat_all.get("hot_bots", []) if isinstance(sat_all, dict) else []
-        for hb in hot_bots[:6]:
+        hot_msgs = []
+        for hb in hot_bots[:3]:
             bot = hb.get("bot", "?")
             dom = hb.get("dominance", {}) if isinstance(hb.get("dominance", {}), dict) else {}
             feats = hb.get("features", []) if isinstance(hb.get("features", []), list) else []
             hot = [f"{k}={float(dom.get(k, 0.0))*100:.1f}%" for k in feats]
             if hot:
-                msgs.append(f"⚠️ Features saturadas en {bot}: " + ", ".join(hot))
+                hot_msgs.append(f"{bot}({', '.join(hot)})")
+        if hot_msgs:
+            extra = "" if len(hot_bots) <= 3 else f" +{len(hot_bots)-3} bot(s)"
+            msgs.append("⚠️ Features saturadas detectadas: " + " | ".join(hot_msgs) + extra + ".")
 
         # Calidad de labels del incremental (si hay inválidas, la IA aprende con humo)
         incq = _auditar_calidad_incremental("dataset_incremental.csv")
