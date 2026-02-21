@@ -223,6 +223,12 @@ IA_BASE_RATE_WINDOW = 300            # cierres recientes para tasa base rolling
 IA_WARMUP_PROB_CAP_MIN = 0.70
 IA_WARMUP_PROB_CAP_MAX = 0.85
 IA_WARMUP_CAP_RAMP_ROWS = 120         # rampa de cap en warmup: permite tocar 75% antes sin abrir 90%
+IA_WARMUP_LOW_EVIDENCE_CAP_BASE = 0.80
+IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15 = 0.85
+
+AUTO_REAL_ALLOW_UNRELIABLE_POST_N15 = True
+AUTO_REAL_UNRELIABLE_MIN_N = 80
+AUTO_REAL_UNRELIABLE_MIN_PROB = 0.78
 
 # Gate de calidad operativo (objetivo: mejorar precisión real, no volumen)
 GATE_RACHA_NEG_BLOQUEO = -2.0        # bloquear señales con racha <= -2
@@ -3806,7 +3812,10 @@ def _cap_prob_por_madurez(prob: float | None, bot: str | None = None) -> float |
                 st = estado_bots.get(bot, {})
                 cal_n = int(st.get("cal_n", 0) or 0)
                 if cal_n < 20:
-                    cap = min(cap, 0.80)
+                    cap_low = float(IA_WARMUP_LOW_EVIDENCE_CAP_BASE)
+                    if _todos_bots_con_n_minimo_real():
+                        cap_low = max(cap_low, float(IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15))
+                    cap = min(cap, float(cap_low))
             except Exception:
                 pass
 
@@ -9912,6 +9921,26 @@ def _marcar_compuerta_real_consumida() -> None:
         pass
 
 
+def _cooldown_post_trade_s() -> float:
+    """Cooldown dinámico post-trade: más largo si el mercado está saturado de probabilidades altas."""
+    try:
+        crowd_count = int(DYN_ROOF_STATE.get("crowd_count", 0) or 0)
+        p_best = float(DYN_ROOF_STATE.get("last_p_best", 0.0) or 0.0)
+        if crowd_count >= int(DYN_ROOF_CROWD_MIN_BOTS) and p_best >= float(DYN_ROOF_CROWD_P_MIN):
+            return float(REAL_POST_TRADE_COOLDOWN_CROWDED_S)
+    except Exception:
+        pass
+    return float(REAL_POST_TRADE_COOLDOWN_S)
+
+
+def _marcar_compuerta_real_consumida() -> None:
+    """Consume la apertura de compuerta REAL para evitar ráfagas mientras la señal siga pegada."""
+    try:
+        DYN_ROOF_STATE["gate_consumed"] = True
+    except Exception:
+        pass
+
+
 def _todos_bots_con_n_minimo_real(min_n: int | None = None) -> bool:
     """True si TODOS los bots alcanzaron el mínimo de muestra para habilitar umbral REAL reducido."""
     try:
@@ -11135,8 +11164,23 @@ async def main():
                             meta_live = leer_model_meta() or {}
                             modelo_reliable = bool(meta_live.get("reliable", False))
                             if not modelo_reliable:
-                                agregar_evento("🛡️ IA AUTO bloqueado: modelo no confiable (reliable=false).")
-                                candidatos = []
+                                n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
+                                post_n15 = bool(_todos_bots_con_n_minimo_real())
+                                best_prob = max((float(x[2]) for x in candidatos), default=0.0)
+                                allow_unreliable = bool(
+                                    AUTO_REAL_ALLOW_UNRELIABLE_POST_N15
+                                    and post_n15
+                                    and (n_samples_live >= int(AUTO_REAL_UNRELIABLE_MIN_N))
+                                    and (best_prob >= float(AUTO_REAL_UNRELIABLE_MIN_PROB))
+                                )
+                                if allow_unreliable:
+                                    agregar_evento(
+                                        f"⚠️ IA AUTO modo adaptativo: reliable=false, pero se habilita por post-n15 "
+                                        f"(n={n_samples_live}, p_best={best_prob*100:.1f}%)."
+                                    )
+                                else:
+                                    agregar_evento("🛡️ IA AUTO bloqueado: modelo no confiable (reliable=false).")
+                                    candidatos = []
                             elif time.time() < float(REAL_COOLDOWN_UNTIL_TS):
                                 restantes = max(0.0, float(REAL_COOLDOWN_UNTIL_TS) - time.time())
                                 agregar_evento(f"⏳ IA AUTO cooldown post-trade activo ({restantes:.0f}s).")
