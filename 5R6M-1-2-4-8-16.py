@@ -173,7 +173,7 @@ HUD_VISIBLE = True       # Para ocultarlo con tecla
 # --- Objetivos / umbrales globales de IA ---
 IA_OBJETIVO_REAL_THR = 0.70   # objetivo de calidad REAL (meta: 70% aprox)
 IA_ACTIVACION_REAL_THR = 0.85 # mínimo operativo para activar señal REAL
-IA_ACTIVACION_REAL_THR_POST_N15 = 0.55  # al cumplir n mínimo por bot, baja el umbral operativo a 55%
+IA_ACTIVACION_REAL_THR_POST_N15 = 0.75  # al cumplir n mínimo por bot, el umbral operativo baja solo hasta 75%
 IA_ACTIVACION_REAL_MIN_N_POR_BOT = 15   # condición: todos los bots deben tener al menos n=15
 
 # --- Oráculo visual ---
@@ -222,6 +222,13 @@ IA_BASE_RATE_WINDOW = 300            # cierres recientes para tasa base rolling
 # Cap conservador de probabilidad durante warmup para evitar inflado (ej. 99-100%).
 IA_WARMUP_PROB_CAP_MIN = 0.70
 IA_WARMUP_PROB_CAP_MAX = 0.85
+IA_WARMUP_CAP_RAMP_ROWS = 120         # rampa de cap en warmup: permite tocar 75% antes sin abrir 90%
+IA_WARMUP_LOW_EVIDENCE_CAP_BASE = 0.80
+IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15 = 0.85
+
+AUTO_REAL_ALLOW_UNRELIABLE_POST_N15 = True
+AUTO_REAL_UNRELIABLE_MIN_N = 80
+AUTO_REAL_UNRELIABLE_MIN_PROB = 0.78
 
 # Gate de calidad operativo (objetivo: mejorar precisión real, no volumen)
 GATE_RACHA_NEG_BLOQUEO = -2.0        # bloquear señales con racha <= -2
@@ -1713,7 +1720,11 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
     activar_real_inmediato(bot, ciclo, origen="orden_real")
 
     owner_after = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-    return owner_after == bot
+    ok = owner_after == bot
+    if ok:
+        _marcar_compuerta_real_consumida()
+        DYN_ROOF_STATE["last_real_open_ts"] = float(time.time())
+    return ok
 # === FIN PATCH REAL INMEDIATO ===
 # === IA ACK (handshake maestro→bot: confirma que el PRE-TRADE ya fue evaluado) ===
 IA_ACK_DIR = "ia_ack"
@@ -1939,7 +1950,7 @@ def cerrar_por_win(bot: str, reason: str):
 
     # Liberar token global REAL
     REAL_OWNER_LOCK = None
-    REAL_COOLDOWN_UNTIL_TS = time.time() + float(REAL_POST_TRADE_COOLDOWN_S)
+    REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
     try:
         with file_lock():
             write_token_atomic(TOKEN_FILE, "REAL:none")
@@ -3791,7 +3802,8 @@ def _cap_prob_por_madurez(prob: float | None, bot: str | None = None) -> float |
         if not warmup:
             return p
 
-        ratio = max(0.0, min(1.0, float(n_samples) / float(max(1, int(TRAIN_WARMUP_MIN_ROWS)))))
+        ramp_rows = max(1, int(IA_WARMUP_CAP_RAMP_ROWS))
+        ratio = max(0.0, min(1.0, float(n_samples) / float(ramp_rows)))
         cap = float(IA_WARMUP_PROB_CAP_MIN + (IA_WARMUP_PROB_CAP_MAX - IA_WARMUP_PROB_CAP_MIN) * ratio)
 
         # Si el bot aún no tiene evidencia auditada mínima, mantener cap más conservador.
@@ -3800,7 +3812,10 @@ def _cap_prob_por_madurez(prob: float | None, bot: str | None = None) -> float |
                 st = estado_bots.get(bot, {})
                 cal_n = int(st.get("cal_n", 0) or 0)
                 if cal_n < 20:
-                    cap = min(cap, 0.80)
+                    cap_low = float(IA_WARMUP_LOW_EVIDENCE_CAP_BASE)
+                    if _todos_bots_con_n_minimo_real():
+                        cap_low = max(cap_low, float(IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15))
+                    cap = min(cap, float(cap_low))
             except Exception:
                 pass
 
@@ -5971,7 +5986,7 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
 
     # Liberar token global REAL
     REAL_OWNER_LOCK = None
-    REAL_COOLDOWN_UNTIL_TS = time.time() + float(REAL_POST_TRADE_COOLDOWN_S)
+    REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
     try:
         with file_lock():
             write_token_atomic(TOKEN_FILE, "REAL:none")
@@ -8787,6 +8802,38 @@ def mostrar_panel():
         n_min_real, n_req_real = _n_minimo_real_status()
         print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | OBS≥{umbral_obs*100:.1f}%: {bots_obs} | REAL≥{umbral_real_vigente*100:.1f}%: {bots_real} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} (warmup:{sensores_warmup}) | n_min_real: {n_min_real}/{n_req_real} | Token: {owner_txt}")
 
+        try:
+            meta_live = leer_model_meta() or {}
+            reliable = bool(meta_live.get("reliable", False))
+            n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
+            warmup_live = bool(meta_live.get("warmup_mode", n_samples_live < int(TRAIN_WARMUP_MIN_ROWS)))
+            cap_base = float(IA_WARMUP_LOW_EVIDENCE_CAP_BASE)
+            cap_post = float(IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15)
+            post_n15 = bool(_todos_bots_con_n_minimo_real())
+            cap_now = cap_post if post_n15 else cap_base
+            mode_h = str(DYN_ROOF_STATE.get("last_gate_mode", "A") or "A")
+            confirm_h = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
+            confirm_need_h = int(DYN_ROOF_STATE.get("last_confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
+            trigger_ok_h = bool(DYN_ROOF_STATE.get("last_trigger_ok", False))
+            clone_gate = bool(DYN_ROOF_STATE.get("gate_consumed", False))
+            best_prob = float(mejor[1]) if isinstance(mejor, tuple) and len(mejor) >= 2 else 0.0
+            auto_adapt_ok = bool(
+                AUTO_REAL_ALLOW_UNRELIABLE_POST_N15
+                and post_n15
+                and (n_samples_live >= int(AUTO_REAL_UNRELIABLE_MIN_N))
+                and (best_prob >= float(AUTO_REAL_UNRELIABLE_MIN_PROB))
+            )
+            auto_state = "OK" if reliable else ("ADAPT" if auto_adapt_ok else "BLOCK")
+            print(
+                padding
+                + Fore.YELLOW
+                + f"🧩 WHY-NO: CAP≈{cap_now*100:.1f}% (warmup={'sí' if warmup_live else 'no'}) | "
+                  f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} n={n_samples_live} p_best={best_prob*100:.1f}% | "
+                  f"ROOF mode={mode_h} confirm={confirm_h}/{confirm_need_h} trigger_ok={'sí' if trigger_ok_h else 'no'} gate_consumed={'sí' if clone_gate else 'no'}"
+            )
+        except Exception:
+            pass
+
         if owner not in (None, "none") and mejor is not None and owner != mejor[0]:
             print(padding + Fore.YELLOW + f"⛓️ Token bloqueado en {owner}; mejor IA actual es {mejor[0]} ({mejor[1]*100:.1f}%).")
     except Exception:
@@ -9164,12 +9211,18 @@ def mostrar_panel():
             roof_h = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
             cbot_h = DYN_ROOF_STATE.get("confirm_bot")
             cst_h = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
+            mode_h = str(DYN_ROOF_STATE.get("last_gate_mode", "A") or "A")
+            floor_eff_h = float(DYN_ROOF_STATE.get("last_floor_eff", _umbral_real_operativo_actual()) or _umbral_real_operativo_actual())
+            confirm_need_h = int(DYN_ROOF_STATE.get("last_confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
+            trigger_ok_h = bool(DYN_ROOF_STATE.get("last_trigger_ok", False))
+            crowd_h = int(DYN_ROOF_STATE.get("crowd_count", 0) or 0)
             n_min_real, n_req_real = _n_minimo_real_status()
             bloqueado_txt = "bloqueado" if n_min_real < n_req_real else "ok"
             print(
                 Fore.YELLOW
-                + f" Compuerta REAL (operativa): roof={roof_h*100:.1f}% | floor={float(_umbral_real_operativo_actual())*100:.1f}% | "
-                  f"confirm={cst_h}/{int(DYN_ROOF_CONFIRM_TICKS)}" + (f" ({cbot_h})" if cbot_h else "")
+                + f" Compuerta REAL (operativa): mode={mode_h} | roof={roof_h*100:.1f}% | floor={floor_eff_h*100:.1f}% | "
+                  f"confirm={cst_h}/{confirm_need_h}" + (f" ({cbot_h})" if cbot_h else "")
+                  + f" | trigger_ok={'sí' if trigger_ok_h else 'no'} | crowd={crowd_h}"
                   + f" | n_min_real={n_min_real}/{n_req_real} ({bloqueado_txt})"
             )
         except Exception:
@@ -9515,15 +9568,19 @@ def evaluar_semaforo():
     try: saldo_val = float(obtener_valor_saldo() or 0.0)
     except: saldo_val = 0.0
     costo = float(sum(MARTI_ESCALADO[:max(1, int(MAX_CICLOS))]))
+    costo_c1 = float(MARTI_ESCALADO[0]) if MARTI_ESCALADO else 0.0
 
     detalle = ""
     if owner and owner not in (None, "none"):
         detalle = f"Token en uso por {owner}. Puedes forzar 5–0 → 1..5."
         return "🟡", "AVISO", detalle
-    if saldo_val < costo:
-        falta = costo - saldo_val
-        detalle = f"Saldo < colchón Martingala ({costo:.2f} para C1..C{int(MAX_CICLOS)}). Faltan {falta:.2f} USD."
+    if saldo_val < costo_c1:
+        falta = costo_c1 - saldo_val
+        detalle = f"Saldo < C1 ({costo_c1:.2f}). Faltan {falta:.2f} USD para abrir nueva orden."
         return "🟡", "AVISO", detalle
+    if saldo_val < costo:
+        detalle = f"Saldo parcial: cubre C1 pero no todo C1..C{int(MAX_CICLOS)} ({costo:.2f})."
+        return "🟢", "SEÑAL LISTA", detalle
 
     n_inc = contar_filas_incremental()
     if n_inc < MIN_FIT_ROWS_LOW:
@@ -9846,6 +9903,19 @@ DYN_ROOF_LOW_N_PENALTY = 0.02
 PROB_CLONE_STD_MIN = 0.01
 PROB_CLONE_GAP_MIN = 0.005
 REAL_POST_TRADE_COOLDOWN_S = 45
+REAL_POST_TRADE_COOLDOWN_CROWDED_S = 240
+DYN_ROOF_CROWD_P_MIN = 0.90
+DYN_ROOF_CROWD_MIN_BOTS = 3
+DYN_ROOF_CROWD_EXTRA_ROOF = 0.02
+DYN_ROOF_CROWD_EXTRA_GAP = 0.02
+DYN_ROOF_GATE_REARM_HYST = 0.02
+DYN_ROOF_GATE_REARM_TICKS = 2
+DYN_ROOF_LOW_BAL_WARN_COOLDOWN_S = 60
+DYN_ROOF_STALL_TO_MODE_C_S = 2 * 60 * 60
+DYN_ROOF_MODE_C_FLOOR = 0.70
+DYN_ROOF_MODE_C_CONFIRM_TICKS = 3
+DYN_ROOF_MODE_C_MIN_EVIDENCE_N = 20
+DYN_ROOF_MODE_C_MIN_EVIDENCE_LB = 0.60
 REAL_COOLDOWN_UNTIL_TS = 0.0
 LAST_RETRAIN_ERROR = ""
 
@@ -9858,7 +9928,35 @@ DYN_ROOF_STATE = {
     "confirm_streak": 0,
     "last_open_tick": 0,
     "last_floor": None,
+    "allow_real_prev": False,
+    "gate_consumed": False,
+    "gate_rearm_streak": 0,
+    "crowd_count": 0,
+    "last_low_balance_warn_ts": 0.0,
+    "last_p_best": 0.0,
+    "prev_probs": {},
+    "last_real_open_ts": 0.0,
 }
+
+
+def _cooldown_post_trade_s() -> float:
+    """Cooldown dinámico post-trade: más largo si el mercado está saturado de probabilidades altas."""
+    try:
+        crowd_count = int(DYN_ROOF_STATE.get("crowd_count", 0) or 0)
+        p_best = float(DYN_ROOF_STATE.get("last_p_best", 0.0) or 0.0)
+        if crowd_count >= int(DYN_ROOF_CROWD_MIN_BOTS) and p_best >= float(DYN_ROOF_CROWD_P_MIN):
+            return float(REAL_POST_TRADE_COOLDOWN_CROWDED_S)
+    except Exception:
+        pass
+    return float(REAL_POST_TRADE_COOLDOWN_S)
+
+
+def _marcar_compuerta_real_consumida() -> None:
+    """Consume la apertura de compuerta REAL para evitar ráfagas mientras la señal siga pegada."""
+    try:
+        DYN_ROOF_STATE["gate_consumed"] = True
+    except Exception:
+        pass
 
 
 def _todos_bots_con_n_minimo_real(min_n: int | None = None) -> bool:
@@ -9878,7 +9976,7 @@ def _umbral_real_operativo_actual() -> float:
     """
     Umbral REAL dinámico:
     - Base 85%
-    - Baja a 55% cuando TODOS los bots tienen n>=15
+    - Baja a 75% cuando TODOS los bots tienen n>=15
     """
     try:
         if _todos_bots_con_n_minimo_real():
@@ -9910,6 +10008,17 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
     """
     floor_now = float(_umbral_real_operativo_actual())
     modo_relajado_n15 = bool(_todos_bots_con_n_minimo_real())
+    meta_live = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+    n_samples_meta = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
+    warmup_mode = bool(meta_live.get("warmup_mode", n_samples_meta < int(TRAIN_WARMUP_MIN_ROWS)))
+    reliable_mode = bool(meta_live.get("reliable", False)) and (not warmup_mode)
+    last_real_open_ts = float(DYN_ROOF_STATE.get("last_real_open_ts", 0.0) or 0.0)
+    stall_s = max(0.0, time.time() - last_real_open_ts) if last_real_open_ts > 0 else float(DYN_ROOF_STALL_TO_MODE_C_S + 1)
+    mode_c_candidate = bool(
+        modo_relajado_n15
+        and reliable_mode
+        and (stall_s >= float(DYN_ROOF_STALL_TO_MODE_C_S))
+    )
     out = {
         "best_bot": None,
         "p_best": 0.0,
@@ -9921,6 +10030,8 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         "allow_real": False,
         "n_best": 0,
         "new_open": False,
+        "gate_mode": "A",
+        "stall_s": float(stall_s),
     }
     try:
         DYN_ROOF_STATE["tick"] = int(DYN_ROOF_STATE.get("tick", 0) or 0) + 1
@@ -9948,6 +10059,7 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         live.sort(key=lambda x: x[1], reverse=True)
         best_bot, p_best, n_best = live[0]
         p_second = float(live[1][1]) if len(live) > 1 else 0.0
+        crowd_count = sum(1 for _b, p, _n in live if float(p) >= float(DYN_ROOF_CROWD_P_MIN))
         probs_live = [float(x[1]) for x in live]
         spread_std = float(np.std(probs_live)) if probs_live else 0.0
 
@@ -9984,6 +10096,9 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         roof = float(DYN_ROOF_STATE.get("roof", floor_now) or floor_now)
         penalty = float(DYN_ROOF_LOW_N_PENALTY) if int(n_best) < int(DYN_ROOF_LOW_N_MIN) else 0.0
         roof_eff = float(roof + penalty)
+        crowding = bool(crowd_count >= int(DYN_ROOF_CROWD_MIN_BOTS))
+        if crowding:
+            roof_eff = float(roof_eff + float(DYN_ROOF_CROWD_EXTRA_ROOF))
 
         # GAP con fallback:
         # - Si solo hay 1 bot válido, no se bloquea por GAP.
@@ -9993,6 +10108,8 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             gap_ok = True
         else:
             gap_ok = (float(p_best) - float(p_second)) >= float(DYN_ROOF_GAP)
+        if crowding and len(live) > 1:
+            gap_ok = bool((float(p_best) - float(p_second)) >= float(DYN_ROOF_GAP + DYN_ROOF_CROWD_EXTRA_GAP))
 
         clone_flat = bool(
             (len(live) >= 2)
@@ -10004,14 +10121,33 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         if clone_flat:
             gap_ok = False
 
-        # En modo relajado (n>=15 en todos): entrar con piso 55% sin depender del roof.
+        mode_c_active = bool(mode_c_candidate and float(p_best) < float(floor_now))
+        gate_mode = "C" if mode_c_active else ("B" if modo_relajado_n15 else "A")
+        floor_eff = float(DYN_ROOF_MODE_C_FLOOR) if mode_c_active else float(floor_now)
+
+        # En modo relajado (n>=15 en todos): entrar con piso post-n15 sin depender del roof.
         if modo_relajado_n15:
+            floor_gate = floor_eff if mode_c_active else floor_now
             pass_gate = bool((float(p_best) >= float(floor_now)) and bool(gap_ok))
         else:
             pass_gate = (
                 (float(p_best) >= float(roof_eff))
-                and (float(p_best) >= float(floor_now))
+                and (float(p_best) >= float(floor_eff))
                 and bool(gap_ok)
+            )
+        if modo_relajado_n15:
+            pass_gate = bool((float(p_best) >= float(floor_gate)) and bool(gap_ok))
+
+        if mode_c_active:
+            ev = _evidencia_bot_umbral_objetivo(best_bot)
+            ev_n = int(ev.get("n", 0) or 0)
+            ev_lb = float(ev.get("lb", 0.0) or 0.0)
+            suceso_ok_mode_c = bool(estado_bots.get(best_bot, {}).get("ia_suceso_ok", False))
+            pass_gate = bool(
+                pass_gate
+                and suceso_ok_mode_c
+                and (ev_n >= int(DYN_ROOF_MODE_C_MIN_EVIDENCE_N))
+                and (ev_lb >= float(DYN_ROOF_MODE_C_MIN_EVIDENCE_LB))
             )
 
         # Confirmación: 2 ticks consecutivos del mismo bot.
@@ -10030,12 +10166,59 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         DYN_ROOF_STATE["confirm_bot"] = confirm_bot
         DYN_ROOF_STATE["confirm_streak"] = int(confirm_streak)
 
-        confirm_need = 1 if modo_relajado_n15 else int(DYN_ROOF_CONFIRM_TICKS)
+        confirm_need = int(DYN_ROOF_MODE_C_CONFIRM_TICKS if mode_c_active else DYN_ROOF_CONFIRM_TICKS)
         allow_real = bool(pass_gate and (confirm_streak >= int(confirm_need)))
+        allow_real_prev = bool(DYN_ROOF_STATE.get("allow_real_prev", False))
+        gate_consumed = bool(DYN_ROOF_STATE.get("gate_consumed", False))
+        rearm_streak = int(DYN_ROOF_STATE.get("gate_rearm_streak", 0) or 0)
+        prev_probs = DYN_ROOF_STATE.get("prev_probs", {})
+        if not isinstance(prev_probs, dict):
+            prev_probs = {}
+        prev_p_best = prev_probs.get(best_bot, None)
+        crossed_up = bool(
+            (isinstance(prev_p_best, (int, float)) and (float(prev_p_best) < float(floor_eff)) and (float(p_best) >= float(floor_eff)))
+            or ((prev_p_best is None) and (float(p_best) >= float(floor_eff)))
+        )
+        suceso_ok = bool(estado_bots.get(best_bot, {}).get("ia_suceso_ok", False))
+
+        if not allow_real:
+            gate_consumed = False
+            rearm_streak = 0
+        elif gate_consumed:
+            if float(p_best) <= float(roof_eff - DYN_ROOF_GATE_REARM_HYST):
+                rearm_streak += 1
+                if rearm_streak >= int(DYN_ROOF_GATE_REARM_TICKS):
+                    gate_consumed = False
+                    rearm_streak = 0
+            else:
+                rearm_streak = 0
+
+        trigger_ok = bool(suceso_ok if mode_c_active else crossed_up)
+        if warmup_mode and (not mode_c_active):
+            trigger_ok = bool(trigger_ok and suceso_ok)
+
         last_open_tick = int(DYN_ROOF_STATE.get("last_open_tick", 0) or 0)
-        new_open = bool(allow_real and (last_open_tick != tick_now))
+        new_open = bool(
+            allow_real
+            and (not allow_real_prev)
+            and trigger_ok
+            and (not gate_consumed)
+            and (last_open_tick != tick_now)
+        )
         if new_open:
             DYN_ROOF_STATE["last_open_tick"] = int(tick_now)
+        DYN_ROOF_STATE["allow_real_prev"] = bool(allow_real)
+        DYN_ROOF_STATE["gate_consumed"] = bool(gate_consumed)
+        DYN_ROOF_STATE["gate_rearm_streak"] = int(rearm_streak)
+        DYN_ROOF_STATE["crowd_count"] = int(crowd_count)
+        DYN_ROOF_STATE["last_p_best"] = float(p_best)
+        DYN_ROOF_STATE["last_gate_mode"] = str(gate_mode)
+        DYN_ROOF_STATE["last_floor_eff"] = float(floor_eff)
+        DYN_ROOF_STATE["last_confirm_need"] = int(confirm_need)
+        DYN_ROOF_STATE["last_trigger_ok"] = bool(trigger_ok)
+        for b_live, p_live, _n_live in live:
+            prev_probs[str(b_live)] = float(p_live)
+        DYN_ROOF_STATE["prev_probs"] = prev_probs
 
         out.update({
             "best_bot": best_bot,
@@ -10048,6 +10231,14 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             "allow_real": bool(allow_real),
             "n_best": int(n_best),
             "new_open": bool(new_open),
+            "crowd_count": int(crowd_count),
+            "crowding": bool(crowding),
+            "crossed_up": bool(crossed_up),
+            "suceso_ok": bool(suceso_ok),
+            "gate_mode": str(gate_mode),
+            "stall_s": float(stall_s),
+            "floor_eff": float(floor_eff),
+            "confirm_need": int(confirm_need),
             "clone_flat": bool(clone_flat),
             "spread_std": float(spread_std),
         })
@@ -10790,14 +10981,19 @@ async def main():
                                     f"{dyn_gate.get('best_bot','--')} | "
                                     f"p_best={float(dyn_gate.get('p_best',0.0))*100:.1f}% "
                                     f"roof_eff={float(dyn_gate.get('roof_eff',0.0))*100:.1f}% "
+                                    f"floor={float(dyn_gate.get('floor_eff',0.0))*100:.1f}% "
                                     f"gap_ok={'sí' if dyn_gate.get('gap_ok') else 'no'} "
-                                    f"confirm={int(dyn_gate.get('confirm_streak',0))}/{int(DYN_ROOF_CONFIRM_TICKS)}"
+                                    f"cross={'sí' if dyn_gate.get('crossed_up') else 'no'} "
+                                    f"suceso={'sí' if dyn_gate.get('suceso_ok') else 'no'} "
+                                    f"mode={dyn_gate.get('gate_mode','A')} "
+                                    f"stall={int(float(dyn_gate.get('stall_s',0.0))//60)}m "
+                                    f"confirm={int(dyn_gate.get('confirm_streak',0))}/{int(dyn_gate.get('confirm_need', DYN_ROOF_CONFIRM_TICKS))}"
                                 )
                         else:
                             umbral_ia_real = max(float(REAL_TRIGGER_MIN), float(get_umbral_real_calibrado()))
                             dyn_gate = None
 
-                        # Bloqueo por saldo (evita abrir REAL sin colchón mínimo de martingala)
+                        # Saldo informativo: no bloquear por colchón completo, solo por ciclo ejecutable.
                         try:
                             saldo_val = float(obtener_valor_saldo() or 0.0)
                         except Exception:
@@ -10936,11 +11132,21 @@ async def main():
 
                             # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
 
-                        # Si hay señal pero saldo insuficiente -> avisar y NO abrir ventana
+                        # Si hay señal y el saldo no cubre el plan completo, solo avisar (no bloquear).
                         if candidatos and saldo_val < costo_plan:
-                            falta = costo_plan - saldo_val
-                            agregar_evento(f"🚫 Señal IA bloqueada por saldo: falta {falta:.2f} USD para cubrir C1..C{int(MAX_CICLOS)} ({costo_plan:.2f}).")
-                            candidatos = []
+                            ahora_warn = time.time()
+                            last_warn = float(DYN_ROOF_STATE.get("last_low_balance_warn_ts", 0.0) or 0.0)
+                            if (ahora_warn - last_warn) >= float(DYN_ROOF_LOW_BAL_WARN_COOLDOWN_S):
+                                if saldo_val >= costo_ciclo1:
+                                    agregar_evento(
+                                        f"ℹ️ Saldo parcial: cubre C1 ({costo_ciclo1:.2f}) pero no C1..C{int(MAX_CICLOS)} ({costo_plan:.2f})."
+                                    )
+                                else:
+                                    falta = costo_ciclo1 - saldo_val
+                                    agregar_evento(
+                                        f"⚠️ Saldo insuficiente para C1: faltan {falta:.2f} USD (C1={costo_ciclo1:.2f})."
+                                    )
+                                DYN_ROOF_STATE["last_low_balance_warn_ts"] = float(ahora_warn)
 
                         # ==================== AUTO-PRESELECCIÓN (MODO MANUAL) ====================
                         # Si la IA detecta señal y tú estás en manual, preselecciona el mejor bot y abre la ventana
@@ -10980,8 +11186,23 @@ async def main():
                             meta_live = leer_model_meta() or {}
                             modelo_reliable = bool(meta_live.get("reliable", False))
                             if not modelo_reliable:
-                                agregar_evento("🛡️ IA AUTO bloqueado: modelo no confiable (reliable=false).")
-                                candidatos = []
+                                n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
+                                post_n15 = bool(_todos_bots_con_n_minimo_real())
+                                best_prob = max((float(x[2]) for x in candidatos), default=0.0)
+                                allow_unreliable = bool(
+                                    AUTO_REAL_ALLOW_UNRELIABLE_POST_N15
+                                    and post_n15
+                                    and (n_samples_live >= int(AUTO_REAL_UNRELIABLE_MIN_N))
+                                    and (best_prob >= float(AUTO_REAL_UNRELIABLE_MIN_PROB))
+                                )
+                                if allow_unreliable:
+                                    agregar_evento(
+                                        f"⚠️ IA AUTO modo adaptativo: reliable=false, pero se habilita por post-n15 "
+                                        f"(n={n_samples_live}, p_best={best_prob*100:.1f}%)."
+                                    )
+                                else:
+                                    agregar_evento("🛡️ IA AUTO bloqueado: modelo no confiable (reliable=false).")
+                                    candidatos = []
                             elif time.time() < float(REAL_COOLDOWN_UNTIL_TS):
                                 restantes = max(0.0, float(REAL_COOLDOWN_UNTIL_TS) - time.time())
                                 agregar_evento(f"⏳ IA AUTO cooldown post-trade activo ({restantes:.0f}s).")
