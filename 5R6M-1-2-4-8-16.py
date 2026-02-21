@@ -9959,6 +9959,46 @@ def _marcar_compuerta_real_consumida() -> None:
         pass
 
 
+def _cooldown_post_trade_s() -> float:
+    """Cooldown dinámico post-trade: más largo si el mercado está saturado de probabilidades altas."""
+    try:
+        crowd_count = int(DYN_ROOF_STATE.get("crowd_count", 0) or 0)
+        p_best = float(DYN_ROOF_STATE.get("last_p_best", 0.0) or 0.0)
+        if crowd_count >= int(DYN_ROOF_CROWD_MIN_BOTS) and p_best >= float(DYN_ROOF_CROWD_P_MIN):
+            return float(REAL_POST_TRADE_COOLDOWN_CROWDED_S)
+    except Exception:
+        pass
+    return float(REAL_POST_TRADE_COOLDOWN_S)
+
+
+def _marcar_compuerta_real_consumida() -> None:
+    """Consume la apertura de compuerta REAL para evitar ráfagas mientras la señal siga pegada."""
+    try:
+        DYN_ROOF_STATE["gate_consumed"] = True
+    except Exception:
+        pass
+
+
+def _cooldown_post_trade_s() -> float:
+    """Cooldown dinámico post-trade: más largo si el mercado está saturado de probabilidades altas."""
+    try:
+        crowd_count = int(DYN_ROOF_STATE.get("crowd_count", 0) or 0)
+        p_best = float(DYN_ROOF_STATE.get("last_p_best", 0.0) or 0.0)
+        if crowd_count >= int(DYN_ROOF_CROWD_MIN_BOTS) and p_best >= float(DYN_ROOF_CROWD_P_MIN):
+            return float(REAL_POST_TRADE_COOLDOWN_CROWDED_S)
+    except Exception:
+        pass
+    return float(REAL_POST_TRADE_COOLDOWN_S)
+
+
+def _marcar_compuerta_real_consumida() -> None:
+    """Consume la apertura de compuerta REAL para evitar ráfagas mientras la señal siga pegada."""
+    try:
+        DYN_ROOF_STATE["gate_consumed"] = True
+    except Exception:
+        pass
+
+
 def _todos_bots_con_n_minimo_real(min_n: int | None = None) -> bool:
     """True si TODOS los bots alcanzaron el mínimo de muestra para habilitar umbral REAL reducido."""
     try:
