@@ -1717,6 +1717,7 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
     ok = owner_after == bot
     if ok:
         _marcar_compuerta_real_consumida()
+        DYN_ROOF_STATE["last_real_open_ts"] = float(time.time())
     return ok
 # === FIN PATCH REAL INMEDIATO ===
 # === IA ACK (handshake maestro→bot: confirma que el PRE-TRADE ya fue evaluado) ===
@@ -9863,6 +9864,11 @@ DYN_ROOF_CROWD_EXTRA_GAP = 0.02
 DYN_ROOF_GATE_REARM_HYST = 0.02
 DYN_ROOF_GATE_REARM_TICKS = 2
 DYN_ROOF_LOW_BAL_WARN_COOLDOWN_S = 60
+DYN_ROOF_STALL_TO_MODE_C_S = 2 * 60 * 60
+DYN_ROOF_MODE_C_FLOOR = 0.70
+DYN_ROOF_MODE_C_CONFIRM_TICKS = 3
+DYN_ROOF_MODE_C_MIN_EVIDENCE_N = 20
+DYN_ROOF_MODE_C_MIN_EVIDENCE_LB = 0.60
 REAL_COOLDOWN_UNTIL_TS = 0.0
 LAST_RETRAIN_ERROR = ""
 
@@ -9882,6 +9888,7 @@ DYN_ROOF_STATE = {
     "last_low_balance_warn_ts": 0.0,
     "last_p_best": 0.0,
     "prev_probs": {},
+    "last_real_open_ts": 0.0,
 }
 
 
@@ -9954,6 +9961,17 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
     """
     floor_now = float(_umbral_real_operativo_actual())
     modo_relajado_n15 = bool(_todos_bots_con_n_minimo_real())
+    meta_live = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+    n_samples_meta = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
+    warmup_mode = bool(meta_live.get("warmup_mode", n_samples_meta < int(TRAIN_WARMUP_MIN_ROWS)))
+    reliable_mode = bool(meta_live.get("reliable", False)) and (not warmup_mode)
+    last_real_open_ts = float(DYN_ROOF_STATE.get("last_real_open_ts", 0.0) or 0.0)
+    stall_s = max(0.0, time.time() - last_real_open_ts) if last_real_open_ts > 0 else float(DYN_ROOF_STALL_TO_MODE_C_S + 1)
+    mode_c_candidate = bool(
+        modo_relajado_n15
+        and reliable_mode
+        and (stall_s >= float(DYN_ROOF_STALL_TO_MODE_C_S))
+    )
     out = {
         "best_bot": None,
         "p_best": 0.0,
@@ -9965,6 +9983,8 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         "allow_real": False,
         "n_best": 0,
         "new_open": False,
+        "gate_mode": "A",
+        "stall_s": float(stall_s),
     }
     try:
         DYN_ROOF_STATE["tick"] = int(DYN_ROOF_STATE.get("tick", 0) or 0) + 1
@@ -10054,14 +10074,33 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         if clone_flat:
             gap_ok = False
 
-        # En modo relajado (n>=15 en todos): entrar con piso 75% sin depender del roof.
+        mode_c_active = bool(mode_c_candidate and float(p_best) < float(floor_now))
+        gate_mode = "C" if mode_c_active else ("B" if modo_relajado_n15 else "A")
+        floor_eff = float(DYN_ROOF_MODE_C_FLOOR) if mode_c_active else float(floor_now)
+
+        # En modo relajado (n>=15 en todos): entrar con piso post-n15 sin depender del roof.
         if modo_relajado_n15:
+            floor_gate = floor_eff if mode_c_active else floor_now
             pass_gate = bool((float(p_best) >= float(floor_now)) and bool(gap_ok))
         else:
             pass_gate = (
                 (float(p_best) >= float(roof_eff))
-                and (float(p_best) >= float(floor_now))
+                and (float(p_best) >= float(floor_eff))
                 and bool(gap_ok)
+            )
+        if modo_relajado_n15:
+            pass_gate = bool((float(p_best) >= float(floor_gate)) and bool(gap_ok))
+
+        if mode_c_active:
+            ev = _evidencia_bot_umbral_objetivo(best_bot)
+            ev_n = int(ev.get("n", 0) or 0)
+            ev_lb = float(ev.get("lb", 0.0) or 0.0)
+            suceso_ok_mode_c = bool(estado_bots.get(best_bot, {}).get("ia_suceso_ok", False))
+            pass_gate = bool(
+                pass_gate
+                and suceso_ok_mode_c
+                and (ev_n >= int(DYN_ROOF_MODE_C_MIN_EVIDENCE_N))
+                and (ev_lb >= float(DYN_ROOF_MODE_C_MIN_EVIDENCE_LB))
             )
 
         # Confirmación: 2 ticks consecutivos del mismo bot.
@@ -10080,7 +10119,7 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         DYN_ROOF_STATE["confirm_bot"] = confirm_bot
         DYN_ROOF_STATE["confirm_streak"] = int(confirm_streak)
 
-        confirm_need = int(DYN_ROOF_CONFIRM_TICKS)
+        confirm_need = int(DYN_ROOF_MODE_C_CONFIRM_TICKS if mode_c_active else DYN_ROOF_CONFIRM_TICKS)
         allow_real = bool(pass_gate and (confirm_streak >= int(confirm_need)))
         allow_real_prev = bool(DYN_ROOF_STATE.get("allow_real_prev", False))
         gate_consumed = bool(DYN_ROOF_STATE.get("gate_consumed", False))
@@ -10090,8 +10129,8 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             prev_probs = {}
         prev_p_best = prev_probs.get(best_bot, None)
         crossed_up = bool(
-            (isinstance(prev_p_best, (int, float)) and (float(prev_p_best) < float(floor_now)) and (float(p_best) >= float(floor_now)))
-            or ((prev_p_best is None) and (float(p_best) >= float(floor_now)))
+            (isinstance(prev_p_best, (int, float)) and (float(prev_p_best) < float(floor_eff)) and (float(p_best) >= float(floor_eff)))
+            or ((prev_p_best is None) and (float(p_best) >= float(floor_eff)))
         )
         suceso_ok = bool(estado_bots.get(best_bot, {}).get("ia_suceso_ok", False))
 
@@ -10107,11 +10146,8 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             else:
                 rearm_streak = 0
 
-        meta_live = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
-        n_samples = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
-        warmup_mode = bool(meta_live.get("warmup_mode", n_samples < int(TRAIN_WARMUP_MIN_ROWS)))
-        trigger_ok = bool(crossed_up)
-        if warmup_mode:
+        trigger_ok = bool(suceso_ok if mode_c_active else crossed_up)
+        if warmup_mode and (not mode_c_active):
             trigger_ok = bool(trigger_ok and suceso_ok)
 
         last_open_tick = int(DYN_ROOF_STATE.get("last_open_tick", 0) or 0)
@@ -10148,6 +10184,10 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             "crowding": bool(crowding),
             "crossed_up": bool(crossed_up),
             "suceso_ok": bool(suceso_ok),
+            "gate_mode": str(gate_mode),
+            "stall_s": float(stall_s),
+            "floor_eff": float(floor_eff),
+            "confirm_need": int(confirm_need),
             "clone_flat": bool(clone_flat),
             "spread_std": float(spread_std),
         })
@@ -10890,10 +10930,13 @@ async def main():
                                     f"{dyn_gate.get('best_bot','--')} | "
                                     f"p_best={float(dyn_gate.get('p_best',0.0))*100:.1f}% "
                                     f"roof_eff={float(dyn_gate.get('roof_eff',0.0))*100:.1f}% "
+                                    f"floor={float(dyn_gate.get('floor_eff',0.0))*100:.1f}% "
                                     f"gap_ok={'sí' if dyn_gate.get('gap_ok') else 'no'} "
                                     f"cross={'sí' if dyn_gate.get('crossed_up') else 'no'} "
                                     f"suceso={'sí' if dyn_gate.get('suceso_ok') else 'no'} "
-                                    f"confirm={int(dyn_gate.get('confirm_streak',0))}/{int(DYN_ROOF_CONFIRM_TICKS)}"
+                                    f"mode={dyn_gate.get('gate_mode','A')} "
+                                    f"stall={int(float(dyn_gate.get('stall_s',0.0))//60)}m "
+                                    f"confirm={int(dyn_gate.get('confirm_streak',0))}/{int(dyn_gate.get('confirm_need', DYN_ROOF_CONFIRM_TICKS))}"
                                 )
                         else:
                             umbral_ia_real = max(float(REAL_TRIGGER_MIN), float(get_umbral_real_calibrado()))
