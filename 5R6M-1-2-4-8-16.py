@@ -1759,6 +1759,26 @@ def _prob_ia_para_ack(bot: str, st: dict | None = None):
         pass
     return None
 
+def _resolver_prob_en_juego_ack(bot: str, st: dict | None = None):
+    """Devuelve (prob_en_juego, source) para unificar la fuente de verdad del ACK."""
+    try:
+        st = st if isinstance(st, dict) else estado_bots.get(str(bot), {})
+        p_lock = st.get("ia_prob_senal", None)
+        if isinstance(p_lock, (int, float)) and 0.0 <= float(p_lock) <= 1.0:
+            return float(p_lock), "SENAL"
+
+        ia_ready = bool(st.get("ia_ready", False))
+        modo = str(st.get("modo_ia", "off") or "off").strip().lower()
+        p_live = st.get("prob_ia", None)
+        if ia_ready and (modo != "off") and isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0:
+            return float(p_live), "MODELO"
+
+        if modo == "off":
+            return None, "OFF"
+        return None, "NO_READY"
+    except Exception:
+        return None, "NO_READY"
+
 def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: str, meta: dict | None):
     """
     Escribe un ACK por-bot para que el bot muestre la prob IA asociada a su PRE.
@@ -1775,6 +1795,11 @@ def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: st
         st = estado_bots.get(str(bot), {}) if isinstance(estado_bots, dict) else {}
 
         p_hud = _prob_ia_para_ack(bot, st)
+        p_play, p_source = _resolver_prob_en_juego_ack(bot, st)
+        decision_id = st.get("ia_decision_id")
+        if not decision_id:
+            ep = int(epoch) if epoch is not None else 0
+            decision_id = f"{bot}|{ep}"
         payload = {
             "bot": str(bot),
             "epoch": int(epoch) if epoch is not None else 0,
@@ -1784,6 +1809,11 @@ def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: st
             "has_prob_hud": isinstance(p_hud, (int, float)),
             "ia_ready": bool(st.get("ia_ready", False)),
             "modo_hud": str(st.get("modo_ia", "off") or "off").upper(),
+            "prob_en_juego": p_play,
+            "has_prob_en_juego": isinstance(p_play, (int, float)),
+            "prob_source": str(p_source),
+            "decision_id": str(decision_id),
+            "ack_ts": time.time(),
             "prob_raw": float(st.get("prob_ia_raw")) if isinstance(st.get("prob_ia_raw"), (int, float)) else None,
             "calib_factor": float(st.get("cal_factor")) if isinstance(st.get("cal_factor"), (int, float)) else None,
             "auc": float((meta or {}).get("auc", 0.0) or 0.0),
@@ -1792,6 +1822,7 @@ def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: st
             "real_thr_cap": float(AUTO_REAL_THR),
             "reliable": bool((meta or {}).get("reliable", True)),
             "modo": str(modo_ia).upper() if modo_ia else "OFF",
+            "model_version": str((meta or {}).get("trained_at", "")),
             "ts": time.time()
         }
 
@@ -10383,6 +10414,16 @@ async def cargar_datos_bot(bot, token_actual):
 
             trade_status = str(fila_dict.get("trade_status", "")).strip().upper()
             resultado = normalizar_resultado(fila_dict.get("resultado", ""))
+
+            try:
+                ep_dec = int(float(fila_dict.get("epoch", 0) or 0))
+                cyc_dec = int(float(fila_dict.get("ciclo_martingala", fila_dict.get("ciclo", 1)) or 1))
+            except Exception:
+                ep_dec, cyc_dec = 0, 1
+            token_dec = "REAL" if effective_owner == bot else "DEMO"
+            act_dec = str(fila_dict.get("activo", ""))
+            dir_dec = str(fila_dict.get("direction", fila_dict.get("direccion", "")) or "")
+            estado_bots[bot]["ia_decision_id"] = f"{bot}|{ep_dec}|C{cyc_dec}|{act_dec}|{dir_dec}|{token_dec}"
 
             # =========================
             # 1) FILAS NO-CERRADAS (PRE_TRADE / incompletas)

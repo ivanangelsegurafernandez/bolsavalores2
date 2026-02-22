@@ -348,7 +348,13 @@ CSV_HEADER = [
     "result_bin",            # 1 o 0 solo en filas cerradas
     "trade_status",          # "PRE_TRADE" o "CERRADO"
     "epoch",
-    "ts"
+    "ts",
+    "ia_prob_en_juego",
+    "ia_prob_source",
+    "ia_decision_id",
+    "ia_gate_real",
+    "ia_modo_ack",
+    "ia_ready_ack"
 ]
 # =============================================================================
 # CSV — helpers robustos (evita columnas corridas + asegura puntaje 0..1)
@@ -398,7 +404,7 @@ def _norm_puntaje_01(condiciones, total_cond=3):
 
 def _write_row_dict_atomic(archivo_csv: str, row_dict: dict):
     """
-    Escribe SIEMPRE respetando el orden de CSV_HEADER (23 columnas).
+    Escribe SIEMPRE respetando el orden de CSV_HEADER.
     """
     row = [row_dict.get(col, "") for col in CSV_HEADER]
     write_csv_atomic(archivo_csv, row)
@@ -551,6 +557,12 @@ def write_pretrade_snapshot(
         "trade_status": "PRE_TRADE",
         "epoch": int(epoch_val),
         "ts": ts_val,
+        "ia_prob_en_juego": "",
+        "ia_prob_source": "",
+        "ia_decision_id": f"{NOMBRE_BOT}|{int(epoch_val)}|C{int(ciclo) if ciclo is not None else 1}|{symbol}|{direccion}|{str(kwargs.get('token', 'NA')).upper()}",
+        "ia_gate_real": "",
+        "ia_modo_ack": "",
+        "ia_ready_ack": "",
     }
 
     _write_row_dict_atomic(archivo_csv, row_dict)
@@ -1584,6 +1596,12 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                         "trade_status": "CERRADO",
                         "epoch": int(epoch_val),
                         "ts": ts_val,
+                        "ia_prob_en_juego": estado_bot.get("ack_ctx", {}).get("ia_prob_en_juego", ""),
+                        "ia_prob_source": estado_bot.get("ack_ctx", {}).get("ia_prob_source", ""),
+                        "ia_decision_id": estado_bot.get("ack_ctx", {}).get("ia_decision_id", f"{NOMBRE_BOT}|{int(epoch_val)}"),
+                        "ia_gate_real": estado_bot.get("ack_ctx", {}).get("ia_gate_real", ""),
+                        "ia_modo_ack": estado_bot.get("ack_ctx", {}).get("ia_modo_ack", ""),
+                        "ia_ready_ack": estado_bot.get("ack_ctx", {}).get("ia_ready_ack", ""),
                     }
                     _write_row_dict_atomic(ARCHIVO_CSV, row_dict)
 
@@ -2194,6 +2212,7 @@ async def ejecutar_panel():
                         ciclo_martingala=int(ciclo),
                         payout=float(payout),
                         puntaje_estrategia=float(condiciones),  # tu score
+                        token=current_token,
                     )
                 except Exception:
                     epoch_pre = None
@@ -2227,8 +2246,12 @@ async def ejecutar_panel():
                                 if ack and int(ack.get("epoch", 0)) >= int(epoch_pre):
                                     p = ack.get("prob", None)
                                     p_hud = ack.get("prob_hud", None)
+                                    p_play = ack.get("prob_en_juego", None)
                                     has_prob_hud = ack.get("has_prob_hud", None)
-                                    if isinstance(has_prob_hud, bool):
+                                    has_prob_play = ack.get("has_prob_en_juego", None)
+                                    if isinstance(has_prob_play, bool):
+                                        p_show = p_play if has_prob_play else None
+                                    elif isinstance(has_prob_hud, bool):
                                         p_show = p_hud if has_prob_hud else p
                                     else:
                                         p_show = p_hud if isinstance(p_hud, (int, float)) else p
@@ -2236,14 +2259,28 @@ async def ejecutar_panel():
                                     auc = float(ack.get("auc", 0.0) or 0.0)
                                     modo = ack.get("modo", "OFF")
                                     thr_real = ack.get("real_thr", None)
+                                    reliable_ack = bool(ack.get("reliable", False))
+                                    modo_norm = str(modo or "OFF").strip().upper()
+                                    if modo_norm == "OFF":
+                                        p_show = None
+                                    auc_txt = f"{auc:.3f}" if (reliable_ack and 0.0 < auc < 1.0 and modo_norm != "OFF") else "N/A"
+
+                                    estado_bot["ack_ctx"] = {
+                                        "ia_prob_en_juego": p_show if isinstance(p_show, (int, float)) else "",
+                                        "ia_prob_source": str(ack.get("prob_source", "")),
+                                        "ia_decision_id": str(ack.get("decision_id", "")),
+                                        "ia_gate_real": float(thr_real) if isinstance(thr_real, (int, float)) else "",
+                                        "ia_modo_ack": str(modo),
+                                        "ia_ready_ack": bool(ack.get("ia_ready", False)),
+                                    }
 
                                     if isinstance(p_show, (int, float)):
                                         if isinstance(thr_real, (int, float)):
-                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | Gate REAL={float(thr_real)*100:.1f}% | AUC={auc:.3f} | modo={modo}")
+                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | Gate REAL={float(thr_real)*100:.1f}% | AUC={auc_txt} | modo={modo}")
                                         else:
-                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | AUC={auc:.3f} | modo={modo}")
+                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | AUC={auc_txt} | modo={modo}")
                                     else:
-                                        print(f"🤖 IA ACK ({NOMBRE_BOT}) → (sin prob) | AUC={auc:.3f} | modo={modo}")
+                                        print(f"🤖 IA ACK ({NOMBRE_BOT}) → (sin prob) | AUC={auc_txt} | modo={modo}")
 
                                     ack_visto = True
                             except Exception:
