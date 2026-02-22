@@ -1770,8 +1770,14 @@ def _resolver_prob_en_juego_ack(bot: str, st: dict | None = None):
         ia_ready = bool(st.get("ia_ready", False))
         modo = str(st.get("modo_ia", "off") or "off").strip().lower()
         p_live = st.get("prob_ia", None)
-        if ia_ready and (modo != "off") and isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0:
-            return float(p_live), "MODELO"
+        if isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0 and (modo != "off"):
+            # MODELO: predicción lista y usable para decisión real.
+            if ia_ready:
+                return float(p_live), "MODELO"
+            # LOW_DATA/NO_READY: mostramos prob viva del maestro como referencia visual
+            # (evita ocultar 54.2% en bot cuando el HUD sí la está mostrando).
+            if float(p_live) > 0.0:
+                return float(p_live), "HUD"
 
         if modo == "off":
             return None, "OFF"
