@@ -177,6 +177,9 @@ REAL_COMMIT_WINDOW_S = 75
 last_real_contract_id = None
 real_buy_commit_until = 0.0
 
+# Higiene de riesgo: al saltar a REAL, arrancar en C1 (aunque el maestro sugiera C2+)
+RESET_CICLO_EN_ENTRADA_REAL = True
+
 def commit_guard_active() -> bool:
     return (last_real_contract_id is not None) and (time.time() < real_buy_commit_until)
 
@@ -345,7 +348,13 @@ CSV_HEADER = [
     "result_bin",            # 1 o 0 solo en filas cerradas
     "trade_status",          # "PRE_TRADE" o "CERRADO"
     "epoch",
-    "ts"
+    "ts",
+    "ia_prob_en_juego",
+    "ia_prob_source",
+    "ia_decision_id",
+    "ia_gate_real",
+    "ia_modo_ack",
+    "ia_ready_ack"
 ]
 # =============================================================================
 # CSV — helpers robustos (evita columnas corridas + asegura puntaje 0..1)
@@ -395,7 +404,7 @@ def _norm_puntaje_01(condiciones, total_cond=3):
 
 def _write_row_dict_atomic(archivo_csv: str, row_dict: dict):
     """
-    Escribe SIEMPRE respetando el orden de CSV_HEADER (23 columnas).
+    Escribe SIEMPRE respetando el orden de CSV_HEADER.
     """
     row = [row_dict.get(col, "") for col in CSV_HEADER]
     write_csv_atomic(archivo_csv, row)
@@ -548,6 +557,12 @@ def write_pretrade_snapshot(
         "trade_status": "PRE_TRADE",
         "epoch": int(epoch_val),
         "ts": ts_val,
+        "ia_prob_en_juego": "",
+        "ia_prob_source": "",
+        "ia_decision_id": f"{NOMBRE_BOT}|{int(epoch_val)}|C{int(ciclo) if ciclo is not None else 1}|{symbol}|{direccion}|{str(kwargs.get('token', 'NA')).upper()}",
+        "ia_gate_real": "",
+        "ia_modo_ack": "",
+        "ia_ready_ack": "",
     }
 
     _write_row_dict_atomic(archivo_csv, row_dict)
@@ -1233,26 +1248,36 @@ async def check_token_and_reconnect(ws, current_token):
                     real_activado_en_bot = time.time()  # BLOQUE 5 and 2: Set activation time
                     # Lee la orden del maestro y deja seteado el ciclo para la siguiente vuelta
                     cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    if cyc:
+                    if RESET_CICLO_EN_ENTRADA_REAL:
+                        estado_bot["ciclo_forzado"] = 1
+                        if cyc and int(cyc) > 1:
+                            print(Fore.YELLOW + f"Orden maestro C{cyc} ignorada por seguridad: en entrada REAL reinicio a C1.")
+                        else:
+                            print(Fore.YELLOW + "Entrada REAL detectada: reinicio de martingala a C1 por seguridad.")
+                    elif cyc:
                         estado_bot["ciclo_forzado"] = cyc
                         print(Fore.YELLOW + f"Orden maestro detectada: arrancaré en ciclo #{cyc}.")
-                        # Silenciar ruido guiado por maestro (BLOQUE 3)
-                        if quiet or (str(src).upper() == "MANUAL"):
-                            asyncio.create_task(_silencio_temporal(90, fuente=src))
-                        else:
-                            asyncio.create_task(_desactivar_silencioso_en(90))
+
+                    # Silenciar ruido guiado por maestro (BLOQUE 3)
+                    if quiet or (str(src).upper() == "MANUAL"):
+                        asyncio.create_task(_silencio_temporal(90, fuente=src))
+                    else:
+                        asyncio.create_task(_desactivar_silencioso_en(90))
                     reinicio_forzado.set()
                 else:
                     if not (MODO_SILENCIOSO and estado_bot.get("modo_manual")) and not estado_bot.get("barra_activa", False):
                         if _print_once("rea-REAL", ttl=180):
                             print(Fore.YELLOW + "Reafirmación de REAL (sin reset de martingala)")
                     cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    if cyc:
+                    if RESET_CICLO_EN_ENTRADA_REAL:
+                        estado_bot["ciclo_forzado"] = 1
+                    elif cyc:
                         estado_bot["ciclo_forzado"] = cyc
-                        if quiet or (str(src).upper() == "MANUAL"):
-                            asyncio.create_task(_silencio_temporal(90, fuente=src))
-                        else:
-                            asyncio.create_task(_desactivar_silencioso_en(90))
+
+                    if quiet or (str(src).upper() == "MANUAL"):
+                        asyncio.create_task(_silencio_temporal(90, fuente=src))
+                    else:
+                        asyncio.create_task(_desactivar_silencioso_en(90))
                 # <<< PATCH 4
             else:
                 # Saliste de REAL: prepara el sonido para la próxima ventana
@@ -1571,24 +1596,42 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                         "trade_status": "CERRADO",
                         "epoch": int(epoch_val),
                         "ts": ts_val,
+                        "ia_prob_en_juego": estado_bot.get("ack_ctx", {}).get("ia_prob_en_juego", ""),
+                        "ia_prob_source": estado_bot.get("ack_ctx", {}).get("ia_prob_source", ""),
+                        "ia_decision_id": estado_bot.get("ack_ctx", {}).get("ia_decision_id", f"{NOMBRE_BOT}|{int(epoch_val)}"),
+                        "ia_gate_real": estado_bot.get("ack_ctx", {}).get("ia_gate_real", ""),
+                        "ia_modo_ack": estado_bot.get("ack_ctx", {}).get("ia_modo_ack", ""),
+                        "ia_ready_ack": estado_bot.get("ack_ctx", {}).get("ia_ready_ack", ""),
                     }
                     _write_row_dict_atomic(ARCHIVO_CSV, row_dict)
 
             except Exception as csv_e:
                 print(Fore.RED + f"[ERROR] al escribir CSV: {csv_e}")
-            # Calcular y mostrar % de éxito acumulado (robusto: solo cuenta 0/1)
+            # Calcular y mostrar % de éxito acumulado (solo cierres auditables)
             try:
-                import pandas as pd
-                # on_bad_lines="skip" evita que una línea rota tumbe todo el panel
-                df = pd.read_csv(ARCHIVO_CSV, encoding="utf-8", on_bad_lines="skip")
-                if "result_bin" in df.columns:
-                    # Normaliza y filtra solo valores válidos "0" y "1"
-                    rb = df["result_bin"].astype(str).str.strip()
-                    mask = rb.isin(["0", "1"])                   
-                    total = int(mask.sum())
-                    ganancias = int((rb[mask] == "1").sum())
-                    porcentaje_exito = (ganancias / total) * 100 if total else 0.0
-                    print(f"Éxito acumulado en {ARCHIVO_CSV}: {ganancias}/{total} = {porcentaje_exito:.2f}%")
+                total_cerrados = 0
+                ganancias = 0
+                pendientes = 0
+                with open(ARCHIVO_CSV, "r", encoding="utf-8", newline="") as fh:
+                    reader = csv.DictReader(fh)
+                    for row in reader:
+                        status = str(row.get("trade_status", "")).strip().upper()
+                        rb = str(row.get("result_bin", "")).strip()
+                        if status == "CERRADO" and rb in {"0", "1"}:
+                            total_cerrados += 1
+                            if rb == "1":
+                                ganancias += 1
+                        elif status in {"PRE_TRADE", "PENDIENTE"}:
+                            pendientes += 1
+
+                if total_cerrados:
+                    porcentaje_exito = (ganancias / total_cerrados) * 100
+                    print(f"Éxito acumulado en {ARCHIVO_CSV}: {ganancias}/{total_cerrados} = {porcentaje_exito:.2f}%")
+                else:
+                    print(
+                        f"Éxito acumulado en {ARCHIVO_CSV}: sin cierres auditables aún "
+                        f"(pendientes={pendientes})"
+                    )
             except Exception as e:
                 print(f"No se pudo calcular % de éxito: {type(e).__name__}: {e!r}")
 
@@ -2169,6 +2212,7 @@ async def ejecutar_panel():
                         ciclo_martingala=int(ciclo),
                         payout=float(payout),
                         puntaje_estrategia=float(condiciones),  # tu score
+                        token=current_token,
                     )
                 except Exception:
                     epoch_pre = None
@@ -2202,18 +2246,41 @@ async def ejecutar_panel():
                                 if ack and int(ack.get("epoch", 0)) >= int(epoch_pre):
                                     p = ack.get("prob", None)
                                     p_hud = ack.get("prob_hud", None)
-                                    p_show = p_hud if isinstance(p_hud, (int, float)) else p
+                                    p_play = ack.get("prob_en_juego", None)
+                                    has_prob_hud = ack.get("has_prob_hud", None)
+                                    has_prob_play = ack.get("has_prob_en_juego", None)
+                                    if isinstance(has_prob_play, bool):
+                                        p_show = p_play if has_prob_play else None
+                                    elif isinstance(has_prob_hud, bool):
+                                        p_show = p_hud if has_prob_hud else p
+                                    else:
+                                        p_show = p_hud if isinstance(p_hud, (int, float)) else p
+
                                     auc = float(ack.get("auc", 0.0) or 0.0)
                                     modo = ack.get("modo", "OFF")
                                     thr_real = ack.get("real_thr", None)
+                                    reliable_ack = bool(ack.get("reliable", False))
+                                    modo_norm = str(modo or "OFF").strip().upper()
+                                    if modo_norm == "OFF":
+                                        p_show = None
+                                    auc_txt = f"{auc:.3f}" if (reliable_ack and 0.0 < auc < 1.0 and modo_norm != "OFF") else "N/A"
+
+                                    estado_bot["ack_ctx"] = {
+                                        "ia_prob_en_juego": p_show if isinstance(p_show, (int, float)) else "",
+                                        "ia_prob_source": str(ack.get("prob_source", "")),
+                                        "ia_decision_id": str(ack.get("decision_id", "")),
+                                        "ia_gate_real": float(thr_real) if isinstance(thr_real, (int, float)) else "",
+                                        "ia_modo_ack": str(modo),
+                                        "ia_ready_ack": bool(ack.get("ia_ready", False)),
+                                    }
 
                                     if isinstance(p_show, (int, float)):
                                         if isinstance(thr_real, (int, float)):
-                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | Gate REAL={float(thr_real)*100:.1f}% | AUC={auc:.3f} | modo={modo}")
+                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | Gate REAL={float(thr_real)*100:.1f}% | AUC={auc_txt} | modo={modo}")
                                         else:
-                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | AUC={auc:.3f} | modo={modo}")
+                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | AUC={auc_txt} | modo={modo}")
                                     else:
-                                        print(f"🤖 IA ACK ({NOMBRE_BOT}) → (sin prob) | AUC={auc:.3f} | modo={modo}")
+                                        print(f"🤖 IA ACK ({NOMBRE_BOT}) → (sin prob) | AUC={auc_txt} | modo={modo}")
 
                                     ack_visto = True
                             except Exception:
