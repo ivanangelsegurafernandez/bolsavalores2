@@ -1739,19 +1739,51 @@ def _prob_ia_para_ack(bot: str, st: dict | None = None):
     Prob IA efectiva para ACK:
     - Si el bot tiene una señal ya seleccionada (ia_prob_senal), la conservamos para
       evitar que el ACK oscile durante reintentos/token-sync.
-    - Si no, usamos la probabilidad viva del HUD.
+    - Si no hay señal bloqueada, SOLO usamos prob_ia viva cuando el bot reporta
+      ia_ready=True y modo_ia != off.
+
+    Esto evita mostrar 0.0% fantasma cuando prob_ia quedó en default durante resets.
     """
     try:
         st = st if isinstance(st, dict) else estado_bots.get(str(bot), {})
         p_lock = st.get("ia_prob_senal", None)
         if isinstance(p_lock, (int, float)) and 0.0 <= float(p_lock) <= 1.0:
             return float(p_lock)
+
+        ia_ready = bool(st.get("ia_ready", False))
+        modo = str(st.get("modo_ia", "off") or "off").strip().lower()
         p_live = st.get("prob_ia", None)
-        if isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0:
+        if ia_ready and (modo != "off") and isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0:
             return float(p_live)
     except Exception:
         pass
     return None
+
+def _resolver_prob_en_juego_ack(bot: str, st: dict | None = None):
+    """Devuelve (prob_en_juego, source) para unificar la fuente de verdad del ACK."""
+    try:
+        st = st if isinstance(st, dict) else estado_bots.get(str(bot), {})
+        p_lock = st.get("ia_prob_senal", None)
+        if isinstance(p_lock, (int, float)) and 0.0 <= float(p_lock) <= 1.0:
+            return float(p_lock), "SENAL"
+
+        ia_ready = bool(st.get("ia_ready", False))
+        modo = str(st.get("modo_ia", "off") or "off").strip().lower()
+        p_live = st.get("prob_ia", None)
+        if isinstance(p_live, (int, float)) and 0.0 <= float(p_live) <= 1.0 and (modo != "off"):
+            # MODELO: predicción lista y usable para decisión real.
+            if ia_ready:
+                return float(p_live), "MODELO"
+            # LOW_DATA/NO_READY: mostramos prob viva del maestro como referencia visual
+            # (evita ocultar 54.2% en bot cuando el HUD sí la está mostrando).
+            if float(p_live) > 0.0:
+                return float(p_live), "HUD"
+
+        if modo == "off":
+            return None, "OFF"
+        return None, "NO_READY"
+    except Exception:
+        return None, "NO_READY"
 
 def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: str, meta: dict | None):
     """
@@ -1768,13 +1800,26 @@ def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: st
 
         st = estado_bots.get(str(bot), {}) if isinstance(estado_bots, dict) else {}
 
+        p_hud = _prob_ia_para_ack(bot, st)
+        p_play, p_source = _resolver_prob_en_juego_ack(bot, st)
+        decision_id = st.get("ia_decision_id")
+        if not decision_id:
+            ep = int(epoch) if epoch is not None else 0
+            decision_id = f"{bot}|{ep}"
         payload = {
             "bot": str(bot),
             "epoch": int(epoch) if epoch is not None else 0,
             "prob": float(prob) if isinstance(prob, (int, float)) else None,
             # prob_hud/modo_hud = valor vigente que pinta el HUD del maestro (fuente visual principal)
-            "prob_hud": _prob_ia_para_ack(bot, st),
+            "prob_hud": p_hud,
+            "has_prob_hud": isinstance(p_hud, (int, float)),
+            "ia_ready": bool(st.get("ia_ready", False)),
             "modo_hud": str(st.get("modo_ia", "off") or "off").upper(),
+            "prob_en_juego": p_play,
+            "has_prob_en_juego": isinstance(p_play, (int, float)),
+            "prob_source": str(p_source),
+            "decision_id": str(decision_id),
+            "ack_ts": time.time(),
             "prob_raw": float(st.get("prob_ia_raw")) if isinstance(st.get("prob_ia_raw"), (int, float)) else None,
             "calib_factor": float(st.get("cal_factor")) if isinstance(st.get("cal_factor"), (int, float)) else None,
             "auc": float((meta or {}).get("auc", 0.0) or 0.0),
@@ -1783,6 +1828,7 @@ def escribir_ia_ack(bot: str, epoch: int | None, prob: float | None, modo_ia: st
             "real_thr_cap": float(AUTO_REAL_THR),
             "reliable": bool((meta or {}).get("reliable", True)),
             "modo": str(modo_ia).upper() if modo_ia else "OFF",
+            "model_version": str((meta or {}).get("trained_at", "")),
             "ts": time.time()
         }
 
@@ -6106,8 +6152,8 @@ def elegir_candidato_rotacion_marti(candidatos: list, ciclo_objetivo: int):
     """
     Rotación estricta para REAL en C2..C5:
     - Excluye bots ya usados en la corrida activa (bots_usados_en_esta_marti).
-    - Si no hay elegibles, anti-stall: permite reusar el bot menos reciente,
-      pero evita repetir el bot inmediatamente anterior cuando exista alternativa.
+    - Si no hay elegibles nuevos en C2..C5, devuelve None (NO repetir bot).
+      Esto prioriza cortar rachas largas por repetición del mismo bot.
     """
     try:
         ciclo = int(ciclo_objetivo)
@@ -6123,12 +6169,7 @@ def elegir_candidato_rotacion_marti(candidatos: list, ciclo_objetivo: int):
     if candidatos_nuevos:
         return candidatos_nuevos[0]
 
-    # Degradación anti-stall: evitar freeze total si todos los elegibles ya se usaron.
-    ultimo = usados[-1] if usados else None
-    no_ultimo = [c for c in candidatos if c[1] != ultimo]
-    if no_ultimo:
-        return no_ultimo[0]
-    return candidatos[0]
+    return None
 
 # === FIN BLOQUE 9 ===
 
@@ -10343,16 +10384,47 @@ async def cargar_datos_bot(bot, token_actual):
         ]
         try:
             _, _, features_live, _ = get_oracle_assets()
-            if isinstance(features_live, list) and "sma_20" in features_live:
+            if isinstance(features_live, list) and features_live:
+                for feat in features_live:
+                    if isinstance(feat, str) and feat and feat not in required_cols:
+                        required_cols.append(feat)
+            elif "sma_20" not in required_cols:
                 required_cols.append("sma_20")
         except Exception:
-            pass
+            if "sma_20" not in required_cols:
+                required_cols.append("sma_20")
 
         for _, row in nuevas.iterrows():
-            fila_dict = row.to_dict()
+            fila_dict = canonicalizar_campos_bot_maestro(row.to_dict())
+
+            try:
+                if fila_dict.get("payout") in (None, ""):
+                    payout_feat = calcular_payout_feature(fila_dict)
+                    if payout_feat is not None:
+                        fila_dict["payout"] = float(payout_feat)
+                if fila_dict.get("volatilidad") in (None, ""):
+                    fila_dict["volatilidad"] = float(calcular_volatilidad_simple(fila_dict))
+                if fila_dict.get("hora_bucket") in (None, ""):
+                    fila_dict["hora_bucket"] = float(calcular_hora_bucket(fila_dict))
+                if fila_dict.get("sma_spread") in (None, ""):
+                    sp = _calcular_sma_spread_robusto(fila_dict)
+                    if sp is not None:
+                        fila_dict["sma_spread"] = float(sp)
+            except Exception:
+                pass
 
             trade_status = str(fila_dict.get("trade_status", "")).strip().upper()
             resultado = normalizar_resultado(fila_dict.get("resultado", ""))
+
+            try:
+                ep_dec = int(float(fila_dict.get("epoch", 0) or 0))
+                cyc_dec = int(float(fila_dict.get("ciclo_martingala", fila_dict.get("ciclo", 1)) or 1))
+            except Exception:
+                ep_dec, cyc_dec = 0, 1
+            token_dec = "REAL" if effective_owner == bot else "DEMO"
+            act_dec = str(fila_dict.get("activo", ""))
+            dir_dec = str(fila_dict.get("direction", fila_dict.get("direccion", "")) or "")
+            estado_bots[bot]["ia_decision_id"] = f"{bot}|{ep_dec}|C{cyc_dec}|{act_dec}|{dir_dec}|{token_dec}"
 
             # =========================
             # 1) FILAS NO-CERRADAS (PRE_TRADE / incompletas)
@@ -11205,6 +11277,8 @@ async def main():
                             if candidatos and (PENDIENTE_FORZAR_BOT is None) and (owner in (None, "none")):
                                 ciclo_auto = ciclo_martingala_siguiente()
                                 mejor = elegir_candidato_rotacion_marti(candidatos, ciclo_auto)
+                                if mejor is None and int(ciclo_auto) > 1:
+                                    agregar_evento(f"🧯 Rotación C{ciclo_auto}: sin bot nuevo elegible. No se repite bot en esta martingala.")
                                 if mejor is not None:
                                     score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
                                     agregar_evento(f"🧠 Embudo IA: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
@@ -11251,6 +11325,8 @@ async def main():
                         if candidatos and not MODO_REAL_MANUAL:
                             ciclo_auto = ciclo_martingala_siguiente()
                             mejor = elegir_candidato_rotacion_marti(candidatos, ciclo_auto)
+                            if mejor is None and int(ciclo_auto) > 1:
+                                agregar_evento(f"🧯 IA AUTO C{ciclo_auto}: sin bot nuevo elegible. Se omite entrada para evitar repetición.")
                             if mejor is not None:
                                 score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
                                 agregar_evento(f"⚙️ IA AUTO: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")

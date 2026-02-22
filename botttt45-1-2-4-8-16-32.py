@@ -13,7 +13,6 @@ import pandas as pd
 import time  # Added for timestamps in orden_real and BLOQUE 5
 import random  # Added for jitter in BLOQUE 1.3
 import itertools  # For req_counter in api_call
-import socket
 
 # === BLINDAJE: señales limpias ===
 import signal
@@ -135,22 +134,19 @@ ARCHIVO_CSV = f"registro_enriquecido_{NOMBRE_BOT}.csv"
 ARCHIVO_TOKEN = "token_actual.txt"  # Fuente única de verdad (coincide con 5R6M)
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
-MARTINGALA_DEMO = [1, 2, 4, 8, 16]   # Alineado con 5R6M (5 ciclos)
-MARTINGALA_REAL = [1, 2, 4, 8, 16]   # Alineado con 5R6M (5 ciclos)
+MARTINGALA_DEMO = [1, 2, 4, 8, 16, 32]
+MARTINGALA_REAL = [1, 2, 4, 8, 16, 32]
 VELAS = 20
 PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
-WS_OPEN_TRIES = 4
-WS_FAILSAFE_BATCH_LIMIT = 3
-WS_FAILSAFE_COOLDOWN_S = 12
 # ==================== VENTANA DE DECISIÓN IA ====================
 # Objetivo: dar tiempo al MAESTRO + humano para decidir pasar a REAL ANTES del BUY.
 # (0 para desactivar)
 VENTANA_DECISION_IA_S = 60        # segundos
 VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
 # === Filtro avanzado (sin cambiar 13 features) ===
-SCORE_MIN = 2.85            # equilibrio: más entradas válidas sin relajar demasiado la calidad
-SCORE_DROP_MAX = 0.65       # tolerancia un poco mayor para no perder señales por micro-ruido
-REVALIDAR_VELAS_N = 7       # revalidación más rápida para evitar quedarse colgado buscando chance
+SCORE_MIN = 2.80            # score mínimo para aceptar un setup
+SCORE_DROP_MAX = 0.70       # caída máxima tolerada al revalidar pre-buy
+REVALIDAR_VELAS_N = 8       # velas mínimas para revalidación rápida
 resultado_global = {"demo": 0.0, "real": 0.0}
 ultimo_token = None
 reinicio_forzado = asyncio.Event()
@@ -164,6 +160,7 @@ estado_bot = {
     "modo_manual": False,
     "barra_activa": False,
     "score_senal": None,
+    "ciclo_actual": 1,
 }  # Added modo_manual and barra_activa
 racha_actual_bot = 0  # racha del bot: >0 = racha de GANANCIAS, <0 = racha de PÉRDIDAS
 
@@ -179,6 +176,9 @@ real_activado_en_bot = 0.0  # BLOQUE 5: Global for activation timestamp
 REAL_COMMIT_WINDOW_S = 75
 last_real_contract_id = None
 real_buy_commit_until = 0.0
+
+# Higiene de riesgo: al saltar a REAL, arrancar en C1 (aunque el maestro sugiera C2+)
+RESET_CICLO_EN_ENTRADA_REAL = True
 
 def commit_guard_active() -> bool:
     return (last_real_contract_id is not None) and (time.time() < real_buy_commit_until)
@@ -253,7 +253,7 @@ def leer_orden_real(bot: str):
 # <<< PATCH 1
 
 # >>> PATCH: WS robusto
-WS_KW = dict(ping_interval=20, ping_timeout=20, close_timeout=8, max_queue=None)
+WS_KW = dict(ping_interval=15, ping_timeout=10, close_timeout=5, max_queue=None)
 # <<< PATCH
 
 # >>> PATCH (cerca de tus globals) BLOQUE 10
@@ -333,14 +333,6 @@ def sep_ciclo():
     """Separador discreto para inicio/fin de ciclos de martingala."""
     print(Fore.BLUE + "─" * 60)
 
-def print_ciclo_header(bot: str, modo_real: bool, ciclo: int, total: int, monto: float):
-    modo_txt = "REAL" if modo_real else "DEMO"
-    line = "=" * 80
-    print(Fore.CYAN + Style.BRIGHT + line)
-    print(Fore.CYAN + Style.BRIGHT + f"{bot.upper()} | MODO {modo_txt} | CICLO #{ciclo}/{total}".center(80))
-    print(Fore.CYAN + f"Stake objetivo: {float(monto):.2f} USD | Blindaje WS: ON".center(80))
-    print(Fore.CYAN + Style.BRIGHT + line)
-
 # <<< BLOQUE C
 
 # ==================== UTILIDADES ====================
@@ -356,7 +348,13 @@ CSV_HEADER = [
     "result_bin",            # 1 o 0 solo en filas cerradas
     "trade_status",          # "PRE_TRADE" o "CERRADO"
     "epoch",
-    "ts"
+    "ts",
+    "ia_prob_en_juego",
+    "ia_prob_source",
+    "ia_decision_id",
+    "ia_gate_real",
+    "ia_modo_ack",
+    "ia_ready_ack"
 ]
 # =============================================================================
 # CSV — helpers robustos (evita columnas corridas + asegura puntaje 0..1)
@@ -406,7 +404,7 @@ def _norm_puntaje_01(condiciones, total_cond=3):
 
 def _write_row_dict_atomic(archivo_csv: str, row_dict: dict):
     """
-    Escribe SIEMPRE respetando el orden de CSV_HEADER (23 columnas).
+    Escribe SIEMPRE respetando el orden de CSV_HEADER.
     """
     row = [row_dict.get(col, "") for col in CSV_HEADER]
     write_csv_atomic(archivo_csv, row)
@@ -559,6 +557,12 @@ def write_pretrade_snapshot(
         "trade_status": "PRE_TRADE",
         "epoch": int(epoch_val),
         "ts": ts_val,
+        "ia_prob_en_juego": "",
+        "ia_prob_source": "",
+        "ia_decision_id": f"{NOMBRE_BOT}|{int(epoch_val)}|C{int(ciclo) if ciclo is not None else 1}|{symbol}|{direccion}|{str(kwargs.get('token', 'NA')).upper()}",
+        "ia_gate_real": "",
+        "ia_modo_ack": "",
+        "ia_ready_ack": "",
     }
 
     _write_row_dict_atomic(archivo_csv, row_dict)
@@ -1038,7 +1042,7 @@ def puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, c
 
 
 def setup_pasa_filtro(score: float, condiciones: int) -> bool:
-    """Gate de calidad: exige al menos 2 confirmaciones y score mínimo."""
+    """Gate de calidad: mantiene >=2/3 y exige score mínimo."""
     try:
         return (int(condiciones) >= 2) and (float(score) >= float(SCORE_MIN))
     except Exception:
@@ -1114,6 +1118,19 @@ _symbol_cooldown = {}  # symbol -> epoch hasta el que está en pausa
 # Salud WS
 _ws_fail_streak = 0  # cuántas 1006/errores seguidos en esta pasada
 ws_reset_needed = asyncio.Event()  # señal para que el loop principal reabra WS
+
+def _es_error_transitorio_ws(exc: Exception) -> bool:
+    """Errores de red/WS que deben reintentarse sin tumbar el ciclo."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, websockets.exceptions.ConnectionClosed, OSError)):
+        return True
+    msg = str(exc).lower()
+    return (
+        "connectionclosed" in msg
+        or "timeout" in msg
+        or "timed out" in msg
+        or "se agotó el tiempo" in msg
+        or "winerror 121" in msg
+    )
 
 async def obtener_velas(ws, symbol, token, reintentos=4):
     global _ws_fail_streak
@@ -1231,26 +1248,36 @@ async def check_token_and_reconnect(ws, current_token):
                     real_activado_en_bot = time.time()  # BLOQUE 5 and 2: Set activation time
                     # Lee la orden del maestro y deja seteado el ciclo para la siguiente vuelta
                     cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    if cyc:
+                    if RESET_CICLO_EN_ENTRADA_REAL:
+                        estado_bot["ciclo_forzado"] = 1
+                        if cyc and int(cyc) > 1:
+                            print(Fore.YELLOW + f"Orden maestro C{cyc} ignorada por seguridad: en entrada REAL reinicio a C1.")
+                        else:
+                            print(Fore.YELLOW + "Entrada REAL detectada: reinicio de martingala a C1 por seguridad.")
+                    elif cyc:
                         estado_bot["ciclo_forzado"] = cyc
                         print(Fore.YELLOW + f"Orden maestro detectada: arrancaré en ciclo #{cyc}.")
-                        # Silenciar ruido guiado por maestro (BLOQUE 3)
-                        if quiet or (str(src).upper() == "MANUAL"):
-                            asyncio.create_task(_silencio_temporal(90, fuente=src))
-                        else:
-                            asyncio.create_task(_desactivar_silencioso_en(90))
+
+                    # Silenciar ruido guiado por maestro (BLOQUE 3)
+                    if quiet or (str(src).upper() == "MANUAL"):
+                        asyncio.create_task(_silencio_temporal(90, fuente=src))
+                    else:
+                        asyncio.create_task(_desactivar_silencioso_en(90))
                     reinicio_forzado.set()
                 else:
                     if not (MODO_SILENCIOSO and estado_bot.get("modo_manual")) and not estado_bot.get("barra_activa", False):
                         if _print_once("rea-REAL", ttl=180):
                             print(Fore.YELLOW + "Reafirmación de REAL (sin reset de martingala)")
                     cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
-                    if cyc:
+                    if RESET_CICLO_EN_ENTRADA_REAL:
+                        estado_bot["ciclo_forzado"] = 1
+                    elif cyc:
                         estado_bot["ciclo_forzado"] = cyc
-                        if quiet or (str(src).upper() == "MANUAL"):
-                            asyncio.create_task(_silencio_temporal(90, fuente=src))
-                        else:
-                            asyncio.create_task(_desactivar_silencioso_en(90))
+
+                    if quiet or (str(src).upper() == "MANUAL"):
+                        asyncio.create_task(_silencio_temporal(90, fuente=src))
+                    else:
+                        asyncio.create_task(_desactivar_silencioso_en(90))
                 # <<< PATCH 4
             else:
                 # Saliste de REAL: prepara el sonido para la próxima ventana
@@ -1352,7 +1379,7 @@ async def consultar_saldo_real(ws):
 # ==================== LÓGICA DE OPERACIÓN ====================
 async def buscar_estrategia(ws, ciclo, token):
     print(Fore.MAGENTA + Style.BRIGHT + f"\nBuscando señal válida para Martingala #{ciclo}")
-    for intento in range(1, 9):
+    for intento in range(1, 11):
         if reinicio_forzado.is_set():
             return "REINTENTAR", None, None, None, None, None, None, None, None, None
         if MODO_SILENCIOSO and estado_bot.get("modo_manual"):
@@ -1397,9 +1424,9 @@ async def buscar_estrategia(ws, ciclo, token):
         if activos_invalidos:
             msg_sil = (MODO_SILENCIOSO and estado_bot.get("modo_manual"))
             if not msg_sil:
-                print(Fore.YELLOW + f"Ningún activo válido en intento #{intento}. Esperando 12s...")
-            elif intento in (1, 4, 8):
-                print(Fore.YELLOW + f"Sin activo válido (intento #{intento}, silencioso). Esperando 12s...")
+                print(Fore.YELLOW + f"Ningún activo válido en intento #{intento}. Esperando 15s...")
+            elif intento in (1, 5, 10):
+                print(Fore.YELLOW + f"Sin activo válido (intento #{intento}, silencioso). Esperando 15s...")
         # Nueva lógica: si todos salieron inválidos y la racha de 1006 es alta, pide reconexión
         if len(activos_invalidos) == len(ACTIVOS) and _ws_fail_streak >= len(ACTIVOS):
             if _print_once("ws-reopen-needed", ttl=15):
@@ -1407,13 +1434,13 @@ async def buscar_estrategia(ws, ciclo, token):
             ws_reset_needed.set()
             # No seguimos martillando: pequeño respiro
             await asyncio.sleep(1.0 + random.uniform(0.0, 0.5))  # Jitter
-        await asyncio.sleep(12 + random.uniform(0.0, 0.5))  # Jitter para pausas (más ágil)
-    print(Fore.RED + Style.BRIGHT + f"No se encontró activo válido tras 8 intentos para Martingala #{ciclo}. Reintentando MISMO ciclo...")
+        await asyncio.sleep(15 + random.uniform(0.0, 0.5))  # Jitter para pausas
+    print(Fore.RED + Style.BRIGHT + f"No se encontró activo válido tras 10 intentos para Martingala #{ciclo}. Reintentando MISMO ciclo...")
     try:
         play_sfx("REINTENTA", vol=0.8)
     except Exception:
         pass
-    await asyncio.sleep(20)
+    await asyncio.sleep(30)
     return "REINTENTAR", None, None, None, None, None, None, None, None, None
 
 async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, ciclo, payout, condiciones, token_usado_buy, epoch_pretrade=None):
@@ -1569,24 +1596,42 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                         "trade_status": "CERRADO",
                         "epoch": int(epoch_val),
                         "ts": ts_val,
+                        "ia_prob_en_juego": estado_bot.get("ack_ctx", {}).get("ia_prob_en_juego", ""),
+                        "ia_prob_source": estado_bot.get("ack_ctx", {}).get("ia_prob_source", ""),
+                        "ia_decision_id": estado_bot.get("ack_ctx", {}).get("ia_decision_id", f"{NOMBRE_BOT}|{int(epoch_val)}"),
+                        "ia_gate_real": estado_bot.get("ack_ctx", {}).get("ia_gate_real", ""),
+                        "ia_modo_ack": estado_bot.get("ack_ctx", {}).get("ia_modo_ack", ""),
+                        "ia_ready_ack": estado_bot.get("ack_ctx", {}).get("ia_ready_ack", ""),
                     }
                     _write_row_dict_atomic(ARCHIVO_CSV, row_dict)
 
             except Exception as csv_e:
                 print(Fore.RED + f"[ERROR] al escribir CSV: {csv_e}")
-            # Calcular y mostrar % de éxito acumulado (robusto: solo cuenta 0/1)
+            # Calcular y mostrar % de éxito acumulado (solo cierres auditables)
             try:
-                import pandas as pd
-                # on_bad_lines="skip" evita que una línea rota tumbe todo el panel
-                df = pd.read_csv(ARCHIVO_CSV, encoding="utf-8", on_bad_lines="skip")
-                if "result_bin" in df.columns:
-                    # Normaliza y filtra solo valores válidos "0" y "1"
-                    rb = df["result_bin"].astype(str).str.strip()
-                    mask = rb.isin(["0", "1"])                   
-                    total = int(mask.sum())
-                    ganancias = int((rb[mask] == "1").sum())
-                    porcentaje_exito = (ganancias / total) * 100 if total else 0.0
-                    print(f"Éxito acumulado en {ARCHIVO_CSV}: {ganancias}/{total} = {porcentaje_exito:.2f}%")
+                total_cerrados = 0
+                ganancias = 0
+                pendientes = 0
+                with open(ARCHIVO_CSV, "r", encoding="utf-8", newline="") as fh:
+                    reader = csv.DictReader(fh)
+                    for row in reader:
+                        status = str(row.get("trade_status", "")).strip().upper()
+                        rb = str(row.get("result_bin", "")).strip()
+                        if status == "CERRADO" and rb in {"0", "1"}:
+                            total_cerrados += 1
+                            if rb == "1":
+                                ganancias += 1
+                        elif status in {"PRE_TRADE", "PENDIENTE"}:
+                            pendientes += 1
+
+                if total_cerrados:
+                    porcentaje_exito = (ganancias / total_cerrados) * 100
+                    print(f"Éxito acumulado en {ARCHIVO_CSV}: {ganancias}/{total_cerrados} = {porcentaje_exito:.2f}%")
+                else:
+                    print(
+                        f"Éxito acumulado en {ARCHIVO_CSV}: sin cierres auditables aún "
+                        f"(pendientes={pendientes})"
+                    )
             except Exception as e:
                 print(f"No se pudo calcular % de éxito: {type(e).__name__}: {e!r}")
 
@@ -1614,28 +1659,12 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
             if _print_once("no-close-frame", ttl=15):
                 print(Fore.YELLOW + "WS cerrado sin close frame (resolverá en background). Mismo ciclo.")
             try:
-                asyncio.create_task(finalizar_contrato_bg(
-                    contract_id, 0, symbol, direccion, monto,
-                    rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade
-                ))
-            except Exception:
-                pass
-            try:
                 play_sfx("REINTENTA", vol=0.8)
             except Exception:
                 pass
             return "INDEFINIDO", 0.0
         except Exception as e:
             print(Fore.RED + Style.BRIGHT + f"[ERROR] Resultado INDEFINIDO: {e}. Reintentando mismo ciclo...")
-            try:
-                asyncio.create_task(finalizar_contrato_bg(
-                    contract_id, 0, symbol, direccion, monto,
-                    rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade
-                ))
-            except Exception:
-                pass
             try:
                 play_sfx("REINTENTA", vol=0.8)
             except Exception:
@@ -1924,23 +1953,23 @@ async def ejecutar_panel():
         except Exception:
             pass
 
-    async def _abrir_ws(token: str, tries: int = WS_OPEN_TRIES):
+    async def _abrir_ws(token: str, tries: int = 4):
         last = None
-        for i in range(max(1, int(tries))):
+        for intento in range(1, tries + 1):
             try:
                 _ws = await websockets.connect(DERIV_WS_URL, **WS_KW)
                 await authorize_ws(_ws, token)
                 return _ws
-            except (websockets.exceptions.WebSocketException, asyncio.TimeoutError, TimeoutError, OSError, socket.gaierror) as e:
-                last = e
-                wait_s = min(8.0, 1.0 + (i * 1.5)) + random.uniform(0.0, 0.5)
-                if _print_once(f"ws-open-retry-{type(e).__name__}", ttl=6):
-                    print(Fore.YELLOW + f"WS/NET inestable al abrir sesión ({type(e).__name__}). Reintento {i+1}/{tries} en {wait_s:.1f}s...")
-                await asyncio.sleep(wait_s)
             except Exception as e:
                 last = e
-                await asyncio.sleep(0.8 + random.uniform(0.0, 0.3))
-        raise last if last else RuntimeError("No se pudo abrir WS")
+                if _es_error_transitorio_ws(e):
+                    espera = min(6.0, 0.8 * intento + random.uniform(0.0, 0.6))
+                    if _print_once(f"ws-open-retry-{intento}", ttl=2):
+                        print(Fore.YELLOW + f"WS/NET inestable al abrir sesión ({type(e).__name__}). Reintento {intento}/{tries} en {espera:.1f}s...")
+                    await asyncio.sleep(espera)
+                    continue
+                raise
+        raise last
 
     ws = None
     try:
@@ -2001,11 +2030,11 @@ async def ejecutar_panel():
             estado_bot["reinicios_consecutivos"] = 0
             N = len(martingala)
             indefinidos_consecutivos = 0
-            ws_reconexion_lote = 0
 
             while ciclo <= N and (not stop_event.is_set()):
 
                 monto = martingala[ciclo - 1]
+                estado_bot["ciclo_actual"] = int(ciclo)
 
                 # Sync token/WS con el maestro (sin perder ciclo)
                 ws, current_token = await check_token_and_reconnect(ws, current_token)
@@ -2022,7 +2051,10 @@ async def ejecutar_panel():
                 modo_real = (current_token == TOKEN_REAL)
                 martingala = MARTINGALA_REAL if modo_real else MARTINGALA_DEMO
 
-                print_ciclo_header(NOMBRE_BOT, modo_real, ciclo, len(martingala), monto)
+                print(Fore.CYAN + Style.BRIGHT + "=" * 80)
+                titulo = f"{NOMBRE_BOT.upper()} | MODO {'REAL' if modo_real else 'DEMO'} | CICLO #{ciclo}/{len(martingala)}"
+                print(Fore.CYAN + Style.BRIGHT + titulo.center(80))
+                print(Fore.CYAN + Style.BRIGHT + "=" * 80)
 
                 # Salud WS (si buscar_estrategia detectó 1006 masivos)
                 if ws_reset_needed.is_set():
@@ -2030,16 +2062,9 @@ async def ejecutar_panel():
                     ws = await _abrir_ws(current_token)
                     _ws_fail_streak = 0
                     ws_reset_needed.clear()
-                    ws_reconexion_lote += 1
-                    if ws_reconexion_lote >= WS_FAILSAFE_BATCH_LIMIT:
-                        print(Fore.YELLOW + Style.BRIGHT + f"[BLINDAJE WS] {ws_reconexion_lote} reconexiones seguidas. Enfriando {WS_FAILSAFE_COOLDOWN_S}s para estabilizar red...")
-                        await asyncio.sleep(WS_FAILSAFE_COOLDOWN_S)
-                        ws_reconexion_lote = 0
                     if _print_once("ws-reopened", ttl=20):
                         print(Fore.CYAN + Style.BRIGHT + "WS reabierto por salud. Retomando MISMO ciclo.")
                     await asyncio.sleep(0.6 + random.uniform(0.0, 0.5))
-                else:
-                    ws_reconexion_lote = 0
 
                 # ========= BUSCAR SEÑAL =========
                 symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion = await buscar_estrategia(ws, ciclo, current_token)
@@ -2129,6 +2154,15 @@ async def ejecutar_panel():
                     estado_bot["token_msg_mostrado"] = False
                     await asyncio.sleep(8 + random.uniform(0.0, 0.5))
                     continue
+                except Exception as e:
+                    if _es_error_transitorio_ws(e):
+                        if _print_once("proposal-transient", ttl=8):
+                            print(Fore.YELLOW + Style.BRIGHT + f"[WARN] Propuesta inestable ({type(e).__name__}). Reabro WS y mantengo ciclo #{ciclo}.")
+                        await _cerrar_ws(ws)
+                        ws = await _abrir_ws(current_token)
+                        await asyncio.sleep(0.6 + random.uniform(0.0, 0.4))
+                        continue
+                    raise
 
                 # Si token cambió DURANTE proposal → NO compramos, reinicio limpio
                 if reinicio_forzado.is_set():
@@ -2178,6 +2212,7 @@ async def ejecutar_panel():
                         ciclo_martingala=int(ciclo),
                         payout=float(payout),
                         puntaje_estrategia=float(condiciones),  # tu score
+                        token=current_token,
                     )
                 except Exception:
                     epoch_pre = None
@@ -2211,18 +2246,41 @@ async def ejecutar_panel():
                                 if ack and int(ack.get("epoch", 0)) >= int(epoch_pre):
                                     p = ack.get("prob", None)
                                     p_hud = ack.get("prob_hud", None)
-                                    p_show = p_hud if isinstance(p_hud, (int, float)) else p
+                                    p_play = ack.get("prob_en_juego", None)
+                                    has_prob_hud = ack.get("has_prob_hud", None)
+                                    has_prob_play = ack.get("has_prob_en_juego", None)
+                                    if isinstance(has_prob_play, bool):
+                                        p_show = p_play if has_prob_play else None
+                                    elif isinstance(has_prob_hud, bool):
+                                        p_show = p_hud if has_prob_hud else p
+                                    else:
+                                        p_show = p_hud if isinstance(p_hud, (int, float)) else p
+
                                     auc = float(ack.get("auc", 0.0) or 0.0)
                                     modo = ack.get("modo", "OFF")
                                     thr_real = ack.get("real_thr", None)
+                                    reliable_ack = bool(ack.get("reliable", False))
+                                    modo_norm = str(modo or "OFF").strip().upper()
+                                    if modo_norm == "OFF":
+                                        p_show = None
+                                    auc_txt = f"{auc:.3f}" if (reliable_ack and 0.0 < auc < 1.0 and modo_norm != "OFF") else "N/A"
+
+                                    estado_bot["ack_ctx"] = {
+                                        "ia_prob_en_juego": p_show if isinstance(p_show, (int, float)) else "",
+                                        "ia_prob_source": str(ack.get("prob_source", "")),
+                                        "ia_decision_id": str(ack.get("decision_id", "")),
+                                        "ia_gate_real": float(thr_real) if isinstance(thr_real, (int, float)) else "",
+                                        "ia_modo_ack": str(modo),
+                                        "ia_ready_ack": bool(ack.get("ia_ready", False)),
+                                    }
 
                                     if isinstance(p_show, (int, float)):
                                         if isinstance(thr_real, (int, float)):
-                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | Gate REAL={float(thr_real)*100:.1f}% | AUC={auc:.3f} | modo={modo}")
+                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | Gate REAL={float(thr_real)*100:.1f}% | AUC={auc_txt} | modo={modo}")
                                         else:
-                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | AUC={auc:.3f} | modo={modo}")
+                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | AUC={auc_txt} | modo={modo}")
                                     else:
-                                        print(f"🤖 IA ACK ({NOMBRE_BOT}) → (sin prob) | AUC={auc:.3f} | modo={modo}")
+                                        print(f"🤖 IA ACK ({NOMBRE_BOT}) → (sin prob) | AUC={auc_txt} | modo={modo}")
 
                                     ack_visto = True
                             except Exception:
@@ -2262,6 +2320,15 @@ async def ejecutar_panel():
                     estado_bot["token_msg_mostrado"] = False
                     await asyncio.sleep(10 + random.uniform(0.0, 0.5))
                     continue
+                except Exception as e:
+                    if _es_error_transitorio_ws(e):
+                        if _print_once("buy-transient", ttl=8):
+                            print(Fore.YELLOW + Style.BRIGHT + f"[WARN] Compra inestable ({type(e).__name__}). Reabro WS y mantengo ciclo #{ciclo}.")
+                        await _cerrar_ws(ws)
+                        ws = await _abrir_ws(current_token)
+                        await asyncio.sleep(0.6 + random.uniform(0.0, 0.4))
+                        continue
+                    raise
 
                 contract_id = data_buy["buy"]["contract_id"]
 
@@ -2364,8 +2431,15 @@ async def ejecutar_panel():
                 break
 
     except Exception as e:
-        print(Fore.RED + Style.BRIGHT + f"[ERROR] Fallo general: {type(e).__name__}: {e!r}")
-        await asyncio.sleep(10 + random.uniform(0.0, 0.5))
+        if _es_error_transitorio_ws(e):
+            ciclo_ref = int(estado_bot.get("ciclo_actual", 1) or 1)
+            estado_bot["ciclo_forzado"] = max(1, ciclo_ref)
+            reinicio_forzado.set()
+            print(Fore.YELLOW + Style.BRIGHT + f"[WARN] WS/NET transitorio ({type(e).__name__}). Blindaje activo: reintento en ciclo #{estado_bot['ciclo_forzado']}.")
+            await asyncio.sleep(1.2 + random.uniform(0.0, 0.5))
+        else:
+            print(Fore.RED + Style.BRIGHT + f"[ERROR] Fallo general: {type(e).__name__}: {e!r}")
+            await asyncio.sleep(10 + random.uniform(0.0, 0.5))
     finally:
         try:
             await _cerrar_ws(ws)
