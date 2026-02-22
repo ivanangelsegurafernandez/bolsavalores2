@@ -6152,8 +6152,8 @@ def elegir_candidato_rotacion_marti(candidatos: list, ciclo_objetivo: int):
     """
     Rotación estricta para REAL en C2..C5:
     - Excluye bots ya usados en la corrida activa (bots_usados_en_esta_marti).
-    - Si no hay elegibles, anti-stall: permite reusar el bot menos reciente,
-      pero evita repetir el bot inmediatamente anterior cuando exista alternativa.
+    - Si no hay elegibles nuevos en C2..C5, devuelve None (NO repetir bot).
+      Esto prioriza cortar rachas largas por repetición del mismo bot.
     """
     try:
         ciclo = int(ciclo_objetivo)
@@ -6169,12 +6169,7 @@ def elegir_candidato_rotacion_marti(candidatos: list, ciclo_objetivo: int):
     if candidatos_nuevos:
         return candidatos_nuevos[0]
 
-    # Degradación anti-stall: evitar freeze total si todos los elegibles ya se usaron.
-    ultimo = usados[-1] if usados else None
-    no_ultimo = [c for c in candidatos if c[1] != ultimo]
-    if no_ultimo:
-        return no_ultimo[0]
-    return candidatos[0]
+    return None
 
 # === FIN BLOQUE 9 ===
 
@@ -11282,6 +11277,8 @@ async def main():
                             if candidatos and (PENDIENTE_FORZAR_BOT is None) and (owner in (None, "none")):
                                 ciclo_auto = ciclo_martingala_siguiente()
                                 mejor = elegir_candidato_rotacion_marti(candidatos, ciclo_auto)
+                                if mejor is None and int(ciclo_auto) > 1:
+                                    agregar_evento(f"🧯 Rotación C{ciclo_auto}: sin bot nuevo elegible. No se repite bot en esta martingala.")
                                 if mejor is not None:
                                     score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
                                     agregar_evento(f"🧠 Embudo IA: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
@@ -11328,6 +11325,8 @@ async def main():
                         if candidatos and not MODO_REAL_MANUAL:
                             ciclo_auto = ciclo_martingala_siguiente()
                             mejor = elegir_candidato_rotacion_marti(candidatos, ciclo_auto)
+                            if mejor is None and int(ciclo_auto) > 1:
+                                agregar_evento(f"🧯 IA AUTO C{ciclo_auto}: sin bot nuevo elegible. Se omite entrada para evitar repetición.")
                             if mejor is not None:
                                 score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
                                 agregar_evento(f"⚙️ IA AUTO: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
