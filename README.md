@@ -175,9 +175,8 @@ Una variable nueva **no entra** por intuición; entra únicamente si gana al bas
 Para reducir falsos positivos de antivirus y fallos al iniciar en diferentes equipos:
 
 - El lanzador (`evabot_gui .py`) ahora usa el mismo intérprete de Python que ejecuta la GUI (`sys.executable`), evitando rutas ambiguas de `python`.
-- Los bots se lanzan sin abrir consolas extra por defecto (menos comportamiento sospechoso para algunos antivirus).
-- Si necesitas ver una consola por bot en Windows, activa opcionalmente:
-  - `EVA_OPEN_CONSOLES=1`
+- Los bots se lanzan con el mismo intérprete de la GUI y en orden controlado, validando que cada proceso quede activo.
+- Si algún script falla al iniciar, el sistema detiene los ya abiertos para evitar que quede solo el maestro corriendo.
 - Se centralizó la lista de scripts en `SCRIPTS_TO_LAUNCH` para mantener intacto el flujo maestro + bots.
 
 Recomendación operativa en laptops nuevas:
