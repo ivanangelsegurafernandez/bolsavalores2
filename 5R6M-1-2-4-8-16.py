@@ -338,6 +338,8 @@ MIN_IA_SENIALES_CONF = 10  # Mínimo señales cerradas para confiar en prob_hist
 MIN_AUC_CONF = 0.65        # AUC mínimo para audios/colores verdes
 MAX_CLASS_IMBALANCE = 0.8  # Máx proporción pos/neg para entrenar (evita 99% wins)
 AUC_DROP_TOL = 0.05        # Tolerancia para no machacar modelo si AUC baja
+TRAIN_ROWS_DROP_GUARD_RATIO = 0.35  # no reemplazar modelo si la muestra cae demasiado vs meta anterior
+TRAIN_ROWS_DROP_GUARD_MIN_PREV = 120  # activar guard solo si el modelo previo ya tenía muestra razonable
 FEATURE_MAX_DOMINANCE = 0.90  # Si una feature repite >90%, se considera casi constante
 TRAIN_WARMUP_MIN_ROWS = 250          # evita declarar modo confiable sin muestra mínima
 INPUT_DUP_DIAG_COOLDOWN_S = 25.0     # anti-spam de diagnóstico por inputs duplicados
@@ -6150,10 +6152,10 @@ def ciclo_martingala_siguiente() -> int:
 
 def elegir_candidato_rotacion_marti(candidatos: list, ciclo_objetivo: int):
     """
-    Rotación estricta para REAL en C2..C5:
+    Rotación preferente para REAL en C2..C5:
     - Excluye bots ya usados en la corrida activa (bots_usados_en_esta_marti).
-    - Si no hay elegibles nuevos en C2..C5, devuelve None (NO repetir bot).
-      Esto prioriza cortar rachas largas por repetición del mismo bot.
+    - Si no hay elegibles nuevos en C2..C5, permite fallback al mejor candidato
+      repetido para no congelar la martingala cuando el filtro deja 1-2 bots.
     """
     try:
         ciclo = int(ciclo_objetivo)
@@ -6169,7 +6171,9 @@ def elegir_candidato_rotacion_marti(candidatos: list, ciclo_objetivo: int):
     if candidatos_nuevos:
         return candidatos_nuevos[0]
 
-    return None
+    # Fallback controlado: si ya no quedan "nuevos", no bloquear IA AUTO.
+    # Priorizamos continuidad operativa antes que quedarse sin entrada.
+    return candidatos[0]
 
 # === FIN BLOQUE 9 ===
 
@@ -8255,6 +8259,28 @@ def maybe_retrain(force: bool = False):
             except Exception:
                 pass
             return False
+
+        # 5.1) Guardia anti-colapso de dataset:
+        # evita machacar un modelo sano cuando el incremental se resetea/parcializa
+        # y momentáneamente quedan muy pocas filas útiles (p.ej. n=6).
+        if not force:
+            try:
+                meta_prev = leer_model_meta() or {}
+                prev_n = int(meta_prev.get("n_samples", meta_prev.get("rows_total", meta_prev.get("n", 0))) or 0)
+                prev_reliable = bool(meta_prev.get("reliable", False))
+                drop_floor = int(max(MIN_FIT_ROWS_PROD, round(float(prev_n) * float(TRAIN_ROWS_DROP_GUARD_RATIO))))
+                collapse_guard_on = bool((prev_n >= int(TRAIN_ROWS_DROP_GUARD_MIN_PREV)) or prev_reliable)
+
+                if collapse_guard_on and (int(n_total) < int(drop_floor)):
+                    try:
+                        agregar_evento(
+                            f"🛡️ IA: NO actualizo (muestra cayó {prev_n}->{n_total}; mínimo guard={drop_floor})."
+                        )
+                    except Exception:
+                        pass
+                    return False
+            except Exception:
+                pass
 
         # 6) Corte duro: una sola clase -> no entrenar
         try:
