@@ -11,6 +11,7 @@ import websockets
 import platform
 import threading
 import time
+import sys
 import psutil  # Para lock file PID checking
 
 # Estilos constantes - Mejorados para belleza visual
@@ -41,6 +42,36 @@ is_running = False
 last_enter_ms = 0
 ENTER_DEBOUNCE_MS = 800
 LOCK_FILE = "evabot.lock"
+SCRIPTS_TO_LAUNCH = [
+    "5R6M-1-2-4-8-16.py",
+    "botttt45-1-2-4-8-16-32.py",
+    "botttt46-1-2-4-8-16-32.py",
+    "botttt47-1-2-4-8-16-32.py",
+    "botttt48-1-2-4-8-16-32.py",
+    "botttt49-1-2-4-8-16-32.py",
+    "botttt50-1-2-4-8-16-32.py",
+]
+
+
+def get_scaled_fonts(screen_w, screen_h):
+    """Calcula fuentes y tamaños adaptativos para distintas pantallas."""
+    scale = min(screen_w / 1920, screen_h / 1080)
+    scale = max(0.65, min(scale, 1.15))
+
+    return {
+        "titulo": ("Impact", max(36, int(72 * scale)), "bold"),
+        "etiqueta": ("Arial", max(11, int(18 * scale)), "bold"),
+        "entrada": ("Arial", max(10, int(16 * scale))),
+        "firma": ("Georgia", max(9, int(16 * scale)), "italic"),
+        "hora": ("Consolas", max(9, int(14 * scale))),
+        "boton": ("Arial", max(12, int(20 * scale)), "bold"),
+        "intro": ("Arial", max(10, int(18 * scale))),
+    }
+
+
+def get_python_command():
+    """Obtiene el intérprete actual para evitar fallos entre laptops."""
+    return sys.executable or "python"
 
 def aplicar_estilo_label(texto, fuente, fg, bg=None):
     """Aplica estilos consistentes a un Label."""
@@ -203,16 +234,9 @@ async def start_eva_bot():
         
         # Lanzar los scripts
         processes = []
-        scripts = [
-            "5R6M-1-2-4-8-16.py",
-            "botttt45-1-2-4-8-16-32.py",
-            "botttt46-1-2-4-8-16-32.py",
-            "botttt47-1-2-4-8-16-32.py",
-            "botttt48-1-2-4-8-16-32.py",
-            "botttt49-1-2-4-8-16-32.py",
-            "botttt50-1-2-4-8-16-32.py"
-        ]
+        scripts = SCRIPTS_TO_LAUNCH
         validation_text = "🚀 Lanzando bots...\n"
+        python_cmd = get_python_command()
         for script in scripts:
             script_path = os.path.join(os.path.dirname(__file__), script)
             if not os.path.exists(script_path):
@@ -222,8 +246,11 @@ async def start_eva_bot():
                 liberar_lock()
                 return
             try:
-                kwargs = {"creationflags": subprocess.CREATE_NEW_CONSOLE} if platform.system() == "Windows" else {}
-                p = subprocess.Popen(['python', script_path], **kwargs)
+                kwargs = {"cwd": os.path.dirname(__file__), "close_fds": True}
+                if platform.system() == "Windows" and os.getenv("EVA_OPEN_CONSOLES", "0") == "1":
+                    kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+
+                p = subprocess.Popen([python_cmd, script_path], **kwargs)
                 processes.append(p)
                 if script == "5R6M-1-2-4-8-16.py":
                     validation_text += "🚀 Programa maestro iniciado\n"
@@ -249,7 +276,15 @@ def stop_and_close():
     """Termina los procesos del bot y cierra la ventana."""
     global processes, is_running, is_starting
     for p in processes:
-        p.terminate()
+        try:
+            if p.poll() is None:
+                p.terminate()
+                p.wait(timeout=2)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
     is_running = False
     is_starting = False
     liberar_lock()
@@ -281,6 +316,7 @@ def mostrar_presentacion():
     # Configurar ventana con tamaño adaptable
     ancho = root.winfo_screenwidth()
     alto = root.winfo_screenheight()
+    fonts = get_scaled_fonts(ancho, alto)
     root.minsize(800, 600)
     root.maxsize(ancho, alto)
     root.geometry(f"{ancho}x{alto}")
@@ -336,9 +372,9 @@ def mostrar_presentacion():
         "Está pensado para personas que buscan automatizar sus ingresos con una\n"
         "herramienta confiable, intuitiva y lista para trabajar por ti."
     )
-    font_size = 18 if alto > 700 else 15
+    font_size = fonts["intro"][1]
     ancho_texto = min(int(ancho * 0.78), 1200)
-    text_id = canvas.create_text(ancho // 2, margen_y + 30, text=intro_text, font=("Arial", font_size), fill="#FFFFFF", justify="center", width=ancho_texto, anchor="n")
+    text_id = canvas.create_text(ancho // 2, margen_y + 30, text=intro_text, font=fonts["intro"], fill="#FFFFFF", justify="center", width=ancho_texto, anchor="n")
 
     # Medir bbox del texto y dibujar rectángulo detrás con padding
     padding_x = 20
@@ -351,7 +387,7 @@ def mostrar_presentacion():
     title_offset = 217
     if alto > 800:
         title_offset += int(alto * 0.01)
-    canvas.create_text(ancho // 2, bbox[3] + title_offset, text="EVA BOT", font=FUENTE_TITULO, fill=COLOR_TITULO)
+    canvas.create_text(ancho // 2, bbox[3] + title_offset, text="EVA BOT", font=fonts["titulo"], fill=COLOR_TITULO)
 
     # Banda semitransparente detrás del bloque de tokens
     desplazamiento_px = int(root.winfo_fpixels('0.5c'))  # ~0.5 cm ≈ 40 px en 96 DPI
@@ -361,32 +397,33 @@ def mostrar_presentacion():
     canvas.create_rectangle(x_centro - 400, y_base - 20, x_centro + 400, y_base + token_block_height, fill="#000000", stipple="gray50", outline="")
     
     # Etiquetas y entradas para tokens
-    label_demo = aplicar_estilo_label("Token DEMO:", FUENTE_ETIQUETA, COLOR_ETIQUETA, COLOR_FONDO_ETIQUETA)
+    label_demo = aplicar_estilo_label("Token DEMO:", fonts["etiqueta"], COLOR_ETIQUETA, COLOR_FONDO_ETIQUETA)
     canvas.create_window(x_centro, y_base, window=label_demo)
 
-    entry_token_demo = tk.Entry(root, width=60, font=FUENTE_ENTRADA, bg=COLOR_FONDO_ENTRADA, fg=COLOR_TEXTO_ENTRADA, 
+    entry_width = max(34, min(70, int(ancho / 24)))
+    entry_token_demo = tk.Entry(root, width=entry_width, font=fonts["entrada"], bg=COLOR_FONDO_ENTRADA, fg=COLOR_TEXTO_ENTRADA,
                                 highlightbackground=COLOR_BORDE_ENTRADA, highlightthickness=3, bd=1, relief="flat")
     canvas.create_window(x_centro, y_base + 50, window=entry_token_demo)
 
-    label_real = aplicar_estilo_label("Token REAL:", FUENTE_ETIQUETA, COLOR_ETIQUETA, COLOR_FONDO_ETIQUETA)
+    label_real = aplicar_estilo_label("Token REAL:", fonts["etiqueta"], COLOR_ETIQUETA, COLOR_FONDO_ETIQUETA)
     canvas.create_window(x_centro, y_base + 100, window=label_real)
 
-    entry_token_real = tk.Entry(root, width=60, font=FUENTE_ENTRADA, bg=COLOR_FONDO_ENTRADA, fg=COLOR_TEXTO_ENTRADA, 
+    entry_token_real = tk.Entry(root, width=entry_width, font=fonts["entrada"], bg=COLOR_FONDO_ENTRADA, fg=COLOR_TEXTO_ENTRADA,
                                 highlightbackground=COLOR_BORDE_ENTRADA, highlightthickness=3, bd=1, relief="flat", show="*")
     canvas.create_window(x_centro, y_base + 150, window=entry_token_real)
 
     # Área para resultados de validación
-    validation_label = aplicar_estilo_label("", FUENTE_ENTRADA, "white", COLOR_FONDO_ETIQUETA)
+    validation_label = aplicar_estilo_label("", fonts["entrada"], "white", COLOR_FONDO_ETIQUETA)
     canvas.create_window(x_centro, y_base + 200, window=validation_label)
 
     # Botón de inicio
-    start_button = tk.Button(root, text="✅ Iniciar sistema", font=("Arial", 20, "bold"), 
+    start_button = tk.Button(root, text="✅ Iniciar sistema", font=fonts["boton"],
                              bg=COLOR_BOTON, fg="white", relief="flat", bd=0, padx=20, pady=10,
                              command=lambda: threading.Thread(target=lambda: asyncio.run(start_eva_bot()), daemon=True).start())
     canvas.create_window(x_centro, y_base + 150, window=start_button)  # Reducir espacio vertical
 
     # Botón para salir y cerrar bots
-    stop_button = tk.Button(root, text="Salir y cerrar bots", font=("Arial", 20, "bold"), 
+    stop_button = tk.Button(root, text="Salir y cerrar bots", font=fonts["boton"],
                             bg="#D32F2F", fg="white", relief="flat", bd=0, padx=20, pady=10,
                             command=stop_and_close, state="disabled")
     canvas.create_window(x_centro, y_base + 210, window=stop_button)  # Reducir espacio vertical
@@ -402,14 +439,14 @@ def mostrar_presentacion():
     # Barra inferior
     footer_y = alto - 160
     canvas.create_rectangle(0, footer_y, ancho, alto, fill=COLOR_FONDO_ETIQUETA, stipple="gray50")
-    canvas.create_text(12, footer_y + 67, text="by Ing Biomedico Ivan Angel Segura Fernandez", font=FUENTE_FIRMA, fill=COLOR_SOMBRA, anchor="sw")
-    firma_label = aplicar_estilo_label("by Ing Biomedico Ivan Angel Segura Fernandez", FUENTE_FIRMA, COLOR_FIRMA, COLOR_FONDO_ETIQUETA)
+    canvas.create_text(12, footer_y + 67, text="by Ing Biomedico Ivan Angel Segura Fernandez", font=fonts["firma"], fill=COLOR_SOMBRA, anchor="sw")
+    firma_label = aplicar_estilo_label("by Ing Biomedico Ivan Angel Segura Fernandez", fonts["firma"], COLOR_FIRMA, COLOR_FONDO_ETIQUETA)
     canvas.create_window(10, footer_y + 67, window=firma_label, anchor="sw")
 
     # Hora y fecha
-    hora_label = tk.Label(root, font=FUENTE_HORA, bg=COLOR_FONDO_ETIQUETA, fg="white", padx=10, pady=5)
+    hora_label = tk.Label(root, font=fonts["hora"], bg=COLOR_FONDO_ETIQUETA, fg="white", padx=10, pady=5)
     canvas.create_window(ancho - 10, footer_y + 30, window=hora_label, anchor="se")
-    canvas.create_text(ancho - 12, footer_y + 32, text="", font=FUENTE_HORA, fill=COLOR_SOMBRA, anchor="se", tag="hora_sombra")
+    canvas.create_text(ancho - 12, footer_y + 32, text="", font=fonts["hora"], fill=COLOR_SOMBRA, anchor="se", tag="hora_sombra")
     actualizar_hora(canvas, hora_label, ancho, alto)
 
     # Manejar cierre de ventana
