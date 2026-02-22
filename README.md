@@ -169,3 +169,18 @@ Sí, **se puede** pasar del enfoque de 13 variables al enfoque de calidad. Con l
 
 ### Regla de gobierno (simple)
 Una variable nueva **no entra** por intuición; entra únicamente si gana al baseline en walk-forward y mejora calibración real.
+
+## Compatibilidad entre laptops (antivirus + arranque)
+
+Para reducir falsos positivos de antivirus y fallos al iniciar en diferentes equipos:
+
+- El lanzador (`evabot_gui .py`) ahora usa el mismo intérprete de Python que ejecuta la GUI (`sys.executable`), evitando rutas ambiguas de `python`.
+- Los bots se lanzan sin abrir consolas extra por defecto (menos comportamiento sospechoso para algunos antivirus).
+- Si necesitas ver una consola por bot en Windows, activa opcionalmente:
+  - `EVA_OPEN_CONSOLES=1`
+- Se centralizó la lista de scripts en `SCRIPTS_TO_LAUNCH` para mantener intacto el flujo maestro + bots.
+
+Recomendación operativa en laptops nuevas:
+1. Ejecutar desde una carpeta confiable (por ejemplo `C:\EVA_BOT`).
+2. Agregar exclusión del antivirus solo a esa carpeta y a `python.exe` del entorno usado.
+3. Mantener el arranque desde `evabot_gui .py` (que inicia maestro + bots automáticamente).
