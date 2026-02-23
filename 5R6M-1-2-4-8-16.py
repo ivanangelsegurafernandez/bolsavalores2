@@ -229,6 +229,12 @@ IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15 = 0.85
 AUTO_REAL_ALLOW_UNRELIABLE_POST_N15 = True
 AUTO_REAL_UNRELIABLE_MIN_N = 80
 AUTO_REAL_UNRELIABLE_MIN_PROB = 0.63  # más permisivo en reliable=false (sube activación y riesgo de falsos positivos)
+AUTO_REAL_UNRELIABLE_MIN_AUC = 0.50   # si AUC cae bajo azar, no habilitar AUTO aunque post-n15
+AUTO_REAL_BLOCK_WHEN_WARMUP = True    # durante warmup evita promoción AUTO en modo unreliable
+
+# Guardas por bot para reducir desalineación Prob IA vs % Éxito observado en HUD.
+IA_PROMO_MIN_WR_POR_BOT = 0.45         # no promover bots con WR rolling claramente negativo
+IA_PROMO_MAX_OVERCONF_GAP = 0.18       # si p_real supera WR por >18pp con evidencia, bloquear promoción
 
 # Gate de calidad operativo (objetivo: mejorar precisión real, no volumen)
 GATE_RACHA_NEG_BLOQUEO = -2.0        # bloquear señales con racha <= -2
@@ -11545,6 +11551,20 @@ async def main():
                                     # 6) Prob REAL posterior (modelo + régimen + evidencia + bound)
                                     p_post = _prob_real_posterior(float(p), float(regime_score), int(ev_n), float(ev_wr), float(ev_lb))
 
+                                    # Guardas por bot (alineadas al HUD): evitar promoción cuando hay
+                                    # desalineación severa entre probabilidad y performance real reciente.
+                                    if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (ev_wr < float(IA_PROMO_MIN_WR_POR_BOT)):
+                                        agregar_evento(
+                                            f"🧱 Guarda WR bot: {b} bloqueado (WR={ev_wr*100:.1f}% < {IA_PROMO_MIN_WR_POR_BOT*100:.1f}%, n={ev_n})."
+                                        )
+                                        continue
+                                    overconf_gap = float(p_post) - float(ev_wr)
+                                    if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (overconf_gap > float(IA_PROMO_MAX_OVERCONF_GAP)):
+                                        agregar_evento(
+                                            f"🧯 Guarda calibración: {b} bloqueado (p_real-WR={overconf_gap*100:.1f}pp > {IA_PROMO_MAX_OVERCONF_GAP*100:.1f}pp)."
+                                        )
+                                        continue
+
                                     # Candado final: el umbral REAL se valida sobre la probabilidad posterior (no p_model)
                                     thr_post = float(umbral_ia_real)
                                     if ev_n < int(EVIDENCE_MIN_N_SOFT):
@@ -11653,6 +11673,8 @@ async def main():
                                 candidatos = []
                             elif not modelo_reliable:
                                 n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
+                                auc_live = float(meta_live.get("auc", 0.0) or 0.0)
+                                warmup_live = bool(meta_live.get("warmup_mode", n_samples_live < int(TRAIN_WARMUP_MIN_ROWS)))
                                 post_n15 = bool(_todos_bots_con_n_minimo_real())
                                 best_prob = max((float(x[2]) for x in candidatos), default=0.0)
                                 allow_unreliable = bool(
@@ -11660,14 +11682,28 @@ async def main():
                                     and post_n15
                                     and (n_samples_live >= int(AUTO_REAL_UNRELIABLE_MIN_N))
                                     and (best_prob >= float(AUTO_REAL_UNRELIABLE_MIN_PROB))
+                                    and (auc_live >= float(AUTO_REAL_UNRELIABLE_MIN_AUC))
+                                    and (not (bool(AUTO_REAL_BLOCK_WHEN_WARMUP) and warmup_live))
                                 )
                                 if allow_unreliable:
                                     agregar_evento(
                                         f"⚠️ IA AUTO modo adaptativo: reliable=false, pero se habilita por post-n15 "
-                                        f"(n={n_samples_live}, p_best={best_prob*100:.1f}%)."
+                                        f"(n={n_samples_live}, auc={auc_live:.3f}, p_best={best_prob*100:.1f}%)."
                                     )
                                 else:
-                                    agregar_evento("🛡️ IA AUTO bloqueado: modelo no confiable (reliable=false).")
+                                    why_nr = []
+                                    if n_samples_live < int(AUTO_REAL_UNRELIABLE_MIN_N):
+                                        why_nr.append(f"n<{int(AUTO_REAL_UNRELIABLE_MIN_N)}")
+                                    if best_prob < float(AUTO_REAL_UNRELIABLE_MIN_PROB):
+                                        why_nr.append(f"p_best<{AUTO_REAL_UNRELIABLE_MIN_PROB*100:.0f}%")
+                                    if auc_live < float(AUTO_REAL_UNRELIABLE_MIN_AUC):
+                                        why_nr.append(f"auc<{AUTO_REAL_UNRELIABLE_MIN_AUC:.2f}")
+                                    if bool(AUTO_REAL_BLOCK_WHEN_WARMUP) and warmup_live:
+                                        why_nr.append("warmup")
+                                    why_nr_txt = ", ".join(why_nr) if why_nr else "regla_adapt"
+                                    agregar_evento(
+                                        f"🛡️ IA AUTO bloqueado: modelo no confiable (reliable=false, {why_nr_txt})."
+                                    )
                                     candidatos = []
                             elif time.time() < float(REAL_COOLDOWN_UNTIL_TS):
                                 restantes = max(0.0, float(REAL_COOLDOWN_UNTIL_TS) - time.time())
