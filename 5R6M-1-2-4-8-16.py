@@ -9346,7 +9346,14 @@ def mostrar_panel():
             if hot:
                 hot_rows.append(f"{b}:{','.join(hot)}")
         if hot_rows:
-            print(Fore.YELLOW + " SENSOR_PLANO hot-features: " + " | ".join(hot_rows))
+            hot_msg = " SENSOR_PLANO hot-features: " + " | ".join(hot_rows)
+            try:
+                term_cols_clip = os.get_terminal_size().columns
+            except Exception:
+                term_cols_clip = 140
+            if len(hot_msg) > max(40, term_cols_clip - 2):
+                hot_msg = hot_msg[:max(40, term_cols_clip - 5)] + "..."
+            print(Fore.YELLOW + hot_msg)
     except Exception:
         pass
 
@@ -9364,7 +9371,7 @@ def mostrar_panel():
         "├────────────────────────────────────────────┤",
         "│ 🤖 ¿CÓMO INVIERTES?                        │",
         "│ [5–0] Elige bot (p.ej. 7 = fulll47)       │",
-        "│ [1–5] Elige ciclo [p.ej. 3 = Marti #3)    │",
+        "│ [1–6] Elige ciclo [p.ej. 3 = Marti #3)    │",
     ]
 
     token_file = leer_token_actual()
@@ -9591,7 +9598,7 @@ def dibujar_hud_gatewin(panel_height=8, layout=None):
         "├" + "─" * HUD_INNER_WIDTH + "┤",
         f"│ {'🤖 ¿CÓMO INVIERTES?':<{HUD_INNER_WIDTH}}│",
         f"│ {'[5–0] Elige bot (p.ej. 7 = fulll47)':<{HUD_INNER_WIDTH}}│",
-        f"│ {'[1–5] Elige ciclo (p.ej. 3 = Marti #3)':<{HUD_INNER_WIDTH}}│",
+        f"│ {[f'[1–{MAX_CICLOS}] Elige ciclo (p.ej. 3 = Marti #3)'][0]:<{HUD_INNER_WIDTH}}│",
     ]
     activo_real = next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
     if activo_real:
