@@ -228,7 +228,7 @@ IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15 = 0.85
 
 AUTO_REAL_ALLOW_UNRELIABLE_POST_N15 = True
 AUTO_REAL_UNRELIABLE_MIN_N = 80
-AUTO_REAL_UNRELIABLE_MIN_PROB = 0.78
+AUTO_REAL_UNRELIABLE_MIN_PROB = 0.63  # más permisivo en reliable=false (sube activación y riesgo de falsos positivos)
 
 # Gate de calidad operativo (objetivo: mejorar precisión real, no volumen)
 GATE_RACHA_NEG_BLOQUEO = -2.0        # bloquear señales con racha <= -2
@@ -9351,8 +9351,11 @@ def mostrar_panel():
                 term_cols_clip = os.get_terminal_size().columns
             except Exception:
                 term_cols_clip = 140
-            if len(hot_msg) > max(40, term_cols_clip - 2):
-                hot_msg = hot_msg[:max(40, term_cols_clip - 5)] + "..."
+            # Mantener esta línea lejos del HUD/panel derecho (evita solapado visual).
+            # Tope fijo corto para consolas angostas o con zoom/fuentes variables.
+            max_hot_len = 72
+            if len(hot_msg) > max_hot_len:
+                hot_msg = hot_msg[:max(0, max_hot_len - 3)] + "..."
             print(Fore.YELLOW + hot_msg)
     except Exception:
         pass
