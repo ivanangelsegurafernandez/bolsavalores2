@@ -341,6 +341,8 @@ AUC_DROP_TOL = 0.05        # Tolerancia para no machacar modelo si AUC baja
 TRAIN_REFRESH_STALE_MIN = 45 * 60   # forzar revisión de refresh si el campeón lleva mucho sin actualizar (s)
 TRAIN_REFRESH_MIN_GROWTH = 0.20     # crecimiento mínimo relativo de dataset para considerar stale override
 TRAIN_REFRESH_MIN_ABS_ROWS = 60      # crecimiento mínimo absoluto de filas para stale override
+TRAIN_REFRESH_MIN_ABS_ROWS_LOWN = 20 # override para modelos pequeños: refresco más temprano
+TRAIN_REFRESH_LOWN_CUTOFF = 180      # n por debajo de esto usa umbral absoluto reducido
 TRAIN_CANARY_FORCE_UNRELIABLE = True # canary: refresca probs pero bloquea REAL hasta validar en operación cerrada
 CANARY_MIN_CLOSED_SIGNALS = 20      # cierres mínimos para decidir salida de canary
 CANARY_MIN_HITRATE = 0.50           # hit-rate mínimo de cierres durante canary para promover
@@ -8790,9 +8792,16 @@ def maybe_retrain(force: bool = False):
         )
 
         # staleness override: evita quedarse pegado al campeón antiguo cuando crece la data
+        min_abs_growth = int(TRAIN_REFRESH_MIN_ABS_ROWS)
+        try:
+            if int(prev_n_samples) <= int(TRAIN_REFRESH_LOWN_CUTOFF):
+                min_abs_growth = int(TRAIN_REFRESH_MIN_ABS_ROWS_LOWN)
+        except Exception:
+            min_abs_growth = int(TRAIN_REFRESH_MIN_ABS_ROWS)
+
         stale_by_rows = bool(
             prev_n_samples > 0
-            and (n_total >= int(prev_n_samples + TRAIN_REFRESH_MIN_ABS_ROWS))
+            and (n_total >= int(prev_n_samples + min_abs_growth))
             and (n_total >= int(round(prev_n_samples * (1.0 + TRAIN_REFRESH_MIN_GROWTH))))
         )
         stale_by_time = False
@@ -9100,11 +9109,35 @@ def mostrar_panel():
                 and (best_prob >= float(AUTO_REAL_UNRELIABLE_MIN_PROB))
             )
             auto_state = "OK" if reliable else ("ADAPT" if auto_adapt_ok else "BLOCK")
+
+            c_prog = int(meta_live.get('canary_closed_signals', 0) or 0)
+            c_tgt = int(meta_live.get('canary_target_closed', 0) or 0)
+            c_hit = float(meta_live.get('canary_hitrate', 0.0) or 0.0) * 100.0
+            canary_prog_txt = f"{c_prog}/{c_tgt}" if canary_live else "-"
+
+            why_reasons = []
+            if warmup_live:
+                why_reasons.append("warmup")
+            if (not reliable) and (not canary_live) and (not auto_adapt_ok):
+                if not bool(AUTO_REAL_ALLOW_UNRELIABLE_POST_N15):
+                    why_reasons.append("adapt_off")
+                if not post_n15:
+                    why_reasons.append("n15_pending")
+                if n_samples_live < int(AUTO_REAL_UNRELIABLE_MIN_N):
+                    why_reasons.append(f"n<{int(AUTO_REAL_UNRELIABLE_MIN_N)}")
+                if best_prob < float(AUTO_REAL_UNRELIABLE_MIN_PROB):
+                    why_reasons.append(f"p_best<{float(AUTO_REAL_UNRELIABLE_MIN_PROB)*100:.1f}%")
+            if confirm_h < confirm_need_h:
+                why_reasons.append(f"confirm_pending({confirm_h}/{confirm_need_h})")
+            if not trigger_ok_h:
+                why_reasons.append("trigger_no")
+            why_txt = "none" if not why_reasons else ",".join(why_reasons)
+
             print(
                 padding
                 + Fore.YELLOW
                 + f"🧩 WHY-NO: CAP≈{cap_now*100:.1f}% (warmup={'sí' if warmup_live else 'no'}) | "
-                  f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} canary={'sí' if canary_live else 'no'} n={n_samples_live} p_best={best_prob*100:.1f}% | canary_prog={int(meta_live.get('canary_closed_signals',0) or 0)}/{int(meta_live.get('canary_target_closed',0) or 0)} hit={float(meta_live.get('canary_hitrate',0.0) or 0.0)*100:.1f}% | "
+                  f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} canary={'sí' if canary_live else 'no'} n={n_samples_live} p_best={best_prob*100:.1f}% why={why_txt} | canary_prog={canary_prog_txt} hit={c_hit:.1f}% | "
                   f"ROOF mode={mode_h} confirm={confirm_h}/{confirm_need_h} trigger_ok={'sí' if trigger_ok_h else 'no'} gate_consumed={'sí' if clone_gate else 'no'}"
             )
         except Exception:
