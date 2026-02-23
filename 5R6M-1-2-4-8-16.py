@@ -338,6 +338,10 @@ MIN_IA_SENIALES_CONF = 10  # Mínimo señales cerradas para confiar en prob_hist
 MIN_AUC_CONF = 0.65        # AUC mínimo para audios/colores verdes
 MAX_CLASS_IMBALANCE = 0.8  # Máx proporción pos/neg para entrenar (evita 99% wins)
 AUC_DROP_TOL = 0.05        # Tolerancia para no machacar modelo si AUC baja
+TRAIN_REFRESH_STALE_MIN = 45 * 60   # forzar revisión de refresh si el campeón lleva mucho sin actualizar (s)
+TRAIN_REFRESH_MIN_GROWTH = 0.20     # crecimiento mínimo relativo de dataset para considerar stale override
+TRAIN_REFRESH_MIN_ABS_ROWS = 60      # crecimiento mínimo absoluto de filas para stale override
+TRAIN_CANARY_FORCE_UNRELIABLE = True # canary: refresca probs pero bloquea REAL hasta validar en operación cerrada
 TRAIN_ROWS_DROP_GUARD_RATIO = 0.35  # no reemplazar modelo si la muestra cae demasiado vs meta anterior
 TRAIN_ROWS_DROP_GUARD_MIN_PREV = 120  # activar guard solo si el modelo previo ya tenía muestra razonable
 FEATURE_MAX_DOMINANCE = 0.90  # Si una feature repite >90%, se considera casi constante
@@ -8640,23 +8644,42 @@ def maybe_retrain(force: bool = False):
         except Exception:
             reliable = False
 
-        # 16) Anti “machacar” si baja AUC vs modelo anterior (salvo force)
+        # 16) Política robusta Champion vs Challenger (anti-congelamiento por AUC ruidoso)
         prev_auc = None
+        prev_brier = None
+        prev_f1 = None
+        prev_n_samples = 0
         prev_feat_count = 0
+        prev_trained_at = None
         try:
             meta_path = globals().get("_META_PATH", "model_meta.json")
             if os.path.exists(meta_path):
                 with open(meta_path, "r", encoding="utf-8") as f:
                     meta_old = json.load(f)
                 if isinstance(meta_old, dict):
-                    prev_auc = meta_old.get("auc", None)
-                    prev_auc = float(prev_auc) if isinstance(prev_auc, (int, float)) else None
+                    v_auc = meta_old.get("auc", None)
+                    prev_auc = float(v_auc) if isinstance(v_auc, (int, float)) else None
+                    v_brier = meta_old.get("brier", None)
+                    prev_brier = float(v_brier) if isinstance(v_brier, (int, float)) else None
+                    v_f1 = meta_old.get("f1", None)
+                    prev_f1 = float(v_f1) if isinstance(v_f1, (int, float)) else None
+                    prev_n_samples = int(meta_old.get("n_samples", meta_old.get("rows_total", meta_old.get("n", 0))) or 0)
                     prev_feats = meta_old.get("feature_names", meta_old.get("FEATURE_NAMES_USADAS", []))
                     if isinstance(prev_feats, list):
                         prev_feat_count = int(len(prev_feats))
+                    ts_old = str(meta_old.get("trained_at", "") or "").strip()
+                    if ts_old:
+                        try:
+                            prev_trained_at = datetime.strptime(ts_old, "%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            prev_trained_at = None
         except Exception:
             prev_auc = None
+            prev_brier = None
+            prev_f1 = None
+            prev_n_samples = 0
             prev_feat_count = 0
+            prev_trained_at = None
 
         allow_replace_collapsed = (
             (prev_feat_count > 0)
@@ -8664,19 +8687,60 @@ def maybe_retrain(force: bool = False):
             and (len(feats_used) >= int(FEATURE_MIN_ACCEPTED_COUNT))
         )
 
-        if (not force) and (prev_auc is not None) and (auc < (prev_auc - float(AUC_DROP_TOL))) and (not allow_replace_collapsed):
+        # staleness override: evita quedarse pegado al campeón antiguo cuando crece la data
+        stale_by_rows = bool(
+            prev_n_samples > 0
+            and (n_total >= int(prev_n_samples + TRAIN_REFRESH_MIN_ABS_ROWS))
+            and (n_total >= int(round(prev_n_samples * (1.0 + TRAIN_REFRESH_MIN_GROWTH))))
+        )
+        stale_by_time = False
+        try:
+            if prev_trained_at is not None:
+                stale_by_time = (datetime.now() - prev_trained_at).total_seconds() >= float(TRAIN_REFRESH_STALE_MIN)
+        except Exception:
+            stale_by_time = False
+        stale_override = bool(stale_by_rows or stale_by_time)
+
+        # Score compuesto: bajar dependencia de AUC sola en tests pequeños/ruidosos
+        auc_drop = (prev_auc is not None) and (auc < (prev_auc - float(AUC_DROP_TOL)))
+        brier_not_worse = (prev_brier is None) or (brier <= (prev_brier + 0.01))
+        f1_not_worse = (prev_f1 is None) or (f1t >= (prev_f1 - 0.03))
+        small_test = int(n_test) < int(max(40, MIN_TEST_ROWS * 2))
+
+        reject_hard = bool(
+            (not force)
+            and auc_drop
+            and (not allow_replace_collapsed)
+            and (not stale_override)
+            and (not (small_test and brier_not_worse and f1_not_worse))
+        )
+
+        canary_mode = False
+        if reject_hard:
             try:
-                agregar_evento(f"🛡️ IA: NO actualizo (AUC bajó {prev_auc:.3f}→{auc:.3f}).")
+                agregar_evento(f"🛡️ IA: NO actualizo (AUC bajó {prev_auc:.3f}→{auc:.3f}, sin evidencia de stale/canary).")
             except Exception:
                 pass
             return False
-        elif allow_replace_collapsed:
+
+        if allow_replace_collapsed:
             try:
                 agregar_evento(
                     f"🛠️ IA: reemplazo permitido (modelo colapsado {prev_feat_count}f → nuevo {len(feats_used)}f)."
                 )
             except Exception:
                 pass
+
+        if (not force) and auc_drop and (not allow_replace_collapsed):
+            canary_mode = bool(TRAIN_CANARY_FORCE_UNRELIABLE and (stale_override or (small_test and brier_not_worse and f1_not_worse)))
+            if canary_mode:
+                try:
+                    motivo = "stale" if stale_override else "test pequeño"
+                    agregar_evento(
+                        f"🟡 IA CANARY: AUC bajó ({prev_auc:.3f}→{auc:.3f}) pero se refresca en modo seguro ({motivo})."
+                    )
+                except Exception:
+                    pass
 
         # 17) Guardado atómico (compatible con tu función si existe)
         meta = {
@@ -8692,7 +8756,9 @@ def maybe_retrain(force: bool = False):
             "brier": float(brier),
             "cv_auc": float(cv_auc) if isinstance(cv_auc, (int, float)) else None,
             "threshold": float(thr),
-            "reliable": bool(reliable),
+            "reliable": bool(False if canary_mode else reliable),
+            "canary_mode": bool(canary_mode),
+            "refresh_policy": "champion_canary" if canary_mode else "champion_direct",
             "calibration": str(calib_kind),
             "calib_precision_at_thr": float(calib_prec_at_thr) if isinstance(calib_prec_at_thr, (int, float)) else None,
             "calib_n_at_thr": int(calib_n_at_thr),
@@ -8909,6 +8975,7 @@ def mostrar_panel():
         try:
             meta_live = leer_model_meta() or {}
             reliable = bool(meta_live.get("reliable", False))
+            canary_live = bool(meta_live.get("canary_mode", False))
             n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
             warmup_live = bool(meta_live.get("warmup_mode", n_samples_live < int(TRAIN_WARMUP_MIN_ROWS)))
             cap_base = float(IA_WARMUP_LOW_EVIDENCE_CAP_BASE)
@@ -8932,7 +8999,7 @@ def mostrar_panel():
                 padding
                 + Fore.YELLOW
                 + f"🧩 WHY-NO: CAP≈{cap_now*100:.1f}% (warmup={'sí' if warmup_live else 'no'}) | "
-                  f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} n={n_samples_live} p_best={best_prob*100:.1f}% | "
+                  f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} canary={'sí' if canary_live else 'no'} n={n_samples_live} p_best={best_prob*100:.1f}% | "
                   f"ROOF mode={mode_h} confirm={confirm_h}/{confirm_need_h} trigger_ok={'sí' if trigger_ok_h else 'no'} gate_consumed={'sí' if clone_gate else 'no'}"
             )
         except Exception:
@@ -11437,7 +11504,11 @@ async def main():
                         if candidatos and not MODO_REAL_MANUAL:
                             meta_live = leer_model_meta() or {}
                             modelo_reliable = bool(meta_live.get("reliable", False))
-                            if not modelo_reliable:
+                            canary_mode_live = bool(meta_live.get("canary_mode", False))
+                            if canary_mode_live:
+                                agregar_evento("🟡 IA AUTO en CANARY: refresco activo, REAL bloqueado temporalmente para validar estabilidad.")
+                                candidatos = []
+                            elif not modelo_reliable:
                                 n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
                                 post_n15 = bool(_todos_bots_con_n_minimo_real())
                                 best_prob = max((float(x[2]) for x in candidatos), default=0.0)
