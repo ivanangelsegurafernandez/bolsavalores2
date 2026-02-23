@@ -155,7 +155,7 @@ init(autoreset=True)
 
 # === BLOQUE 2 — CONFIGURACIÓN GLOBAL (MARTINGALA, HUD, AUDIO, IA) ===
 # === CONFIGURACIÓN DE MARTINGALA ===
-MARTI_ESCALADO = [1, 2, 4, 8, 16]  # Escalado ajustado a 5 pasos
+MARTI_ESCALADO = [1, 2, 4, 8, 16, 32]  # Escalado ajustado a 6 pasos
 MONTO_TOL = 0.01  # Tolerancia para redondeos
 SONAR_TAMBIEN_EN_DEMO = False  # Activar sonidos para victorias en DEMO
 SONAR_SOLO_EN_GATEWIN = True   # Solo sonar dentro de la ventana GateWIN
@@ -281,7 +281,7 @@ SOUND_PATHS = {
     "ganancia_demo": "ganabot.wav",
     "perdida_real": "perdida.wav",
     "perdida_demo": "perdida.wav",
-    "meta_15": "meta15.wav",
+    "meta_15": "meta15%.wav",
     "racha_detectada": "detectaracha.wav",
     "test": "test.wav",
     "ia_53": "ia_scifi_08_53porciento_dry.wav",
@@ -6098,7 +6098,7 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
         marti_paso = 0
         bots_usados_en_esta_marti = []
     elif res == "PÉRDIDA":
-        # Registrar el bot operado en la corrida activa para forzar rotación C2..C5.
+        # Registrar el bot operado en la corrida activa para forzar rotación C2..C{MAX_CICLOS}.
         if bot in BOT_NAMES and bot not in bots_usados_en_esta_marti:
             bots_usados_en_esta_marti.append(bot)
 
@@ -6113,13 +6113,13 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
             MAX_CICLOS,
             max(int(marti_ciclos_perdidos) + 1, max(0, ciclo_ref))
         )
-        # Si ya culminó el 5/5, reinicia a C1 para el siguiente turno.
+        # Si ya culminó C{MAX_CICLOS}, reinicia a C1 para el siguiente turno.
         if int(marti_ciclos_perdidos) >= int(MAX_CICLOS):
             marti_ciclos_perdidos = 0
             marti_paso = 0
             bots_usados_en_esta_marti = []
             try:
-                agregar_evento("🧯 Martingala 5/5 completada: reinicio automático a ciclo 1.")
+                agregar_evento(f"🧯 Martingala C{int(MAX_CICLOS)}/C{int(MAX_CICLOS)} completada: reinicio automático a ciclo 1.")
             except Exception:
                 pass
         else:
@@ -6150,11 +6150,48 @@ def ciclo_martingala_siguiente() -> int:
         return 1
 
 
+
+def reset_martingala_por_saldo(ciclo_objetivo: int, saldo_actual: float | None) -> bool:
+    """
+    Si no alcanza el saldo para el ciclo objetivo (C2..C{MAX_CICLOS}),
+    reinicia la martingala en C1.
+    """
+    global marti_ciclos_perdidos, marti_paso, bots_usados_en_esta_marti
+
+    try:
+        ciclo = int(ciclo_objetivo)
+    except Exception:
+        ciclo = 1
+
+    if ciclo <= 1:
+        return False
+
+    idx = max(0, min(len(MARTI_ESCALADO) - 1, ciclo - 1))
+    monto_necesario = float(MARTI_ESCALADO[idx])
+
+    try:
+        saldo = float(saldo_actual) if saldo_actual is not None else None
+    except Exception:
+        saldo = None
+
+    if saldo is not None and saldo >= monto_necesario:
+        return False
+
+    marti_ciclos_perdidos = 0
+    marti_paso = 0
+    bots_usados_en_esta_marti = []
+    falta_msg = "saldo no disponible"
+    if saldo is not None:
+        falta_msg = f"faltan {(monto_necesario - saldo):.2f} USD"
+    agregar_evento(
+        f"🧯 Saldo insuficiente para C{ciclo} ({monto_necesario:.2f} USD): {falta_msg}. Reinicio automático a C1."
+    )
+    return True
 def elegir_candidato_rotacion_marti(candidatos: list, ciclo_objetivo: int):
     """
-    Rotación preferente para REAL en C2..C5:
+    Rotación preferente para REAL en C2..C{MAX_CICLOS}:
     - Excluye bots ya usados en la corrida activa (bots_usados_en_esta_marti).
-    - Si no hay elegibles nuevos en C2..C5, permite fallback al mejor candidato
+    - Si no hay elegibles nuevos en C2..C{MAX_CICLOS}, permite fallback al mejor candidato
       repetido para no congelar la martingala cuando el filtro deja 1-2 bots.
     """
     try:
@@ -9309,7 +9346,14 @@ def mostrar_panel():
             if hot:
                 hot_rows.append(f"{b}:{','.join(hot)}")
         if hot_rows:
-            print(Fore.YELLOW + " SENSOR_PLANO hot-features: " + " | ".join(hot_rows))
+            hot_msg = " SENSOR_PLANO hot-features: " + " | ".join(hot_rows)
+            try:
+                term_cols_clip = os.get_terminal_size().columns
+            except Exception:
+                term_cols_clip = 140
+            if len(hot_msg) > max(40, term_cols_clip - 2):
+                hot_msg = hot_msg[:max(40, term_cols_clip - 5)] + "..."
+            print(Fore.YELLOW + hot_msg)
     except Exception:
         pass
 
@@ -9327,7 +9371,7 @@ def mostrar_panel():
         "├────────────────────────────────────────────┤",
         "│ 🤖 ¿CÓMO INVIERTES?                        │",
         "│ [5–0] Elige bot (p.ej. 7 = fulll47)       │",
-        "│ [1–5] Elige ciclo [p.ej. 3 = Marti #3)    │",
+        "│ [1–6] Elige ciclo [p.ej. 3 = Marti #3)    │",
     ]
 
     token_file = leer_token_actual()
@@ -9369,50 +9413,129 @@ def mostrar_panel():
 
 # Mostrar advertencia meta
 def mostrar_advertencia_meta():
-    global salir, pausado, MODAL_ACTIVO, META_ACEPTADA, meta_mostrada
+    global salir, pausado, MODAL_ACTIVO, META_ACEPTADA, meta_mostrada, SALDO_INICIAL, META
+
     pausado = True
     MODAL_ACTIVO = True
-    limpiar_consola()
+
     try:
         terminal_width = max(os.get_terminal_size().columns, 100)
-    except:
-        terminal_width = 100
-    ancho = terminal_width
-    print("\n" * 3)
-    print(Fore.YELLOW + "█" * ancho)
-    print("🎉 ¡¡¡FELICIDADES!!! 🎉".center(ancho))
-    print("✅ Has alcanzado tu meta diaria del +15% de ganancia.".center(ancho))
-    print("")
-    print("💡 Recomendación:".center(ancho))
-    print("EvaBot está diseñada para buscar una ganancia diaria aproximada del 15% de tu capital.".center(ancho))
-    print("Puedes seguir invirtiendo hoy bajo su responsabilidad o esperar hasta mañana para intentar nuevamente ese 15%".center(ancho))
-    print("en condiciones potencialmente más favorables.".center(ancho))
-    print("")
-    print("⚠️ Importante:".center(ancho))
-    print("EvaBot está diseñada para el análisis de miles de operaciones reales y tiene alta tasa de acierto,".center(ancho))
-    print("pero ningún sistema es infalible y siempre existe riesgo de pérdida.".center(ancho))
-    print("Lee el Manual de Usuario para horarios recomendados y detalles clave del programa.".center(ancho))
-    print("")
-    print("Presiona [S] para SALIR y asegurar beneficios, o [C] para continuar invirtiendo.".center(ancho))
-    print("█" * ancho)
-    print("\n" * 3)
+        terminal_height = max(os.get_terminal_size().lines, 32)
+    except Exception:
+        terminal_width, terminal_height = 100, 32
 
+    # Área del modal para refresco incremental (sin limpiar toda la consola en cada tick)
+    box_w = min(max(terminal_width - 6, 80), 140)
+    box_h = min(max(terminal_height - 6, 22), 30)
+    left = max(1, (terminal_width - box_w) // 2)
+    top = max(2, (terminal_height - box_h) // 2)
+
+    # Sonido meta en loop hasta [S] o [C]
     if AUDIO_AVAILABLE:
         if pygame.mixer.get_init() and "meta_15" in SOUND_CACHE:
             try:
-                sound = SOUND_CACHE["meta_15"]
-                sound.play(loops=-1)
+                SOUND_CACHE["meta_15"].play(loops=-1)
             except Exception:
                 pass
         elif winsound:
             try:
                 base_dir = os.path.dirname(__file__)
-                sound_path = os.path.join(base_dir, "meta15.wav")
+                sound_path = os.path.join(base_dir, "meta15%.wav")
                 winsound.PlaySound(sound_path, winsound.SND_LOOP | winsound.SND_ASYNC)
             except Exception:
                 pass
 
+    # Confetti + shake suave
+    palette = [Fore.YELLOW, Fore.CYAN, Fore.MAGENTA, Fore.GREEN, Fore.RED, Fore.WHITE]
+    glyphs = ['|', '!', ':', '*', '+']
+    particles = []
+    max_particles = max(30, box_w // 2)
+
+    def _stop_meta_sound():
+        if AUDIO_AVAILABLE:
+            if pygame.mixer.get_init() and "meta_15" in SOUND_CACHE:
+                try:
+                    SOUND_CACHE["meta_15"].stop()
+                except Exception:
+                    pass
+            elif winsound:
+                try:
+                    winsound.PlaySound(None, winsound.SND_PURGE)
+                except Exception:
+                    pass
+
+    def _center_in_box(msg: str) -> str:
+        pad = max(0, box_w - 2 - len(msg))
+        left_pad = pad // 2
+        right_pad = pad - left_pad
+        return " " * left_pad + msg + " " * right_pad
+
+    def _draw_frame(tick: int):
+        # borde
+        print(f"[{top};{left}H" + Fore.YELLOW + "█" * box_w + Fore.RESET, end='')
+        for r in range(1, box_h - 1):
+            print(f"[{top+r};{left}H" + Fore.YELLOW + "█" + Fore.RESET, end='')
+            print(f"[{top+r};{left+box_w-1}H" + Fore.YELLOW + "█" + Fore.RESET, end='')
+        print(f"[{top+box_h-1};{left}H" + Fore.YELLOW + "█" * box_w + Fore.RESET, end='')
+
+        # limpiar interior
+        blank = " " * (box_w - 2)
+        for r in range(1, box_h - 1):
+            print(f"[{top+r};{left+1}H{blank}", end='')
+
+        shake = -1 if (tick % 4 in (0, 1)) else 1
+        title = "🎉 ¡¡¡FELICIDADES!!! 🎉"
+        y = top + 2
+        x = left + 1 + max(0, (box_w - 2 - len(title)) // 2 + shake)
+        print(f"[{y};{x}H" + Fore.CYAN + title + Fore.RESET, end='')
+
+        lines = [
+            "✅ Has alcanzado tu meta diaria del +20% de ganancia.",
+            "",
+            "💡 Recomendación:",
+            "EvaBot busca una ganancia diaria aproximada del 20% de tu capital.",
+            "Puedes seguir invirtiendo bajo tu responsabilidad o esperar al siguiente día.",
+            "",
+            "⚠️ Importante:",
+            "Ningún sistema es infalible y siempre existe riesgo de pérdida.",
+            "Lee el Manual de Usuario para horarios recomendados y detalles clave.",
+            "",
+            "Presiona [S] para SALIR y asegurar beneficios, o [C] para continuar invirtiendo.",
+        ]
+        row = top + 4
+        for msg in lines:
+            if row >= top + box_h - 2:
+                break
+            print(f"[{row};{left+1}H" + _center_in_box(msg), end='')
+            row += 1
+
+        # confetti cayendo
+        if len(particles) < max_particles and random.random() < 0.55:
+            particles.append({
+                "x": left + 2 + random.randint(0, max(1, box_w - 6)),
+                "y": top + 1,
+                "v": random.choice((1, 1, 2)),
+                "ch": random.choice(glyphs),
+                "color": random.choice(palette),
+            })
+
+        alive = []
+        for part in particles:
+            part["y"] += part["v"]
+            if part["y"] < top + box_h - 1:
+                alive.append(part)
+                if left + 1 <= part["x"] <= left + box_w - 2 and top + 1 <= part["y"] <= top + box_h - 2:
+                    print(f"[{int(part['y'])};{int(part['x'])}H" + part["color"] + part["ch"] + Fore.RESET, end='')
+        particles[:] = alive
+
+        print(f"[{terminal_height};1H", end='', flush=True)
+
+    limpiar_consola()
+    tick = 0
     while True:
+        tick += 1
+        _draw_frame(tick)
+
         if HAVE_MSVCRT and msvcrt.kbhit():
             try:
                 t = msvcrt.getch()
@@ -9420,37 +9543,19 @@ def mostrar_advertencia_meta():
                     msvcrt.getch()
                     continue
                 tecla = t.decode("utf-8", errors="ignore").lower()
-            except:
-                continue
-            if tecla in ("s"):
-                print("🛑 Cerrando EvaBot...")
-                if AUDIO_AVAILABLE:
-                    if pygame.mixer.get_init() and "meta_15" in SOUND_CACHE:
-                        try:
-                            SOUND_CACHE["meta_15"].stop()
-                        except:
-                            pass
-                    elif winsound:
-                        try:
-                            winsound.PlaySound(None, winsound.SND_PURGE)
-                        except:
-                            pass
+            except Exception:
+                tecla = ""
+
+            if tecla in ("s",):
+                print("\n🛑 Cerrando EvaBot...")
+                _stop_meta_sound()
                 salir = True
                 MODAL_ACTIVO = False
                 break
-            elif tecla in ("c", "\r"):
-                print("✔️ Continuando bajo responsabilidad del usuario...")
-                if AUDIO_AVAILABLE:
-                    if pygame.mixer.get_init() and "meta_15" in SOUND_CACHE:
-                        try:
-                            SOUND_CACHE["meta_15"].stop()
-                        except:
-                            pass
-                    elif winsound:
-                        try:
-                            winsound.PlaySound(None, winsound.SND_PURGE)
-                        except:
-                            pass
+
+            if tecla in ("c", "\r"):
+                print("\n✔️ Continuando bajo responsabilidad del usuario...")
+                _stop_meta_sound()
                 try:
                     if MAIN_LOOP:
                         fut = asyncio.run_coroutine_threadsafe(refresh_saldo_real(forzado=True), MAIN_LOOP)
@@ -9458,7 +9563,7 @@ def mostrar_advertencia_meta():
                     valor = obtener_valor_saldo()
                     if valor is not None:
                         SALDO_INICIAL = round(valor, 2)
-                        META = round(SALDO_INICIAL * 1.15, 2)
+                        META = round(SALDO_INICIAL * 1.20, 2)
                         inicializar_saldo_real(SALDO_INICIAL)
                 except Exception as e:
                     print(f"⚠️ Error reiniciando meta: {e}")
@@ -9467,6 +9572,8 @@ def mostrar_advertencia_meta():
                 meta_mostrada = False
                 MODAL_ACTIVO = False
                 break
+
+        time.sleep(0.08)
 
 # Dibujar HUD
 def dibujar_hud_gatewin(panel_height=8, layout=None):
@@ -9491,7 +9598,7 @@ def dibujar_hud_gatewin(panel_height=8, layout=None):
         "├" + "─" * HUD_INNER_WIDTH + "┤",
         f"│ {'🤖 ¿CÓMO INVIERTES?':<{HUD_INNER_WIDTH}}│",
         f"│ {'[5–0] Elige bot (p.ej. 7 = fulll47)':<{HUD_INNER_WIDTH}}│",
-        f"│ {'[1–5] Elige ciclo (p.ej. 3 = Marti #3)':<{HUD_INNER_WIDTH}}│",
+        f"│ {[f'[1–{MAX_CICLOS}] Elige ciclo (p.ej. 3 = Marti #3)'][0]:<{HUD_INNER_WIDTH}}│",
     ]
     activo_real = next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
     if activo_real:
@@ -10641,7 +10748,7 @@ def obtener_valor_saldo():
 def inicializar_saldo_real(valor):
     global SALDO_INICIAL, META
     SALDO_INICIAL = round(valor, 2)
-    META = round(SALDO_INICIAL * 1.15, 2)
+    META = round(SALDO_INICIAL * 1.20, 2)
 
 # Escuchar teclas
 def escuchar_teclas():
@@ -11302,6 +11409,8 @@ async def main():
                             owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
                             if candidatos and (PENDIENTE_FORZAR_BOT is None) and (owner in (None, "none")):
                                 ciclo_auto = ciclo_martingala_siguiente()
+                                if reset_martingala_por_saldo(ciclo_auto, saldo_val):
+                                    ciclo_auto = 1
                                 mejor = elegir_candidato_rotacion_marti(candidatos, ciclo_auto)
                                 if mejor is None and int(ciclo_auto) > 1:
                                     agregar_evento(f"🧯 Rotación C{ciclo_auto}: sin bot nuevo elegible. No se repite bot en esta martingala.")
@@ -11350,6 +11459,8 @@ async def main():
 
                         if candidatos and not MODO_REAL_MANUAL:
                             ciclo_auto = ciclo_martingala_siguiente()
+                            if reset_martingala_por_saldo(ciclo_auto, saldo_val):
+                                ciclo_auto = 1
                             mejor = elegir_candidato_rotacion_marti(candidatos, ciclo_auto)
                             if mejor is None and int(ciclo_auto) > 1:
                                 agregar_evento(f"🧯 IA AUTO C{ciclo_auto}: sin bot nuevo elegible. Se omite entrada para evitar repetición.")
