@@ -155,7 +155,7 @@ init(autoreset=True)
 
 # === BLOQUE 2 — CONFIGURACIÓN GLOBAL (MARTINGALA, HUD, AUDIO, IA) ===
 # === CONFIGURACIÓN DE MARTINGALA ===
-MARTI_ESCALADO = [1, 2, 4, 8, 16]  # Escalado ajustado a 5 pasos
+MARTI_ESCALADO = [1, 2, 4, 8, 16, 32]  # Escalado ajustado a 6 pasos
 MONTO_TOL = 0.01  # Tolerancia para redondeos
 SONAR_TAMBIEN_EN_DEMO = False  # Activar sonidos para victorias en DEMO
 SONAR_SOLO_EN_GATEWIN = True   # Solo sonar dentro de la ventana GateWIN
@@ -228,7 +228,7 @@ IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15 = 0.85
 
 AUTO_REAL_ALLOW_UNRELIABLE_POST_N15 = True
 AUTO_REAL_UNRELIABLE_MIN_N = 80
-AUTO_REAL_UNRELIABLE_MIN_PROB = 0.78
+AUTO_REAL_UNRELIABLE_MIN_PROB = 0.63  # más permisivo en reliable=false (sube activación y riesgo de falsos positivos)
 
 # Gate de calidad operativo (objetivo: mejorar precisión real, no volumen)
 GATE_RACHA_NEG_BLOQUEO = -2.0        # bloquear señales con racha <= -2
@@ -281,7 +281,7 @@ SOUND_PATHS = {
     "ganancia_demo": "ganabot.wav",
     "perdida_real": "perdida.wav",
     "perdida_demo": "perdida.wav",
-    "meta_15": "meta15.wav",
+    "meta_15": "meta15%.wav",
     "racha_detectada": "detectaracha.wav",
     "test": "test.wav",
     "ia_53": "ia_scifi_08_53porciento_dry.wav",
@@ -338,6 +338,16 @@ MIN_IA_SENIALES_CONF = 10  # Mínimo señales cerradas para confiar en prob_hist
 MIN_AUC_CONF = 0.65        # AUC mínimo para audios/colores verdes
 MAX_CLASS_IMBALANCE = 0.8  # Máx proporción pos/neg para entrenar (evita 99% wins)
 AUC_DROP_TOL = 0.05        # Tolerancia para no machacar modelo si AUC baja
+TRAIN_REFRESH_STALE_MIN = 45 * 60   # forzar revisión de refresh si el campeón lleva mucho sin actualizar (s)
+TRAIN_REFRESH_MIN_GROWTH = 0.20     # crecimiento mínimo relativo de dataset para considerar stale override
+TRAIN_REFRESH_MIN_ABS_ROWS = 60      # crecimiento mínimo absoluto de filas para stale override
+TRAIN_REFRESH_MIN_ABS_ROWS_LOWN = 20 # override para modelos pequeños: refresco más temprano
+TRAIN_REFRESH_LOWN_CUTOFF = 180      # n por debajo de esto usa umbral absoluto reducido
+TRAIN_CANARY_FORCE_UNRELIABLE = True # canary: refresca probs pero bloquea REAL hasta validar en operación cerrada
+CANARY_MIN_CLOSED_SIGNALS = 20      # cierres mínimos para decidir salida de canary
+CANARY_MIN_HITRATE = 0.50           # hit-rate mínimo de cierres durante canary para promover
+CANARY_RETRY_BATCH = 10             # si canary falla, ampliar ventana en este tamaño
+CANARY_EVAL_COOLDOWN_S = 10.0       # evaluar progreso canary como máximo cada N segundos
 TRAIN_ROWS_DROP_GUARD_RATIO = 0.35  # no reemplazar modelo si la muestra cae demasiado vs meta anterior
 TRAIN_ROWS_DROP_GUARD_MIN_PREV = 120  # activar guard solo si el modelo previo ya tenía muestra razonable
 FEATURE_MAX_DOMINANCE = 0.90  # Si una feature repite >90%, se considera casi constante
@@ -3258,6 +3268,7 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
 # ==========================================================
 
 IA_SIGNALS_LOG = "ia_signals_log.csv"
+CANARY_STATE_CACHE = {"ts": 0.0, "meta": None}
 
 # Blindaje: evita crash si threading aún no estaba importado (aunque tú sí lo tienes)
 try:
@@ -3884,6 +3895,103 @@ def _ensure_ia_signals_log():
             os.fsync(f.fileno())
     except Exception:
         pass
+
+def _leer_stats_canary_desde_log(ts_inicio: str | None) -> tuple[int, int]:
+    """
+    Devuelve (cerradas, ganadas) desde ia_signals_log.csv,
+    opcionalmente filtrando por ts >= ts_inicio.
+    """
+    _ensure_ia_signals_log()
+    dt_inicio = None
+    try:
+        if isinstance(ts_inicio, str) and ts_inicio.strip():
+            dt_inicio = datetime.strptime(ts_inicio.strip(), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        dt_inicio = None
+
+    cerradas = 0
+    ganadas = 0
+    try:
+        with open(IA_SIGNALS_LOG, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                yv = str(r.get("y", "")).strip()
+                if yv not in ("0", "1"):
+                    continue
+                if dt_inicio is not None:
+                    ts = str(r.get("ts", "")).strip()
+                    try:
+                        dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        continue
+                    if dt < dt_inicio:
+                        continue
+                cerradas += 1
+                if yv == "1":
+                    ganadas += 1
+    except Exception:
+        pass
+    return int(cerradas), int(ganadas)
+
+
+def resolver_canary_estado(meta: dict | None) -> dict:
+    """
+    Evalúa y resuelve canary automáticamente cuando hay suficiente evidencia cerrada.
+    - Si canary cumple target + hit-rate, promueve a champion_direct.
+    - Si no cumple hit-rate, mantiene canary y amplía target (retry batch).
+    """
+    if not isinstance(meta, dict) or not bool(meta.get("canary_mode", False)):
+        return meta if isinstance(meta, dict) else {}
+
+    now = float(time.time())
+    last_ts = float(CANARY_STATE_CACHE.get("ts", 0.0) or 0.0)
+    cached_meta = CANARY_STATE_CACHE.get("meta")
+    if (now - last_ts) < float(CANARY_EVAL_COOLDOWN_S) and isinstance(cached_meta, dict):
+        return cached_meta
+
+    out = dict(meta)
+    ts_inicio = str(out.get("canary_started_at", "") or "").strip()
+    target = int(out.get("canary_target_closed", CANARY_MIN_CLOSED_SIGNALS) or CANARY_MIN_CLOSED_SIGNALS)
+    target = max(1, target)
+
+    cerradas, ganadas = _leer_stats_canary_desde_log(ts_inicio)
+    hit = (float(ganadas) / float(cerradas)) if cerradas > 0 else 0.0
+    out["canary_closed_signals"] = int(cerradas)
+    out["canary_hitrate"] = float(hit)
+
+    changed = False
+    if cerradas >= target:
+        if hit >= float(CANARY_MIN_HITRATE):
+            out["canary_mode"] = False
+            out["refresh_policy"] = "champion_direct"
+            out["reliable"] = bool(out.get("reliable_candidate", out.get("reliable", False)))
+            out["canary_resolved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            changed = True
+            try:
+                agregar_evento(f"✅ IA CANARY resuelto: {ganadas}/{cerradas} ({hit*100:.1f}%). Se habilita champion_direct.")
+            except Exception:
+                pass
+        else:
+            out["canary_target_closed"] = int(cerradas + max(1, int(CANARY_RETRY_BATCH)))
+            changed = True
+            try:
+                agregar_evento(
+                    f"🟡 IA CANARY extendido: hit-rate {hit*100:.1f}% ({ganadas}/{cerradas}) < {CANARY_MIN_HITRATE*100:.1f}%."
+                )
+            except Exception:
+                pass
+
+    if changed:
+        try:
+            if "guardar_model_meta" in globals() and callable(guardar_model_meta):
+                guardar_model_meta(out)
+        except Exception:
+            pass
+
+    CANARY_STATE_CACHE["ts"] = float(now)
+    CANARY_STATE_CACHE["meta"] = dict(out)
+    return out
+
 
 def _atomic_write_text(path: str, text: str) -> bool:
     tmp = path + ".tmp"
@@ -6098,7 +6206,7 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
         marti_paso = 0
         bots_usados_en_esta_marti = []
     elif res == "PÉRDIDA":
-        # Registrar el bot operado en la corrida activa para forzar rotación C2..C5.
+        # Registrar el bot operado en la corrida activa para forzar rotación C2..C{MAX_CICLOS}.
         if bot in BOT_NAMES and bot not in bots_usados_en_esta_marti:
             bots_usados_en_esta_marti.append(bot)
 
@@ -6113,13 +6221,13 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
             MAX_CICLOS,
             max(int(marti_ciclos_perdidos) + 1, max(0, ciclo_ref))
         )
-        # Si ya culminó el 5/5, reinicia a C1 para el siguiente turno.
+        # Si ya culminó C{MAX_CICLOS}, reinicia a C1 para el siguiente turno.
         if int(marti_ciclos_perdidos) >= int(MAX_CICLOS):
             marti_ciclos_perdidos = 0
             marti_paso = 0
             bots_usados_en_esta_marti = []
             try:
-                agregar_evento("🧯 Martingala 5/5 completada: reinicio automático a ciclo 1.")
+                agregar_evento(f"🧯 Martingala C{int(MAX_CICLOS)}/C{int(MAX_CICLOS)} completada: reinicio automático a ciclo 1.")
             except Exception:
                 pass
         else:
@@ -6150,11 +6258,48 @@ def ciclo_martingala_siguiente() -> int:
         return 1
 
 
+
+def reset_martingala_por_saldo(ciclo_objetivo: int, saldo_actual: float | None) -> bool:
+    """
+    Si no alcanza el saldo para el ciclo objetivo (C2..C{MAX_CICLOS}),
+    reinicia la martingala en C1.
+    """
+    global marti_ciclos_perdidos, marti_paso, bots_usados_en_esta_marti
+
+    try:
+        ciclo = int(ciclo_objetivo)
+    except Exception:
+        ciclo = 1
+
+    if ciclo <= 1:
+        return False
+
+    idx = max(0, min(len(MARTI_ESCALADO) - 1, ciclo - 1))
+    monto_necesario = float(MARTI_ESCALADO[idx])
+
+    try:
+        saldo = float(saldo_actual) if saldo_actual is not None else None
+    except Exception:
+        saldo = None
+
+    if saldo is not None and saldo >= monto_necesario:
+        return False
+
+    marti_ciclos_perdidos = 0
+    marti_paso = 0
+    bots_usados_en_esta_marti = []
+    falta_msg = "saldo no disponible"
+    if saldo is not None:
+        falta_msg = f"faltan {(monto_necesario - saldo):.2f} USD"
+    agregar_evento(
+        f"🧯 Saldo insuficiente para C{ciclo} ({monto_necesario:.2f} USD): {falta_msg}. Reinicio automático a C1."
+    )
+    return True
 def elegir_candidato_rotacion_marti(candidatos: list, ciclo_objetivo: int):
     """
-    Rotación preferente para REAL en C2..C5:
+    Rotación preferente para REAL en C2..C{MAX_CICLOS}:
     - Excluye bots ya usados en la corrida activa (bots_usados_en_esta_marti).
-    - Si no hay elegibles nuevos en C2..C5, permite fallback al mejor candidato
+    - Si no hay elegibles nuevos en C2..C{MAX_CICLOS}, permite fallback al mejor candidato
       repetido para no congelar la martingala cuando el filtro deja 1-2 bots.
     """
     try:
@@ -8603,23 +8748,42 @@ def maybe_retrain(force: bool = False):
         except Exception:
             reliable = False
 
-        # 16) Anti “machacar” si baja AUC vs modelo anterior (salvo force)
+        # 16) Política robusta Champion vs Challenger (anti-congelamiento por AUC ruidoso)
         prev_auc = None
+        prev_brier = None
+        prev_f1 = None
+        prev_n_samples = 0
         prev_feat_count = 0
+        prev_trained_at = None
         try:
             meta_path = globals().get("_META_PATH", "model_meta.json")
             if os.path.exists(meta_path):
                 with open(meta_path, "r", encoding="utf-8") as f:
                     meta_old = json.load(f)
                 if isinstance(meta_old, dict):
-                    prev_auc = meta_old.get("auc", None)
-                    prev_auc = float(prev_auc) if isinstance(prev_auc, (int, float)) else None
+                    v_auc = meta_old.get("auc", None)
+                    prev_auc = float(v_auc) if isinstance(v_auc, (int, float)) else None
+                    v_brier = meta_old.get("brier", None)
+                    prev_brier = float(v_brier) if isinstance(v_brier, (int, float)) else None
+                    v_f1 = meta_old.get("f1", None)
+                    prev_f1 = float(v_f1) if isinstance(v_f1, (int, float)) else None
+                    prev_n_samples = int(meta_old.get("n_samples", meta_old.get("rows_total", meta_old.get("n", 0))) or 0)
                     prev_feats = meta_old.get("feature_names", meta_old.get("FEATURE_NAMES_USADAS", []))
                     if isinstance(prev_feats, list):
                         prev_feat_count = int(len(prev_feats))
+                    ts_old = str(meta_old.get("trained_at", "") or "").strip()
+                    if ts_old:
+                        try:
+                            prev_trained_at = datetime.strptime(ts_old, "%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            prev_trained_at = None
         except Exception:
             prev_auc = None
+            prev_brier = None
+            prev_f1 = None
+            prev_n_samples = 0
             prev_feat_count = 0
+            prev_trained_at = None
 
         allow_replace_collapsed = (
             (prev_feat_count > 0)
@@ -8627,19 +8791,67 @@ def maybe_retrain(force: bool = False):
             and (len(feats_used) >= int(FEATURE_MIN_ACCEPTED_COUNT))
         )
 
-        if (not force) and (prev_auc is not None) and (auc < (prev_auc - float(AUC_DROP_TOL))) and (not allow_replace_collapsed):
+        # staleness override: evita quedarse pegado al campeón antiguo cuando crece la data
+        min_abs_growth = int(TRAIN_REFRESH_MIN_ABS_ROWS)
+        try:
+            if int(prev_n_samples) <= int(TRAIN_REFRESH_LOWN_CUTOFF):
+                min_abs_growth = int(TRAIN_REFRESH_MIN_ABS_ROWS_LOWN)
+        except Exception:
+            min_abs_growth = int(TRAIN_REFRESH_MIN_ABS_ROWS)
+
+        stale_by_rows = bool(
+            prev_n_samples > 0
+            and (n_total >= int(prev_n_samples + min_abs_growth))
+            and (n_total >= int(round(prev_n_samples * (1.0 + TRAIN_REFRESH_MIN_GROWTH))))
+        )
+        stale_by_time = False
+        try:
+            if prev_trained_at is not None:
+                stale_by_time = (datetime.now() - prev_trained_at).total_seconds() >= float(TRAIN_REFRESH_STALE_MIN)
+        except Exception:
+            stale_by_time = False
+        stale_override = bool(stale_by_rows or stale_by_time)
+
+        # Score compuesto: bajar dependencia de AUC sola en tests pequeños/ruidosos
+        auc_drop = (prev_auc is not None) and (auc < (prev_auc - float(AUC_DROP_TOL)))
+        brier_not_worse = (prev_brier is None) or (brier <= (prev_brier + 0.01))
+        f1_not_worse = (prev_f1 is None) or (f1t >= (prev_f1 - 0.03))
+        small_test = int(n_test) < int(max(40, MIN_TEST_ROWS * 2))
+
+        reject_hard = bool(
+            (not force)
+            and auc_drop
+            and (not allow_replace_collapsed)
+            and (not stale_override)
+            and (not (small_test and brier_not_worse and f1_not_worse))
+        )
+
+        canary_mode = False
+        if reject_hard:
             try:
-                agregar_evento(f"🛡️ IA: NO actualizo (AUC bajó {prev_auc:.3f}→{auc:.3f}).")
+                agregar_evento(f"🛡️ IA: NO actualizo (AUC bajó {prev_auc:.3f}→{auc:.3f}, sin evidencia de stale/canary).")
             except Exception:
                 pass
             return False
-        elif allow_replace_collapsed:
+
+        if allow_replace_collapsed:
             try:
                 agregar_evento(
                     f"🛠️ IA: reemplazo permitido (modelo colapsado {prev_feat_count}f → nuevo {len(feats_used)}f)."
                 )
             except Exception:
                 pass
+
+        if (not force) and auc_drop and (not allow_replace_collapsed):
+            canary_mode = bool(TRAIN_CANARY_FORCE_UNRELIABLE and (stale_override or (small_test and brier_not_worse and f1_not_worse)))
+            if canary_mode:
+                try:
+                    motivo = "stale" if stale_override else "test pequeño"
+                    agregar_evento(
+                        f"🟡 IA CANARY: AUC bajó ({prev_auc:.3f}→{auc:.3f}) pero se refresca en modo seguro ({motivo})."
+                    )
+                except Exception:
+                    pass
 
         # 17) Guardado atómico (compatible con tu función si existe)
         meta = {
@@ -8655,7 +8867,12 @@ def maybe_retrain(force: bool = False):
             "brier": float(brier),
             "cv_auc": float(cv_auc) if isinstance(cv_auc, (int, float)) else None,
             "threshold": float(thr),
-            "reliable": bool(reliable),
+            "reliable": bool(False if canary_mode else reliable),
+            "reliable_candidate": bool(reliable),
+            "canary_mode": bool(canary_mode),
+            "canary_started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S") if canary_mode else None,
+            "canary_target_closed": int(CANARY_MIN_CLOSED_SIGNALS) if canary_mode else 0,
+            "refresh_policy": "champion_canary" if canary_mode else "champion_direct",
             "calibration": str(calib_kind),
             "calib_precision_at_thr": float(calib_prec_at_thr) if isinstance(calib_prec_at_thr, (int, float)) else None,
             "calib_n_at_thr": int(calib_n_at_thr),
@@ -8870,8 +9087,9 @@ def mostrar_panel():
         print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | OBS≥{umbral_obs*100:.1f}%: {bots_obs} | REAL≥{umbral_real_vigente*100:.1f}%: {bots_real} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} (warmup:{sensores_warmup}) | n_min_real: {n_min_real}/{n_req_real} | Token: {owner_txt}")
 
         try:
-            meta_live = leer_model_meta() or {}
+            meta_live = resolver_canary_estado(leer_model_meta() or {})
             reliable = bool(meta_live.get("reliable", False))
+            canary_live = bool(meta_live.get("canary_mode", False))
             n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
             warmup_live = bool(meta_live.get("warmup_mode", n_samples_live < int(TRAIN_WARMUP_MIN_ROWS)))
             cap_base = float(IA_WARMUP_LOW_EVIDENCE_CAP_BASE)
@@ -8895,7 +9113,7 @@ def mostrar_panel():
                 padding
                 + Fore.YELLOW
                 + f"🧩 WHY-NO: CAP≈{cap_now*100:.1f}% (warmup={'sí' if warmup_live else 'no'}) | "
-                  f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} n={n_samples_live} p_best={best_prob*100:.1f}% | "
+                  f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} canary={'sí' if canary_live else 'no'} n={n_samples_live} p_best={best_prob*100:.1f}% | canary_prog={int(meta_live.get('canary_closed_signals',0) or 0)}/{int(meta_live.get('canary_target_closed',0) or 0)} hit={float(meta_live.get('canary_hitrate',0.0) or 0.0)*100:.1f}% | "
                   f"ROOF mode={mode_h} confirm={confirm_h}/{confirm_need_h} trigger_ok={'sí' if trigger_ok_h else 'no'} gate_consumed={'sí' if clone_gate else 'no'}"
             )
         except Exception:
@@ -9309,7 +9527,17 @@ def mostrar_panel():
             if hot:
                 hot_rows.append(f"{b}:{','.join(hot)}")
         if hot_rows:
-            print(Fore.YELLOW + " SENSOR_PLANO hot-features: " + " | ".join(hot_rows))
+            hot_msg = " SENSOR_PLANO hot-features: " + " | ".join(hot_rows)
+            try:
+                term_cols_clip = os.get_terminal_size().columns
+            except Exception:
+                term_cols_clip = 140
+            # Mantener esta línea lejos del HUD/panel derecho (evita solapado visual).
+            # Tope fijo corto para consolas angostas o con zoom/fuentes variables.
+            max_hot_len = 72
+            if len(hot_msg) > max_hot_len:
+                hot_msg = hot_msg[:max(0, max_hot_len - 3)] + "..."
+            print(Fore.YELLOW + hot_msg)
     except Exception:
         pass
 
@@ -9327,7 +9555,7 @@ def mostrar_panel():
         "├────────────────────────────────────────────┤",
         "│ 🤖 ¿CÓMO INVIERTES?                        │",
         "│ [5–0] Elige bot (p.ej. 7 = fulll47)       │",
-        "│ [1–5] Elige ciclo [p.ej. 3 = Marti #3)    │",
+        "│ [1–6] Elige ciclo [p.ej. 3 = Marti #3)    │",
     ]
 
     token_file = leer_token_actual()
@@ -9369,50 +9597,129 @@ def mostrar_panel():
 
 # Mostrar advertencia meta
 def mostrar_advertencia_meta():
-    global salir, pausado, MODAL_ACTIVO, META_ACEPTADA, meta_mostrada
+    global salir, pausado, MODAL_ACTIVO, META_ACEPTADA, meta_mostrada, SALDO_INICIAL, META
+
     pausado = True
     MODAL_ACTIVO = True
-    limpiar_consola()
+
     try:
         terminal_width = max(os.get_terminal_size().columns, 100)
-    except:
-        terminal_width = 100
-    ancho = terminal_width
-    print("\n" * 3)
-    print(Fore.YELLOW + "█" * ancho)
-    print("🎉 ¡¡¡FELICIDADES!!! 🎉".center(ancho))
-    print("✅ Has alcanzado tu meta diaria del +15% de ganancia.".center(ancho))
-    print("")
-    print("💡 Recomendación:".center(ancho))
-    print("EvaBot está diseñada para buscar una ganancia diaria aproximada del 15% de tu capital.".center(ancho))
-    print("Puedes seguir invirtiendo hoy bajo su responsabilidad o esperar hasta mañana para intentar nuevamente ese 15%".center(ancho))
-    print("en condiciones potencialmente más favorables.".center(ancho))
-    print("")
-    print("⚠️ Importante:".center(ancho))
-    print("EvaBot está diseñada para el análisis de miles de operaciones reales y tiene alta tasa de acierto,".center(ancho))
-    print("pero ningún sistema es infalible y siempre existe riesgo de pérdida.".center(ancho))
-    print("Lee el Manual de Usuario para horarios recomendados y detalles clave del programa.".center(ancho))
-    print("")
-    print("Presiona [S] para SALIR y asegurar beneficios, o [C] para continuar invirtiendo.".center(ancho))
-    print("█" * ancho)
-    print("\n" * 3)
+        terminal_height = max(os.get_terminal_size().lines, 32)
+    except Exception:
+        terminal_width, terminal_height = 100, 32
 
+    # Área del modal para refresco incremental (sin limpiar toda la consola en cada tick)
+    box_w = min(max(terminal_width - 6, 80), 140)
+    box_h = min(max(terminal_height - 6, 22), 30)
+    left = max(1, (terminal_width - box_w) // 2)
+    top = max(2, (terminal_height - box_h) // 2)
+
+    # Sonido meta en loop hasta [S] o [C]
     if AUDIO_AVAILABLE:
         if pygame.mixer.get_init() and "meta_15" in SOUND_CACHE:
             try:
-                sound = SOUND_CACHE["meta_15"]
-                sound.play(loops=-1)
+                SOUND_CACHE["meta_15"].play(loops=-1)
             except Exception:
                 pass
         elif winsound:
             try:
                 base_dir = os.path.dirname(__file__)
-                sound_path = os.path.join(base_dir, "meta15.wav")
+                sound_path = os.path.join(base_dir, "meta15%.wav")
                 winsound.PlaySound(sound_path, winsound.SND_LOOP | winsound.SND_ASYNC)
             except Exception:
                 pass
 
+    # Confetti + shake suave
+    palette = [Fore.YELLOW, Fore.CYAN, Fore.MAGENTA, Fore.GREEN, Fore.RED, Fore.WHITE]
+    glyphs = ['|', '!', ':', '*', '+']
+    particles = []
+    max_particles = max(30, box_w // 2)
+
+    def _stop_meta_sound():
+        if AUDIO_AVAILABLE:
+            if pygame.mixer.get_init() and "meta_15" in SOUND_CACHE:
+                try:
+                    SOUND_CACHE["meta_15"].stop()
+                except Exception:
+                    pass
+            elif winsound:
+                try:
+                    winsound.PlaySound(None, winsound.SND_PURGE)
+                except Exception:
+                    pass
+
+    def _center_in_box(msg: str) -> str:
+        pad = max(0, box_w - 2 - len(msg))
+        left_pad = pad // 2
+        right_pad = pad - left_pad
+        return " " * left_pad + msg + " " * right_pad
+
+    def _draw_frame(tick: int):
+        # borde
+        print(f"[{top};{left}H" + Fore.YELLOW + "█" * box_w + Fore.RESET, end='')
+        for r in range(1, box_h - 1):
+            print(f"[{top+r};{left}H" + Fore.YELLOW + "█" + Fore.RESET, end='')
+            print(f"[{top+r};{left+box_w-1}H" + Fore.YELLOW + "█" + Fore.RESET, end='')
+        print(f"[{top+box_h-1};{left}H" + Fore.YELLOW + "█" * box_w + Fore.RESET, end='')
+
+        # limpiar interior
+        blank = " " * (box_w - 2)
+        for r in range(1, box_h - 1):
+            print(f"[{top+r};{left+1}H{blank}", end='')
+
+        shake = -1 if (tick % 4 in (0, 1)) else 1
+        title = "🎉 ¡¡¡FELICIDADES!!! 🎉"
+        y = top + 2
+        x = left + 1 + max(0, (box_w - 2 - len(title)) // 2 + shake)
+        print(f"[{y};{x}H" + Fore.CYAN + title + Fore.RESET, end='')
+
+        lines = [
+            "✅ Has alcanzado tu meta diaria del +20% de ganancia.",
+            "",
+            "💡 Recomendación:",
+            "EvaBot busca una ganancia diaria aproximada del 20% de tu capital.",
+            "Puedes seguir invirtiendo bajo tu responsabilidad o esperar al siguiente día.",
+            "",
+            "⚠️ Importante:",
+            "Ningún sistema es infalible y siempre existe riesgo de pérdida.",
+            "Lee el Manual de Usuario para horarios recomendados y detalles clave.",
+            "",
+            "Presiona [S] para SALIR y asegurar beneficios, o [C] para continuar invirtiendo.",
+        ]
+        row = top + 4
+        for msg in lines:
+            if row >= top + box_h - 2:
+                break
+            print(f"[{row};{left+1}H" + _center_in_box(msg), end='')
+            row += 1
+
+        # confetti cayendo
+        if len(particles) < max_particles and random.random() < 0.55:
+            particles.append({
+                "x": left + 2 + random.randint(0, max(1, box_w - 6)),
+                "y": top + 1,
+                "v": random.choice((1, 1, 2)),
+                "ch": random.choice(glyphs),
+                "color": random.choice(palette),
+            })
+
+        alive = []
+        for part in particles:
+            part["y"] += part["v"]
+            if part["y"] < top + box_h - 1:
+                alive.append(part)
+                if left + 1 <= part["x"] <= left + box_w - 2 and top + 1 <= part["y"] <= top + box_h - 2:
+                    print(f"[{int(part['y'])};{int(part['x'])}H" + part["color"] + part["ch"] + Fore.RESET, end='')
+        particles[:] = alive
+
+        print(f"[{terminal_height};1H", end='', flush=True)
+
+    limpiar_consola()
+    tick = 0
     while True:
+        tick += 1
+        _draw_frame(tick)
+
         if HAVE_MSVCRT and msvcrt.kbhit():
             try:
                 t = msvcrt.getch()
@@ -9420,37 +9727,19 @@ def mostrar_advertencia_meta():
                     msvcrt.getch()
                     continue
                 tecla = t.decode("utf-8", errors="ignore").lower()
-            except:
-                continue
-            if tecla in ("s"):
-                print("🛑 Cerrando EvaBot...")
-                if AUDIO_AVAILABLE:
-                    if pygame.mixer.get_init() and "meta_15" in SOUND_CACHE:
-                        try:
-                            SOUND_CACHE["meta_15"].stop()
-                        except:
-                            pass
-                    elif winsound:
-                        try:
-                            winsound.PlaySound(None, winsound.SND_PURGE)
-                        except:
-                            pass
+            except Exception:
+                tecla = ""
+
+            if tecla in ("s",):
+                print("\n🛑 Cerrando EvaBot...")
+                _stop_meta_sound()
                 salir = True
                 MODAL_ACTIVO = False
                 break
-            elif tecla in ("c", "\r"):
-                print("✔️ Continuando bajo responsabilidad del usuario...")
-                if AUDIO_AVAILABLE:
-                    if pygame.mixer.get_init() and "meta_15" in SOUND_CACHE:
-                        try:
-                            SOUND_CACHE["meta_15"].stop()
-                        except:
-                            pass
-                    elif winsound:
-                        try:
-                            winsound.PlaySound(None, winsound.SND_PURGE)
-                        except:
-                            pass
+
+            if tecla in ("c", "\r"):
+                print("\n✔️ Continuando bajo responsabilidad del usuario...")
+                _stop_meta_sound()
                 try:
                     if MAIN_LOOP:
                         fut = asyncio.run_coroutine_threadsafe(refresh_saldo_real(forzado=True), MAIN_LOOP)
@@ -9458,7 +9747,7 @@ def mostrar_advertencia_meta():
                     valor = obtener_valor_saldo()
                     if valor is not None:
                         SALDO_INICIAL = round(valor, 2)
-                        META = round(SALDO_INICIAL * 1.15, 2)
+                        META = round(SALDO_INICIAL * 1.20, 2)
                         inicializar_saldo_real(SALDO_INICIAL)
                 except Exception as e:
                     print(f"⚠️ Error reiniciando meta: {e}")
@@ -9467,6 +9756,8 @@ def mostrar_advertencia_meta():
                 meta_mostrada = False
                 MODAL_ACTIVO = False
                 break
+
+        time.sleep(0.08)
 
 # Dibujar HUD
 def dibujar_hud_gatewin(panel_height=8, layout=None):
@@ -9491,7 +9782,7 @@ def dibujar_hud_gatewin(panel_height=8, layout=None):
         "├" + "─" * HUD_INNER_WIDTH + "┤",
         f"│ {'🤖 ¿CÓMO INVIERTES?':<{HUD_INNER_WIDTH}}│",
         f"│ {'[5–0] Elige bot (p.ej. 7 = fulll47)':<{HUD_INNER_WIDTH}}│",
-        f"│ {'[1–5] Elige ciclo (p.ej. 3 = Marti #3)':<{HUD_INNER_WIDTH}}│",
+        f"│ {[f'[1–{MAX_CICLOS}] Elige ciclo (p.ej. 3 = Marti #3)'][0]:<{HUD_INNER_WIDTH}}│",
     ]
     activo_real = next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
     if activo_real:
@@ -10641,7 +10932,7 @@ def obtener_valor_saldo():
 def inicializar_saldo_real(valor):
     global SALDO_INICIAL, META
     SALDO_INICIAL = round(valor, 2)
-    META = round(SALDO_INICIAL * 1.15, 2)
+    META = round(SALDO_INICIAL * 1.20, 2)
 
 # Escuchar teclas
 def escuchar_teclas():
@@ -11302,6 +11593,8 @@ async def main():
                             owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
                             if candidatos and (PENDIENTE_FORZAR_BOT is None) and (owner in (None, "none")):
                                 ciclo_auto = ciclo_martingala_siguiente()
+                                if reset_martingala_por_saldo(ciclo_auto, saldo_val):
+                                    ciclo_auto = 1
                                 mejor = elegir_candidato_rotacion_marti(candidatos, ciclo_auto)
                                 if mejor is None and int(ciclo_auto) > 1:
                                     agregar_evento(f"🧯 Rotación C{ciclo_auto}: sin bot nuevo elegible. No se repite bot en esta martingala.")
@@ -11323,9 +11616,18 @@ async def main():
                         # ==================== /AUTO-PRESELECCIÓN ====================
 
                         if candidatos and not MODO_REAL_MANUAL:
-                            meta_live = leer_model_meta() or {}
+                            meta_live = resolver_canary_estado(leer_model_meta() or {})
                             modelo_reliable = bool(meta_live.get("reliable", False))
-                            if not modelo_reliable:
+                            canary_mode_live = bool(meta_live.get("canary_mode", False))
+                            if canary_mode_live:
+                                c_prog = int(meta_live.get("canary_closed_signals", 0) or 0)
+                                c_tgt = int(meta_live.get("canary_target_closed", 0) or 0)
+                                c_hit = float(meta_live.get("canary_hitrate", 0.0) or 0.0) * 100.0
+                                agregar_evento(
+                                    f"🟡 IA AUTO en CANARY: REAL bloqueado temporalmente ({c_prog}/{c_tgt}, hit={c_hit:.1f}%)."
+                                )
+                                candidatos = []
+                            elif not modelo_reliable:
                                 n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
                                 post_n15 = bool(_todos_bots_con_n_minimo_real())
                                 best_prob = max((float(x[2]) for x in candidatos), default=0.0)
@@ -11350,6 +11652,8 @@ async def main():
 
                         if candidatos and not MODO_REAL_MANUAL:
                             ciclo_auto = ciclo_martingala_siguiente()
+                            if reset_martingala_por_saldo(ciclo_auto, saldo_val):
+                                ciclo_auto = 1
                             mejor = elegir_candidato_rotacion_marti(candidatos, ciclo_auto)
                             if mejor is None and int(ciclo_auto) > 1:
                                 agregar_evento(f"🧯 IA AUTO C{ciclo_auto}: sin bot nuevo elegible. Se omite entrada para evitar repetición.")
