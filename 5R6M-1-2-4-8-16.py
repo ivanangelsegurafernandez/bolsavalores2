@@ -342,6 +342,10 @@ TRAIN_REFRESH_STALE_MIN = 45 * 60   # forzar revisión de refresh si el campeón
 TRAIN_REFRESH_MIN_GROWTH = 0.20     # crecimiento mínimo relativo de dataset para considerar stale override
 TRAIN_REFRESH_MIN_ABS_ROWS = 60      # crecimiento mínimo absoluto de filas para stale override
 TRAIN_CANARY_FORCE_UNRELIABLE = True # canary: refresca probs pero bloquea REAL hasta validar en operación cerrada
+CANARY_MIN_CLOSED_SIGNALS = 20      # cierres mínimos para decidir salida de canary
+CANARY_MIN_HITRATE = 0.50           # hit-rate mínimo de cierres durante canary para promover
+CANARY_RETRY_BATCH = 10             # si canary falla, ampliar ventana en este tamaño
+CANARY_EVAL_COOLDOWN_S = 10.0       # evaluar progreso canary como máximo cada N segundos
 TRAIN_ROWS_DROP_GUARD_RATIO = 0.35  # no reemplazar modelo si la muestra cae demasiado vs meta anterior
 TRAIN_ROWS_DROP_GUARD_MIN_PREV = 120  # activar guard solo si el modelo previo ya tenía muestra razonable
 FEATURE_MAX_DOMINANCE = 0.90  # Si una feature repite >90%, se considera casi constante
@@ -3262,6 +3266,7 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
 # ==========================================================
 
 IA_SIGNALS_LOG = "ia_signals_log.csv"
+CANARY_STATE_CACHE = {"ts": 0.0, "meta": None}
 
 # Blindaje: evita crash si threading aún no estaba importado (aunque tú sí lo tienes)
 try:
@@ -3888,6 +3893,103 @@ def _ensure_ia_signals_log():
             os.fsync(f.fileno())
     except Exception:
         pass
+
+def _leer_stats_canary_desde_log(ts_inicio: str | None) -> tuple[int, int]:
+    """
+    Devuelve (cerradas, ganadas) desde ia_signals_log.csv,
+    opcionalmente filtrando por ts >= ts_inicio.
+    """
+    _ensure_ia_signals_log()
+    dt_inicio = None
+    try:
+        if isinstance(ts_inicio, str) and ts_inicio.strip():
+            dt_inicio = datetime.strptime(ts_inicio.strip(), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        dt_inicio = None
+
+    cerradas = 0
+    ganadas = 0
+    try:
+        with open(IA_SIGNALS_LOG, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                yv = str(r.get("y", "")).strip()
+                if yv not in ("0", "1"):
+                    continue
+                if dt_inicio is not None:
+                    ts = str(r.get("ts", "")).strip()
+                    try:
+                        dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        continue
+                    if dt < dt_inicio:
+                        continue
+                cerradas += 1
+                if yv == "1":
+                    ganadas += 1
+    except Exception:
+        pass
+    return int(cerradas), int(ganadas)
+
+
+def resolver_canary_estado(meta: dict | None) -> dict:
+    """
+    Evalúa y resuelve canary automáticamente cuando hay suficiente evidencia cerrada.
+    - Si canary cumple target + hit-rate, promueve a champion_direct.
+    - Si no cumple hit-rate, mantiene canary y amplía target (retry batch).
+    """
+    if not isinstance(meta, dict) or not bool(meta.get("canary_mode", False)):
+        return meta if isinstance(meta, dict) else {}
+
+    now = float(time.time())
+    last_ts = float(CANARY_STATE_CACHE.get("ts", 0.0) or 0.0)
+    cached_meta = CANARY_STATE_CACHE.get("meta")
+    if (now - last_ts) < float(CANARY_EVAL_COOLDOWN_S) and isinstance(cached_meta, dict):
+        return cached_meta
+
+    out = dict(meta)
+    ts_inicio = str(out.get("canary_started_at", "") or "").strip()
+    target = int(out.get("canary_target_closed", CANARY_MIN_CLOSED_SIGNALS) or CANARY_MIN_CLOSED_SIGNALS)
+    target = max(1, target)
+
+    cerradas, ganadas = _leer_stats_canary_desde_log(ts_inicio)
+    hit = (float(ganadas) / float(cerradas)) if cerradas > 0 else 0.0
+    out["canary_closed_signals"] = int(cerradas)
+    out["canary_hitrate"] = float(hit)
+
+    changed = False
+    if cerradas >= target:
+        if hit >= float(CANARY_MIN_HITRATE):
+            out["canary_mode"] = False
+            out["refresh_policy"] = "champion_direct"
+            out["reliable"] = bool(out.get("reliable_candidate", out.get("reliable", False)))
+            out["canary_resolved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            changed = True
+            try:
+                agregar_evento(f"✅ IA CANARY resuelto: {ganadas}/{cerradas} ({hit*100:.1f}%). Se habilita champion_direct.")
+            except Exception:
+                pass
+        else:
+            out["canary_target_closed"] = int(cerradas + max(1, int(CANARY_RETRY_BATCH)))
+            changed = True
+            try:
+                agregar_evento(
+                    f"🟡 IA CANARY extendido: hit-rate {hit*100:.1f}% ({ganadas}/{cerradas}) < {CANARY_MIN_HITRATE*100:.1f}%."
+                )
+            except Exception:
+                pass
+
+    if changed:
+        try:
+            if "guardar_model_meta" in globals() and callable(guardar_model_meta):
+                guardar_model_meta(out)
+        except Exception:
+            pass
+
+    CANARY_STATE_CACHE["ts"] = float(now)
+    CANARY_STATE_CACHE["meta"] = dict(out)
+    return out
+
 
 def _atomic_write_text(path: str, text: str) -> bool:
     tmp = path + ".tmp"
@@ -8757,7 +8859,10 @@ def maybe_retrain(force: bool = False):
             "cv_auc": float(cv_auc) if isinstance(cv_auc, (int, float)) else None,
             "threshold": float(thr),
             "reliable": bool(False if canary_mode else reliable),
+            "reliable_candidate": bool(reliable),
             "canary_mode": bool(canary_mode),
+            "canary_started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S") if canary_mode else None,
+            "canary_target_closed": int(CANARY_MIN_CLOSED_SIGNALS) if canary_mode else 0,
             "refresh_policy": "champion_canary" if canary_mode else "champion_direct",
             "calibration": str(calib_kind),
             "calib_precision_at_thr": float(calib_prec_at_thr) if isinstance(calib_prec_at_thr, (int, float)) else None,
@@ -8973,7 +9078,7 @@ def mostrar_panel():
         print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | OBS≥{umbral_obs*100:.1f}%: {bots_obs} | REAL≥{umbral_real_vigente*100:.1f}%: {bots_real} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} (warmup:{sensores_warmup}) | n_min_real: {n_min_real}/{n_req_real} | Token: {owner_txt}")
 
         try:
-            meta_live = leer_model_meta() or {}
+            meta_live = resolver_canary_estado(leer_model_meta() or {})
             reliable = bool(meta_live.get("reliable", False))
             canary_live = bool(meta_live.get("canary_mode", False))
             n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
@@ -8999,7 +9104,7 @@ def mostrar_panel():
                 padding
                 + Fore.YELLOW
                 + f"🧩 WHY-NO: CAP≈{cap_now*100:.1f}% (warmup={'sí' if warmup_live else 'no'}) | "
-                  f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} canary={'sí' if canary_live else 'no'} n={n_samples_live} p_best={best_prob*100:.1f}% | "
+                  f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} canary={'sí' if canary_live else 'no'} n={n_samples_live} p_best={best_prob*100:.1f}% | canary_prog={int(meta_live.get('canary_closed_signals',0) or 0)}/{int(meta_live.get('canary_target_closed',0) or 0)} hit={float(meta_live.get('canary_hitrate',0.0) or 0.0)*100:.1f}% | "
                   f"ROOF mode={mode_h} confirm={confirm_h}/{confirm_need_h} trigger_ok={'sí' if trigger_ok_h else 'no'} gate_consumed={'sí' if clone_gate else 'no'}"
             )
         except Exception:
@@ -11502,11 +11607,16 @@ async def main():
                         # ==================== /AUTO-PRESELECCIÓN ====================
 
                         if candidatos and not MODO_REAL_MANUAL:
-                            meta_live = leer_model_meta() or {}
+                            meta_live = resolver_canary_estado(leer_model_meta() or {})
                             modelo_reliable = bool(meta_live.get("reliable", False))
                             canary_mode_live = bool(meta_live.get("canary_mode", False))
                             if canary_mode_live:
-                                agregar_evento("🟡 IA AUTO en CANARY: refresco activo, REAL bloqueado temporalmente para validar estabilidad.")
+                                c_prog = int(meta_live.get("canary_closed_signals", 0) or 0)
+                                c_tgt = int(meta_live.get("canary_target_closed", 0) or 0)
+                                c_hit = float(meta_live.get("canary_hitrate", 0.0) or 0.0) * 100.0
+                                agregar_evento(
+                                    f"🟡 IA AUTO en CANARY: REAL bloqueado temporalmente ({c_prog}/{c_tgt}, hit={c_hit:.1f}%)."
+                                )
                                 candidatos = []
                             elif not modelo_reliable:
                                 n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
