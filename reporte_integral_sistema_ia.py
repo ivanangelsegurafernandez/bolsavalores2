@@ -197,9 +197,15 @@ def build_report(runtime_log: Path | None) -> dict[str, Any]:
         bots[bot] = {
             **wr,
             **pr,
+            'signals_n': int(pr.get('n', 0) or 0),
             'prob_vs_hit_gap_last_n': (
                 (pr.get('prob_mean_last_n') - pr.get('hit_last_n'))
                 if isinstance(pr.get('prob_mean_last_n'), (int, float)) and isinstance(pr.get('hit_last_n'), (int, float))
+                else None
+            ),
+            'prob_vs_wr_gap_last_n': (
+                (pr.get('prob_mean_last_n') - wr.get('wr_last_n'))
+                if isinstance(pr.get('prob_mean_last_n'), (int, float)) and isinstance(wr.get('wr_last_n'), (int, float))
                 else None
             )
         }
@@ -270,12 +276,16 @@ def render_md(rep: dict[str, Any]) -> str:
     lines.append(f"- Señales cerradas: **{cal['closed_signals']}**")
     lines.append(f"- Precisión @>=70%: **{pct(p70.get('precision'))}** (n={p70.get('n', 0)})")
     lines.append(f"- Precisión @>=85%: **{pct(p85.get('precision'))}** (n={p85.get('n', 0)})")
+    if int(cal['closed_signals']) < 20:
+        lines.append('- ⚠️ Muestra cerrada muy baja: estas precisiones son orientativas, no concluyentes.')
     lines.append('')
     lines.append('## 2) Desalineación Prob IA vs hitrate por bot (last_n=40)')
-    lines.append('| Bot | WR last40 | Prob media last40 | Gap (Prob-Hit) |')
-    lines.append('|---|---:|---:|---:|')
+    lines.append('| Bot | WR last40 (csv) | n señales IA | Hit last40 (señales) | Prob media last40 (señales) | Gap Prob-Hit señales | Gap Prob-WR csv |')
+    lines.append('|---|---:|---:|---:|---:|---:|---:|')
     for bot, d in sorted(rep['bot_alignment'].items()):
-        lines.append(f"| {bot} | {pct(d.get('wr_last_n'))} | {pct(d.get('prob_mean_last_n'))} | {pct(d.get('prob_vs_hit_gap_last_n'))} |")
+        lines.append(
+            f"| {bot} | {pct(d.get('wr_last_n'))} | {int(d.get('signals_n', 0) or 0)} | {pct(d.get('hit_last_n'))} | {pct(d.get('prob_mean_last_n'))} | {pct(d.get('prob_vs_hit_gap_last_n'))} | {pct(d.get('prob_vs_wr_gap_last_n'))} |"
+        )
     lines.append('')
     lines.append('## 3) Salud de ejecución (auth/ws/timeout)')
     rh = rep['runtime_health']
@@ -299,6 +309,7 @@ def render_md(rep: dict[str, Any]) -> str:
     lines.append(f"- Ready for full diagnosis: **{rd['ready_for_full_diagnosis']}**")
     lines.append('')
     lines.append('## 5) Qué falta corregir si no está “bien”')
+    lines.append('- Nota: `Gap Prob-Hit señales` usa SOLO señales cerradas en `ia_signals_log.csv` y puede diferir de `WR last40 (csv)` del bot.')
     lines.append('- Si `precision@85` baja o n es pequeño: recalibrar/proteger compuerta.')
     lines.append('- Si gap Prob-Hit por bot es alto: bajar exposición o bloquear bot temporalmente.')
     lines.append('- Si auth/ws/timeouts suben: estabilizar conectividad antes de evaluar modelo.')
