@@ -1,0 +1,137 @@
+{
+  "generated_at_utc": "2026-02-24T10:32:08.280117+00:00",
+  "sources": {
+    "signals_log": "ia_signals_log.csv",
+    "diag_json": "diagnostico_pipeline_ia.json",
+    "model_meta": "model_meta.json",
+    "real_state": "real_sim_state.json",
+    "runtime_log": null
+  },
+  "calibration": {
+    "closed_signals": 1,
+    "precision_at_70": {
+      "threshold": 0.7,
+      "n": 1,
+      "hits": 1,
+      "precision": 1.0
+    },
+    "precision_at_85": {
+      "threshold": 0.85,
+      "n": 1,
+      "hits": 1,
+      "precision": 1.0
+    }
+  },
+  "diagnostic_snapshot": {
+    "diag_checklist": [],
+    "diag_actions": [],
+    "diag_signals": {},
+    "diag_incremental": {},
+    "diag_model_meta": {}
+  },
+  "bot_alignment": {
+    "fulll45": {
+      "rows_closed": 637,
+      "wr_all": 0.5290423861852434,
+      "wr_last_n": 0.625,
+      "last_n": 40,
+      "signals_n": 0,
+      "signals_min_for_gap": 5,
+      "signals_sample_ok": false,
+      "prob_vs_hit_gap_last_n": null,
+      "prob_vs_wr_gap_last_n": null
+    },
+    "fulll46": {
+      "rows_closed": 636,
+      "wr_all": 0.5125786163522013,
+      "wr_last_n": 0.625,
+      "last_n": 40,
+      "signals_n": 0,
+      "signals_min_for_gap": 5,
+      "signals_sample_ok": false,
+      "prob_vs_hit_gap_last_n": null,
+      "prob_vs_wr_gap_last_n": null
+    },
+    "fulll47": {
+      "rows_closed": 631,
+      "wr_all": 0.5007923930269413,
+      "wr_last_n": 0.55,
+      "last_n": 40,
+      "n": 1,
+      "prob_mean_all": 0.9253988245106484,
+      "hit_all": 1.0,
+      "prob_mean_last_n": 0.9253988245106484,
+      "hit_last_n": 1.0,
+      "signals_n": 1,
+      "signals_min_for_gap": 5,
+      "signals_sample_ok": false,
+      "prob_vs_hit_gap_last_n": null,
+      "prob_vs_wr_gap_last_n": null
+    },
+    "fulll48": {
+      "rows_closed": 642,
+      "wr_all": 0.5062305295950156,
+      "wr_last_n": 0.6,
+      "last_n": 40,
+      "signals_n": 0,
+      "signals_min_for_gap": 5,
+      "signals_sample_ok": false,
+      "prob_vs_hit_gap_last_n": null,
+      "prob_vs_wr_gap_last_n": null
+    },
+    "fulll49": {
+      "rows_closed": 637,
+      "wr_all": 0.4945054945054945,
+      "wr_last_n": 0.725,
+      "last_n": 40,
+      "signals_n": 0,
+      "signals_min_for_gap": 5,
+      "signals_sample_ok": false,
+      "prob_vs_hit_gap_last_n": null,
+      "prob_vs_wr_gap_last_n": null
+    },
+    "fulll50": {
+      "rows_closed": 639,
+      "wr_all": 0.48982785602503914,
+      "wr_last_n": 0.725,
+      "last_n": 40,
+      "signals_n": 0,
+      "signals_min_for_gap": 5,
+      "signals_sample_ok": false,
+      "prob_vs_hit_gap_last_n": null,
+      "prob_vs_wr_gap_last_n": null
+    }
+  },
+  "runtime_health": {
+    "exists": false,
+    "note": "Pasa --runtime-log <archivo> para auditar auth/websocket/WHY-NO tick a tick."
+  },
+  "token_real_state": {
+    "real_sim_state": {},
+    "last_promotions_tail": [
+      "2026-02-23 22:12:46 - Token REAL (inmediato) asignado a fulll45 (ciclo 3)",
+      "2026-02-23 22:22:45 - Token REAL (inmediato) asignado a fulll45 (ciclo 1)",
+      "2026-02-23 22:25:07 - Token REAL (inmediato) asignado a fulll46 (ciclo 2)",
+      "2026-02-24 00:48:48 - Token REAL (inmediato) asignado a fulll50 (ciclo 1)",
+      "2026-02-24 00:57:16 - Token REAL (inmediato) asignado a fulll47 (ciclo 2)",
+      "2026-02-24 01:00:17 - Token REAL (inmediato) asignado a fulll47 (ciclo 1)",
+      "2026-02-24 05:04:27 - Token REAL (inmediato) asignado a fulll46 (ciclo 1)",
+      "2026-02-24 05:14:40 - Token REAL (inmediato) asignado a fulll46 (ciclo 2)",
+      "2026-02-24 05:16:55 - Token REAL (inmediato) asignado a fulll46 (ciclo 3)",
+      "2026-02-24 05:17:08 - Token REAL (inmediato) asignado a fulll46 (ciclo 3)"
+    ]
+  },
+  "readiness_recommendation": {
+    "ready_for_full_diagnosis": false,
+    "criteria": {
+      "n_samples>=250": true,
+      "closed_signals>=80": false,
+      "reliable=true": false,
+      "auc>=0.53": true
+    },
+    "n_samples": 435,
+    "closed_signals": 1,
+    "auc": 0.6508241758241758,
+    "reliable": false
+  }
+}
