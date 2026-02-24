@@ -10705,7 +10705,17 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             else:
                 rearm_streak = 0
 
-        trigger_ok = bool(suceso_ok if mode_c_active else crossed_up)
+        # Trigger de apertura:
+        # - Modo A: exige cruce al alza (anti-ráfaga estricto).
+        # - Modo B (post-n15): si ya hubo confirmación sostenida, usar suceso_ok
+        #   para no quedar "pegado" cuando p_best orbita el mismo nivel sin nuevo cruce.
+        # - Modo C: mantiene criterio conservador basado en suceso_ok + evidencia.
+        if mode_c_active:
+            trigger_ok = bool(suceso_ok)
+        elif modo_relajado_n15:
+            trigger_ok = bool(suceso_ok or crossed_up)
+        else:
+            trigger_ok = bool(crossed_up)
         if warmup_mode and (not mode_c_active):
             trigger_ok = bool(trigger_ok and suceso_ok)
 
@@ -10747,6 +10757,7 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             "crowding": bool(crowding),
             "crossed_up": bool(crossed_up),
             "suceso_ok": bool(suceso_ok),
+            "trigger_ok": bool(trigger_ok),
             "gate_mode": str(gate_mode),
             "stall_s": float(stall_s),
             "floor_eff": float(floor_eff),
