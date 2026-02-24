@@ -19,6 +19,7 @@ BOT_FILES = [ROOT / f'registro_enriquecido_fulll{n}.csv' for n in (45, 46, 47, 4
 
 OUT_JSON = ROOT / 'reporte_integral_sistema_ia.json'
 OUT_MD = ROOT / 'reporte_integral_sistema_ia.md'
+MIN_SIGNALS_FOR_BOT_GAP = 5
 
 
 def _safe_float(v: Any) -> float | None:
@@ -194,18 +195,22 @@ def build_report(runtime_log: Path | None) -> dict[str, Any]:
         bot = fp.stem.replace('registro_enriquecido_', '')
         wr = _bot_winrate_from_reg(fp, last_n=40)
         pr = by_bot_probs.get(bot, {})
+        signals_n = int(pr.get('n', 0) or 0)
+        has_enough_signals = signals_n >= int(MIN_SIGNALS_FOR_BOT_GAP)
         bots[bot] = {
             **wr,
             **pr,
-            'signals_n': int(pr.get('n', 0) or 0),
+            'signals_n': signals_n,
+            'signals_min_for_gap': int(MIN_SIGNALS_FOR_BOT_GAP),
+            'signals_sample_ok': bool(has_enough_signals),
             'prob_vs_hit_gap_last_n': (
                 (pr.get('prob_mean_last_n') - pr.get('hit_last_n'))
-                if isinstance(pr.get('prob_mean_last_n'), (int, float)) and isinstance(pr.get('hit_last_n'), (int, float))
+                if has_enough_signals and isinstance(pr.get('prob_mean_last_n'), (int, float)) and isinstance(pr.get('hit_last_n'), (int, float))
                 else None
             ),
             'prob_vs_wr_gap_last_n': (
                 (pr.get('prob_mean_last_n') - wr.get('wr_last_n'))
-                if isinstance(pr.get('prob_mean_last_n'), (int, float)) and isinstance(wr.get('wr_last_n'), (int, float))
+                if has_enough_signals and isinstance(pr.get('prob_mean_last_n'), (int, float)) and isinstance(wr.get('wr_last_n'), (int, float))
                 else None
             )
         }
@@ -280,11 +285,12 @@ def render_md(rep: dict[str, Any]) -> str:
         lines.append('- ⚠️ Muestra cerrada muy baja: estas precisiones son orientativas, no concluyentes.')
     lines.append('')
     lines.append('## 2) Desalineación Prob IA vs hitrate por bot (last_n=40)')
-    lines.append('| Bot | WR last40 (csv) | n señales IA | Hit last40 (señales) | Prob media last40 (señales) | Gap Prob-Hit señales | Gap Prob-WR csv |')
-    lines.append('|---|---:|---:|---:|---:|---:|---:|')
+    lines.append('| Bot | WR last40 (csv) | n señales IA | Hit last40 (señales) | Prob media last40 (señales) | Gap Prob-Hit señales | Gap Prob-WR csv | Muestra señales |')
+    lines.append('|---|---:|---:|---:|---:|---:|---:|---|')
     for bot, d in sorted(rep['bot_alignment'].items()):
+        sample_txt = 'OK' if bool(d.get('signals_sample_ok', False)) else f"BAJA(<{int(d.get('signals_min_for_gap', MIN_SIGNALS_FOR_BOT_GAP))})"
         lines.append(
-            f"| {bot} | {pct(d.get('wr_last_n'))} | {int(d.get('signals_n', 0) or 0)} | {pct(d.get('hit_last_n'))} | {pct(d.get('prob_mean_last_n'))} | {pct(d.get('prob_vs_hit_gap_last_n'))} | {pct(d.get('prob_vs_wr_gap_last_n'))} |"
+            f"| {bot} | {pct(d.get('wr_last_n'))} | {int(d.get('signals_n', 0) or 0)} | {pct(d.get('hit_last_n'))} | {pct(d.get('prob_mean_last_n'))} | {pct(d.get('prob_vs_hit_gap_last_n'))} | {pct(d.get('prob_vs_wr_gap_last_n'))} | {sample_txt} |"
         )
     lines.append('')
     lines.append('## 3) Salud de ejecución (auth/ws/timeout)')
@@ -310,6 +316,7 @@ def render_md(rep: dict[str, Any]) -> str:
     lines.append('')
     lines.append('## 5) Qué falta corregir si no está “bien”')
     lines.append('- Nota: `Gap Prob-Hit señales` usa SOLO señales cerradas en `ia_signals_log.csv` y puede diferir de `WR last40 (csv)` del bot.')
+    lines.append(f'- Gaps por bot se publican solo si `n señales IA >= {MIN_SIGNALS_FOR_BOT_GAP}` para evitar conclusiones con muestra mínima.')
     lines.append('- Si `precision@85` baja o n es pequeño: recalibrar/proteger compuerta.')
     lines.append('- Si gap Prob-Hit por bot es alto: bajar exposición o bloquear bot temporalmente.')
     lines.append('- Si auth/ws/timeouts suben: estabilizar conectividad antes de evaluar modelo.')

@@ -6303,10 +6303,9 @@ def reset_martingala_por_saldo(ciclo_objetivo: int, saldo_actual: float | None) 
     return True
 def elegir_candidato_rotacion_marti(candidatos: list, ciclo_objetivo: int):
     """
-    Rotación preferente para REAL en C2..C{MAX_CICLOS}:
+    Rotación estricta para REAL en C2..C{MAX_CICLOS}:
     - Excluye bots ya usados en la corrida activa (bots_usados_en_esta_marti).
-    - Si no hay elegibles nuevos en C2..C{MAX_CICLOS}, permite fallback al mejor candidato
-      repetido para no congelar la martingala cuando el filtro deja 1-2 bots.
+    - Si no hay elegibles nuevos, retorna None (NO repetir bot en la misma martingala).
     """
     try:
         ciclo = int(ciclo_objetivo)
@@ -6322,9 +6321,8 @@ def elegir_candidato_rotacion_marti(candidatos: list, ciclo_objetivo: int):
     if candidatos_nuevos:
         return candidatos_nuevos[0]
 
-    # Fallback controlado: si ya no quedan "nuevos", no bloquear IA AUTO.
-    # Priorizamos continuidad operativa antes que quedarse sin entrada.
-    return candidatos[0]
+    # Regla de seguridad solicitada: nunca repetir bot en C2..C{MAX_CICLOS}.
+    return None
 
 # === FIN BLOQUE 9 ===
 
