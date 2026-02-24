@@ -9308,23 +9308,30 @@ def mostrar_panel():
 
         # Decoración SOLO cuando hay prob real
         if prob_ok:
+            flags = ""
             if modo == "low_data":
-                prob_str += " ⚠"
+                flags += "l"   # low-data
             elif modo == "exp":
-                prob_str += "☆"
+                flags += "e"   # experimental
 
-            # Evita lectura "premium" cuando el propio modelo está en warmup o non-reliable.
+            # Evita lectura "premium" cuando el modelo está en warmup/no confiable.
             if warmup_model_live or (not reliable_model_live):
-                prob_str += " ⚠raw"
+                flags += "r"   # raw / no confiable
 
-            # Penalización visual de recencia (no cambia lógica de trading):
-            # si el bot viene de 2 pérdidas consecutivas, marcar para evitar sobreinterpretar 80-85%.
+            # Penalización visual de recencia (no cambia lógica de trading).
             try:
                 ult = list(estado_bots.get(bot, {}).get("resultados", []))[-2:]
                 if len(ult) == 2 and all(str(x) == "PÉRDIDA" for x in ult):
-                    prob_str += " ↯"
+                    flags += "d"   # drawdown reciente
             except Exception:
                 pass
+
+            if flags:
+                prob_str += f"[{flags}]"
+
+            # Mantener ancho de columna estable para no romper la tabla.
+            if len(prob_str) > 10:
+                prob_str = prob_str[:10]
 
         # Semáforo IA (UI FIJA)
         # ----------------------------------------------
@@ -9358,7 +9365,10 @@ def mostrar_panel():
             modo_str = Fore.LIGHTBLACK_EX + "OFF" + Fore.RESET
         else:
             if (modo != "off") and prob_ok:
-                if prob >= high_thr_ui:
+                if (modo == "low_data") or warmup_model_live or (not reliable_model_live):
+                    # En warmup/no-confiable no pintar como "verde premium".
+                    prob_color = Fore.YELLOW if prob >= mid_thr_ui else Fore.LIGHTBLACK_EX
+                elif prob >= high_thr_ui:
                     prob_color = Fore.GREEN
                 elif prob >= mid_thr_ui:
                     prob_color = Fore.YELLOW
@@ -9369,7 +9379,13 @@ def mostrar_panel():
 
             prob_str = prob_color + prob_str + Fore.RESET
 
-            modo_str = (modo.upper() if modo != "off" else "OFF")
+            modo_map = {
+                "low_data": "LWDATA",
+                "exp": "EXP",
+                "modelo": "MODELO",
+                "off": "OFF",
+            }
+            modo_base = modo_map.get(modo, (modo.upper() if modo != "off" else "OFF"))
 
             if modo != "off":
                 if confianza >= IA_ACTIVACION_REAL_THR:
@@ -9383,8 +9399,11 @@ def mostrar_panel():
 
             su_idx = int(round(float(estado_bots.get(bot, {}).get("ia_suceso_idx", 0.0) or 0.0)))
             is_plano = bool(estado_bots.get(bot, {}).get("ia_sensor_plano", False))
-            modo_tag = f" S{max(0, min(99, su_idx)):02d}" + ("⚠" if is_plano else "")
-            modo_str = modo_color + modo_str + Fore.RESET + modo_tag
+            modo_tag = f"S{max(0, min(99, su_idx)):02d}" + ("!" if is_plano else "")
+            modo_txt = f"{modo_base} {modo_tag}" if modo_base != "OFF" else "OFF"
+            if len(modo_txt) > 10:
+                modo_txt = modo_txt[:10]
+            modo_str = modo_color + modo_txt + Fore.RESET
 
         # --- Audio IA "es hora de invertir" (umbral fijo) ---
         audio_thr = float(globals().get("AUDIO_IA53_THR", high_thr_ui))
