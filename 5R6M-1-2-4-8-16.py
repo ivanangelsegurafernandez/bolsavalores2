@@ -11600,6 +11600,20 @@ async def main():
                                         )
                                         continue
 
+                                    # Guardas por bot (alineadas al HUD): evitar promoción cuando hay
+                                    # desalineación severa entre probabilidad y performance real reciente.
+                                    if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (ev_wr < float(IA_PROMO_MIN_WR_POR_BOT)):
+                                        agregar_evento(
+                                            f"🧱 Guarda WR bot: {b} bloqueado (WR={ev_wr*100:.1f}% < {IA_PROMO_MIN_WR_POR_BOT*100:.1f}%, n={ev_n})."
+                                        )
+                                        continue
+                                    overconf_gap = float(p_post) - float(ev_wr)
+                                    if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (overconf_gap > float(IA_PROMO_MAX_OVERCONF_GAP)):
+                                        agregar_evento(
+                                            f"🧯 Guarda calibración: {b} bloqueado (p_real-WR={overconf_gap*100:.1f}pp > {IA_PROMO_MAX_OVERCONF_GAP*100:.1f}pp)."
+                                        )
+                                        continue
+
                                     # Candado final: el umbral REAL se valida sobre la probabilidad posterior (no p_model)
                                     thr_post = float(umbral_ia_real)
                                     if ev_n < int(EVIDENCE_MIN_N_SOFT):
