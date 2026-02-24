@@ -8489,12 +8489,51 @@ def maybe_retrain(force: bool = False):
             if n_train < int(min_train_req):
                 return None
 
-            return n_train, n_cal, n_test
+            return n_train, n_cal, n_test, min_train_req
+
+        def _expand_test_hasta_doble_clase(y_all, n_train, n_cal, n_test, min_train_req):
+            """
+            Evita TEST degenerado de una sola clase cuando sí existe diversidad
+            en histórico total. Conserva orden temporal moviendo frontera
+            train/calib -> test (sin mezclar ni barajar).
+            """
+            try:
+                y_np = np.asarray(y_all)
+                if y_np.size <= 0:
+                    return n_train, n_cal, n_test
+                if len(np.unique(y_np)) < 2:
+                    return n_train, n_cal, n_test
+
+                min_test_floor = max(5, int(min(MIN_TEST_ROWS, max(5, y_np.size // 3))))
+                n_test = max(int(n_test), int(min_test_floor))
+
+                if len(np.unique(y_np[-n_test:])) >= 2:
+                    return n_train, n_cal, n_test
+
+                min_cal_keep = 0
+                max_shift_from_cal = max(0, int(n_cal) - int(min_cal_keep))
+                max_shift_from_train = max(0, int(n_train) - int(min_train_req))
+                max_shift = max_shift_from_cal + max_shift_from_train
+
+                while max_shift > 0 and len(np.unique(y_np[-n_test:])) < 2:
+                    if n_cal > min_cal_keep:
+                        n_cal -= 1
+                    elif n_train > int(min_train_req):
+                        n_train -= 1
+                    else:
+                        break
+                    n_test += 1
+                    max_shift -= 1
+
+                return int(n_train), int(n_cal), int(n_test)
+            except Exception:
+                return n_train, n_cal, n_test
 
         sizes = _calc_sizes(n_total)
         if sizes is None:
             return False
-        n_train, n_cal, n_test = sizes
+        n_train, n_cal, n_test, min_train_req = sizes
+        n_train, n_cal, n_test = _expand_test_hasta_doble_clase(y, n_train, n_cal, n_test, min_train_req)
 
         i0 = 0
         i1 = n_train
@@ -10329,6 +10368,10 @@ DYN_ROOF_CROWD_P_MIN = 0.90
 DYN_ROOF_CROWD_MIN_BOTS = 3
 DYN_ROOF_CROWD_EXTRA_ROOF = 0.02
 DYN_ROOF_CROWD_EXTRA_GAP = 0.02
+# Clustering en zona 70-80%: evita seleccionar bots con margen mínimo "fake".
+DYN_ROOF_CLUSTER_P_MIN = 0.70
+DYN_ROOF_CLUSTER_MIN_BOTS = 3
+DYN_ROOF_CLUSTER_EXTRA_GAP = 0.01
 DYN_ROOF_GATE_REARM_HYST = 0.02
 DYN_ROOF_GATE_REARM_TICKS = 2
 DYN_ROOF_LOW_BAL_WARN_COOLDOWN_S = 60
@@ -10561,16 +10604,24 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         if crowding:
             roof_eff = float(roof_eff + float(DYN_ROOF_CROWD_EXTRA_ROOF))
 
-        # GAP con fallback:
+        # GAP dinámico:
         # - Si solo hay 1 bot válido, no se bloquea por GAP.
-        # - En modo relajado (todos con n>=15), no exigir GAP para evitar congelamiento
-        #   cuando varios bots se agrupan cerca de 55%-60%.
-        if modo_relajado_n15 or len(live) <= 1:
+        # - En modo relajado (n>=15 en todos) pedimos micro-GAP cuando hay
+        #   clustering en 70-80% para evitar márgenes casi idénticos persistentes.
+        if len(live) <= 1:
             gap_ok = True
         else:
-            gap_ok = (float(p_best) - float(p_second)) >= float(DYN_ROOF_GAP)
-        if crowding and len(live) > 1:
-            gap_ok = bool((float(p_best) - float(p_second)) >= float(DYN_ROOF_GAP + DYN_ROOF_CROWD_EXTRA_GAP))
+            cluster_count = sum(1 for _b, p, _n in live if float(p) >= float(DYN_ROOF_CLUSTER_P_MIN))
+            clustering_soft = bool(cluster_count >= int(DYN_ROOF_CLUSTER_MIN_BOTS))
+            gap_req = float(DYN_ROOF_GAP)
+            if crowding:
+                gap_req += float(DYN_ROOF_CROWD_EXTRA_GAP)
+            if modo_relajado_n15 and clustering_soft:
+                gap_req = max(float(DYN_ROOF_CLUSTER_EXTRA_GAP), gap_req)
+            elif modo_relajado_n15 and (not crowding):
+                # Mantener modo B fluido cuando no hay clustering real.
+                gap_req = 0.0
+            gap_ok = bool((float(p_best) - float(p_second)) >= float(gap_req))
 
         clone_flat = bool(
             (len(live) >= 2)
