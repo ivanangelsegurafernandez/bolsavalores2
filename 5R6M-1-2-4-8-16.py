@@ -9172,9 +9172,12 @@ def mostrar_panel():
     print(padding + Fore.CYAN + "│ BOT    │ Últimos 40 Resultados                                                  │ Token   │ GANANCIAS│ PÉRDIDAS │ % ÉXITO  │ Prob IA  │ Modo IA  │")
     print(padding + Fore.CYAN + "├────────┼────────────────────────────────────────────────────────────────────────────────┼─────────┬──────────┬──────────┬──────────┬──────────┬──────────┤")
 
-    # Meta IA para colorear Prob IA
-    meta = leer_model_meta()
-    umbral_ia = get_umbral_dinamico(meta, ORACULO_THR_MIN)
+    # Meta IA para colorear Prob IA (estado global del modelo)
+    model_meta_live = resolver_canary_estado(leer_model_meta() or {})
+    n_model_live = int(model_meta_live.get("n_samples", model_meta_live.get("n", 0)) or 0)
+    warmup_model_live = bool(model_meta_live.get("warmup_mode", n_model_live < int(TRAIN_WARMUP_MIN_ROWS)))
+    reliable_model_live = bool(model_meta_live.get("reliable", False))
+    umbral_ia = get_umbral_dinamico(model_meta_live, ORACULO_THR_MIN)
 
     # Sincronía visual dura: si hay owner REAL en memoria, la tabla SIEMPRE lo refleja.
     owner_visual = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
@@ -9309,6 +9312,19 @@ def mostrar_panel():
                 prob_str += " ⚠"
             elif modo == "exp":
                 prob_str += "☆"
+
+            # Evita lectura "premium" cuando el propio modelo está en warmup o non-reliable.
+            if warmup_model_live or (not reliable_model_live):
+                prob_str += " ⚠raw"
+
+            # Penalización visual de recencia (no cambia lógica de trading):
+            # si el bot viene de 2 pérdidas consecutivas, marcar para evitar sobreinterpretar 80-85%.
+            try:
+                ult = list(estado_bots.get(bot, {}).get("resultados", []))[-2:]
+                if len(ult) == 2 and all(str(x) == "PÉRDIDA" for x in ult):
+                    prob_str += " ↯"
+            except Exception:
+                pass
 
         # Semáforo IA (UI FIJA)
         # ----------------------------------------------
