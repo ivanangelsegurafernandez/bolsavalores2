@@ -10376,6 +10376,9 @@ DYN_ROOF_CROWD_EXTRA_GAP = 0.02
 DYN_ROOF_CLUSTER_P_MIN = 0.70
 DYN_ROOF_CLUSTER_MIN_BOTS = 3
 DYN_ROOF_CLUSTER_EXTRA_GAP = 0.01
+# Si el top está empatado/prácticamente empatado, mantener bot en confirmación
+# para no reiniciar confirm_streak en cada tick por micro-ruido.
+DYN_ROOF_TIE_KEEP_CONFIRM_TOL = 0.003
 DYN_ROOF_GATE_REARM_HYST = 0.02
 DYN_ROOF_GATE_REARM_TICKS = 2
 DYN_ROOF_LOW_BAL_WARN_COOLDOWN_S = 60
@@ -10567,6 +10570,30 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         live.sort(key=lambda x: x[1], reverse=True)
         best_bot, p_best, n_best = live[0]
         p_second = float(live[1][1]) if len(live) > 1 else 0.0
+
+        # Empates prácticos del top (ej. 85.0%/85.0%/85.0%) pueden alternar
+        # best_bot por ruido mínimo y reiniciar confirmación. Si el bot ya en
+        # confirmación sigue prácticamente empatado con el top, lo mantenemos.
+        try:
+            tie_tol = float(DYN_ROOF_TIE_KEEP_CONFIRM_TOL)
+            confirm_bot_prev = DYN_ROOF_STATE.get("confirm_bot")
+            if isinstance(confirm_bot_prev, str) and confirm_bot_prev in {b for b, _p, _n in live}:
+                p_confirm_prev = None
+                n_confirm_prev = 0
+                for b_live, p_live, n_live in live:
+                    if b_live == confirm_bot_prev:
+                        p_confirm_prev = float(p_live)
+                        n_confirm_prev = int(n_live)
+                        break
+                if isinstance(p_confirm_prev, (int, float)) and abs(float(p_best) - float(p_confirm_prev)) <= float(tie_tol):
+                    best_bot = str(confirm_bot_prev)
+                    p_best = float(p_confirm_prev)
+                    n_best = int(n_confirm_prev)
+                    rest = [float(p) for b, p, _n in live if b != best_bot]
+                    p_second = max(rest) if rest else 0.0
+        except Exception:
+            pass
+
         crowd_count = sum(1 for _b, p, _n in live if float(p) >= float(DYN_ROOF_CROWD_P_MIN))
         probs_live = [float(x[1]) for x in live]
         spread_std = float(np.std(probs_live)) if probs_live else 0.0
@@ -10721,7 +10748,12 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         else:
             trigger_ok = bool(crossed_up)
         if warmup_mode and (not mode_c_active):
-            trigger_ok = bool(trigger_ok and suceso_ok)
+            # En modo B (post-n15) no anular trigger por warmup si la compuerta ya
+            # pasó allow_real y hay suceso_ok; evita bloqueo infinito en EXPERIMENTAL.
+            if not modo_relajado_n15:
+                trigger_ok = bool(trigger_ok and suceso_ok)
+            else:
+                trigger_ok = bool(trigger_ok)
 
         last_open_tick = int(DYN_ROOF_STATE.get("last_open_tick", 0) or 0)
         new_open = bool(
