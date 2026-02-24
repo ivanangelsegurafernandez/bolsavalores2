@@ -231,6 +231,10 @@ AUTO_REAL_UNRELIABLE_MIN_N = 80
 AUTO_REAL_UNRELIABLE_MIN_PROB = 0.63  # más permisivo en reliable=false (sube activación y riesgo de falsos positivos)
 AUTO_REAL_UNRELIABLE_MIN_AUC = 0.50   # si AUC cae bajo azar, no habilitar AUTO aunque post-n15
 AUTO_REAL_BLOCK_WHEN_WARMUP = True    # durante warmup evita promoción AUTO en modo unreliable
+# Bypass controlado: si la compuerta REAL ya está sólida en vivo, permitir AUTO
+# aunque el modelo siga en warmup/reliable=false.
+AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE = True
+AUTO_REAL_UNRELIABLE_GATE_MIN_PROB = 0.85
 
 # Guardas por bot para reducir desalineación Prob IA vs % Éxito observado en HUD.
 IA_PROMO_MIN_WR_POR_BOT = 0.45         # no promover bots con WR rolling claramente negativo
@@ -11847,19 +11851,36 @@ async def main():
                                 warmup_live = bool(meta_live.get("warmup_mode", n_samples_live < int(TRAIN_WARMUP_MIN_ROWS)))
                                 post_n15 = bool(_todos_bots_con_n_minimo_real())
                                 best_prob = max((float(x[2]) for x in candidatos), default=0.0)
+                                gate_strong_unrel = False
+                                try:
+                                    dgate = dyn_gate if isinstance(dyn_gate, dict) else {}
+                                    gate_strong_unrel = bool(
+                                        AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE
+                                        and bool(dgate.get("allow_real", False))
+                                        and bool(dgate.get("trigger_ok", False))
+                                        and (float(dgate.get("p_best", 0.0) or 0.0) >= float(AUTO_REAL_UNRELIABLE_GATE_MIN_PROB))
+                                    )
+                                except Exception:
+                                    gate_strong_unrel = False
                                 allow_unreliable = bool(
                                     AUTO_REAL_ALLOW_UNRELIABLE_POST_N15
                                     and post_n15
                                     and (n_samples_live >= int(AUTO_REAL_UNRELIABLE_MIN_N))
                                     and (best_prob >= float(AUTO_REAL_UNRELIABLE_MIN_PROB))
                                     and (auc_live >= float(AUTO_REAL_UNRELIABLE_MIN_AUC))
-                                    and (not (bool(AUTO_REAL_BLOCK_WHEN_WARMUP) and warmup_live))
+                                    and ((not (bool(AUTO_REAL_BLOCK_WHEN_WARMUP) and warmup_live)) or bool(gate_strong_unrel))
                                 )
                                 if allow_unreliable:
-                                    agregar_evento(
-                                        f"⚠️ IA AUTO modo adaptativo: reliable=false, pero se habilita por post-n15 "
-                                        f"(n={n_samples_live}, auc={auc_live:.3f}, p_best={best_prob*100:.1f}%)."
-                                    )
+                                    if gate_strong_unrel and warmup_live:
+                                        agregar_evento(
+                                            f"🟠 IA AUTO bypass warmup: compuerta fuerte habilita REAL "
+                                            f"(p_best={best_prob*100:.1f}%, n={n_samples_live}, auc={auc_live:.3f})."
+                                        )
+                                    else:
+                                        agregar_evento(
+                                            f"⚠️ IA AUTO modo adaptativo: reliable=false, pero se habilita por post-n15 "
+                                            f"(n={n_samples_live}, auc={auc_live:.3f}, p_best={best_prob*100:.1f}%)."
+                                        )
                                 else:
                                     why_nr = []
                                     if n_samples_live < int(AUTO_REAL_UNRELIABLE_MIN_N):
