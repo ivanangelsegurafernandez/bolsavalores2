@@ -234,7 +234,7 @@ AUTO_REAL_BLOCK_WHEN_WARMUP = True    # durante warmup evita promoción AUTO en 
 # Bypass controlado: si la compuerta REAL ya está sólida en vivo, permitir AUTO
 # aunque el modelo siga en warmup/reliable=false.
 AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE = True
-AUTO_REAL_UNRELIABLE_GATE_MIN_PROB = 0.85
+AUTO_REAL_UNRELIABLE_GATE_MIN_PROB = IA_ACTIVACION_REAL_THR_POST_N15
 
 # Guardas por bot para reducir desalineación Prob IA vs % Éxito observado en HUD.
 IA_PROMO_MIN_WR_POR_BOT = 0.45         # no promover bots con WR rolling claramente negativo
@@ -360,7 +360,7 @@ CANARY_RETRY_BATCH = 10             # si canary falla, ampliar ventana en este t
 CANARY_EVAL_COOLDOWN_S = 10.0       # evaluar progreso canary como máximo cada N segundos
 # Escape controlado: evita deadlock cuando CANARY no acumula cierres pero la compuerta REAL ya está sólida.
 CANARY_ALLOW_STRONG_GATE_REAL = True
-CANARY_STRONG_GATE_MIN_PROB = 0.85
+CANARY_STRONG_GATE_MIN_PROB = IA_ACTIVACION_REAL_THR_POST_N15
 CANARY_STRONG_GATE_MIN_CONFIRM = 2
 TRAIN_ROWS_DROP_GUARD_RATIO = 0.35  # no reemplazar modelo si la muestra cae demasiado vs meta anterior
 TRAIN_ROWS_DROP_GUARD_MIN_PREV = 120  # activar guard solo si el modelo previo ya tenía muestra razonable
