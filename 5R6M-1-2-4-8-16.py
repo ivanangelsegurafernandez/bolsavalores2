@@ -354,6 +354,10 @@ CANARY_MIN_CLOSED_SIGNALS = 20      # cierres mínimos para decidir salida de ca
 CANARY_MIN_HITRATE = 0.50           # hit-rate mínimo de cierres durante canary para promover
 CANARY_RETRY_BATCH = 10             # si canary falla, ampliar ventana en este tamaño
 CANARY_EVAL_COOLDOWN_S = 10.0       # evaluar progreso canary como máximo cada N segundos
+# Escape controlado: evita deadlock cuando CANARY no acumula cierres pero la compuerta REAL ya está sólida.
+CANARY_ALLOW_STRONG_GATE_REAL = True
+CANARY_STRONG_GATE_MIN_PROB = 0.85
+CANARY_STRONG_GATE_MIN_CONFIRM = 2
 TRAIN_ROWS_DROP_GUARD_RATIO = 0.35  # no reemplazar modelo si la muestra cae demasiado vs meta anterior
 TRAIN_ROWS_DROP_GUARD_MIN_PREV = 120  # activar guard solo si el modelo previo ya tenía muestra razonable
 FEATURE_MAX_DOMINANCE = 0.90  # Si una feature repite >90%, se considera casi constante
@@ -11776,10 +11780,35 @@ async def main():
                                 c_prog = int(meta_live.get("canary_closed_signals", 0) or 0)
                                 c_tgt = int(meta_live.get("canary_target_closed", 0) or 0)
                                 c_hit = float(meta_live.get("canary_hitrate", 0.0) or 0.0) * 100.0
-                                agregar_evento(
-                                    f"🟡 IA AUTO en CANARY: REAL bloqueado temporalmente ({c_prog}/{c_tgt}, hit={c_hit:.1f}%)."
-                                )
-                                candidatos = []
+                                canary_escape = False
+                                canary_escape_why = ""
+                                try:
+                                    dgate = dyn_gate if isinstance(dyn_gate, dict) else {}
+                                    p_best_d = float(dgate.get("p_best", 0.0) or 0.0)
+                                    c_streak_d = int(dgate.get("confirm_streak", 0) or 0)
+                                    trig_ok_d = bool(dgate.get("trigger_ok", False))
+                                    if bool(CANARY_ALLOW_STRONG_GATE_REAL) and bool(dgate.get("allow_real", False)):
+                                        if (
+                                            p_best_d >= float(CANARY_STRONG_GATE_MIN_PROB)
+                                            and c_streak_d >= int(CANARY_STRONG_GATE_MIN_CONFIRM)
+                                            and trig_ok_d
+                                        ):
+                                            canary_escape = True
+                                            canary_escape_why = (
+                                                f"p_best={p_best_d*100:.1f}% confirm={c_streak_d} trigger_ok=sí"
+                                            )
+                                except Exception:
+                                    canary_escape = False
+
+                                if canary_escape:
+                                    agregar_evento(
+                                        f"🟠 IA AUTO CANARY escape: se habilita REAL por compuerta fuerte ({canary_escape_why})."
+                                    )
+                                else:
+                                    agregar_evento(
+                                        f"🟡 IA AUTO en CANARY: REAL bloqueado temporalmente ({c_prog}/{c_tgt}, hit={c_hit:.1f}%)."
+                                    )
+                                    candidatos = []
                             elif not modelo_reliable:
                                 n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
                                 auc_live = float(meta_live.get("auc", 0.0) or 0.0)
