@@ -9191,6 +9191,57 @@ def mostrar_panel():
                   f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} canary={'sí' if canary_live else 'no'} n={n_samples_live} p_best={best_prob*100:.1f}% why={why_txt} | canary_prog={canary_prog_txt} hit={c_hit:.1f}% | "
                   f"ROOF mode={mode_h} confirm={confirm_h}/{confirm_need_h} trigger_ok={'sí' if trigger_ok_h else 'no'} gate_consumed={'sí' if clone_gate else 'no'}"
             )
+
+            # ===== HUD DIAGNÓSTICO RÁPIDO (solo visual, no cambia lógica) =====
+            roof_h = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
+            floor_h = float(DYN_ROOF_STATE.get("last_floor_eff", _umbral_real_operativo_actual()) or _umbral_real_operativo_actual())
+            obs_ok = bool(best_prob >= float(umbral_obs))
+            unrel_ok = bool(best_prob >= float(AUTO_REAL_UNRELIABLE_MIN_PROB))
+            roof_ok = bool(best_prob >= float(roof_h))
+            confirm_ok = bool(confirm_h >= confirm_need_h)
+            trig_ok = bool(trigger_ok_h)
+            rel_ok = bool(reliable)
+            can_ok = bool(canary_live)
+            classic_ok = bool(best_prob >= float(IA_ACTIVACION_REAL_THR))
+
+            p_model = float(best_prob)
+            p_oper = float(best_prob) if (confirm_ok and trig_ok and (rel_ok or can_ok or auto_adapt_ok)) else 0.0
+
+            funnel_checks = [
+                ("OBS70", obs_ok),
+                ("UNREL63", unrel_ok),
+                ("ROOF", roof_ok),
+                (f"CONF {confirm_h}/{confirm_need_h}", confirm_ok),
+                ("TRIG", trig_ok),
+                ("REL", rel_ok),
+                ("CAN", can_ok),
+                ("CLASS85", classic_ok),
+            ]
+            funnel_txt = " | ".join([f"{k}{'✅' if v else '❌'}" for k, v in funnel_checks])
+
+            bloqueos = [
+                ("UNREL63", unrel_ok, max(0.0, float(AUTO_REAL_UNRELIABLE_MIN_PROB) - best_prob), "%"),
+                ("ROOF", roof_ok, max(0.0, float(roof_h) - best_prob), "%"),
+                (f"CONF {confirm_h}/{confirm_need_h}", confirm_ok, float(max(0, confirm_need_h - confirm_h)), "ticks"),
+                ("TRIGGER", trig_ok, 0.0, ""),
+                ("RELIABLE", rel_ok, 0.0, ""),
+                ("CANARY", can_ok, 0.0, ""),
+                ("CLASS85", classic_ok, max(0.0, float(IA_ACTIVACION_REAL_THR) - best_prob), "%"),
+            ]
+            principal = next((b for b in bloqueos if not b[1]), None)
+            if principal is None:
+                principal_txt = "NONE"
+            else:
+                if principal[3] == "%":
+                    principal_txt = f"{principal[0]} (faltan {principal[2]*100:.1f} pts)"
+                elif principal[3] == "ticks":
+                    principal_txt = f"{principal[0]} (faltan {int(principal[2])})"
+                else:
+                    principal_txt = principal[0]
+
+            print(padding + Fore.CYAN + f"🧪 Embudo: {funnel_txt}")
+            print(padding + Fore.CYAN + f"🧭 Decisión tick: P_model={p_model*100:.1f}% | P_oper={p_oper*100:.1f}% | Bloqueo principal={principal_txt}")
+            print(padding + Fore.CYAN + f"📏 Umbrales activos: OBS={umbral_obs*100:.0f}% | UNREL={AUTO_REAL_UNRELIABLE_MIN_PROB*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | CLASSIC={IA_ACTIVACION_REAL_THR*100:.0f}%")
         except Exception:
             pass
 
