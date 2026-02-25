@@ -669,7 +669,10 @@ estado_bots = {
     }
     for bot in BOT_NAMES
 }
-IA90_stats = {bot: {"n": 0, "ok": 0, "pct": 0.0} for bot in BOT_NAMES}
+IA90_stats = {bot: {"n": 0, "ok": 0, "pct": 0.0, "pct_raw": 0.0, "pct_smooth": 50.0} for bot in BOT_NAMES}
+# Ventana corta para diagnosticar el bloqueo dominante del embudo en HUD.
+HUD_BLOQUEO_WINDOW = 120
+HUD_BLOQUEOS_RECIENTES = deque(maxlen=HUD_BLOQUEO_WINDOW)
 
 EVENTO_MAX_CHARS = 220
 
@@ -6061,7 +6064,7 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
         SNAPSHOT_FILAS[bot] = contar_filas_csv(bot)
         OCULTAR_HASTA_NUEVO[bot] = False  # Cambiado para no ocultar
         IA53_TRIGGERED[bot] = False
-        IA90_stats[bot] = {"n": 0, "ok": 0, "pct": 0.0}
+        IA90_stats[bot] = {"n": 0, "ok": 0, "pct": 0.0, "pct_raw": 0.0, "pct_smooth": 50.0}
         if not isinstance(huellas_usadas.get(bot), set):
             huellas_usadas[bot] = set()
     eventos_recentes.clear()
@@ -6122,7 +6125,7 @@ def reiniciar_bot(bot, borrar_csv=False):
     })
     SNAPSHOT_FILAS[bot] = contar_filas_csv(bot)
     OCULTAR_HASTA_NUEVO[bot] = False  # Cambiado para no ocultar
-    IA90_stats[bot] = {"n": 0, "ok": 0, "pct": 0.0}
+    IA90_stats[bot] = {"n": 0, "ok": 0, "pct": 0.0, "pct_raw": 0.0, "pct_smooth": 50.0}
     LAST_REAL_CLOSE_SIG[bot] = None
     if not isinstance(huellas_usadas.get(bot), set):
         huellas_usadas[bot] = set()
@@ -9239,9 +9242,23 @@ def mostrar_panel():
                 else:
                     principal_txt = principal[0]
 
+            # Histograma compacto del bloqueo dominante para ventana reciente.
+            try:
+                principal_key = "ALLOW" if principal is None else str(principal[0])
+                HUD_BLOQUEOS_RECIENTES.append(principal_key)
+                agg = {}
+                for k in HUD_BLOQUEOS_RECIENTES:
+                    agg[k] = int(agg.get(k, 0)) + 1
+                total_blk = max(1, len(HUD_BLOQUEOS_RECIENTES))
+                top_blk = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)[:3]
+                top_txt = " | ".join([f"{k}:{(v*100.0/total_blk):.0f}%" for k, v in top_blk])
+            except Exception:
+                top_txt = "--"
+
             print(padding + Fore.CYAN + f"🧪 Embudo: {funnel_txt}")
             print(padding + Fore.CYAN + f"🧭 Decisión tick: P_model={p_model*100:.1f}% | P_oper={p_oper*100:.1f}% | Bloqueo principal={principal_txt}")
             print(padding + Fore.CYAN + f"📏 Umbrales activos: OBS={umbral_obs*100:.0f}% | UNREL={AUTO_REAL_UNRELIABLE_MIN_PROB*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | CLASSIC={IA_ACTIVACION_REAL_THR*100:.0f}%")
+            print(padding + Fore.CYAN + f"📉 Bloqueo dominante ({len(HUD_BLOQUEOS_RECIENTES)} ticks): {top_txt}")
         except Exception:
             pass
 
@@ -9631,7 +9648,10 @@ def mostrar_panel():
         stats = IA90_stats.get(bot)
         if stats and stats.get("n", 0) > 0:
             has_hist = True
-            print(Fore.YELLOW + f"   {bot}: {stats['ok']}/{stats['n']} ({stats['pct']:.1f}%)")
+            okh = int(stats.get("ok", 0) or 0)
+            nh = int(stats.get("n", 0) or 0)
+            pct_raw_h = float((okh / nh) * 100.0) if nh > 0 else 0.0
+            print(Fore.YELLOW + f"   {bot}: {okh}/{nh} ({pct_raw_h:.1f}%)")
     if not has_hist:
         print(Fore.YELLOW + f"   (Aún no hay operaciones cerradas con señal IA ≥{IA_METRIC_THRESHOLD*100:.0f}%.)")
 
@@ -11087,10 +11107,17 @@ async def cargar_datos_bot(bot, token_actual):
                 n_ia90 = IA90_stats[bot]["n"]
                 ok_ia90 = IA90_stats[bot]["ok"]
                 if n_ia90 > 0:
+                    pct_raw = (ok_ia90 / n_ia90) * 100.0
                     pct_suav = (ok_ia90 + 1) / (n_ia90 + 2) * 100.0
-                    IA90_stats[bot]["pct"] = pct_suav
+                    IA90_stats[bot]["pct_raw"] = pct_raw
+                    IA90_stats[bot]["pct_smooth"] = pct_suav
+                    # En HUD principal usamos el porcentaje crudo para mantener
+                    # consistencia exacta con la fracción ok/n.
+                    IA90_stats[bot]["pct"] = pct_raw
                 else:
-                    IA90_stats[bot]["pct"] = 50.0
+                    IA90_stats[bot]["pct_raw"] = 0.0
+                    IA90_stats[bot]["pct_smooth"] = 50.0
+                    IA90_stats[bot]["pct"] = 0.0
 
                 # Cerramos señal pendiente SOLO aquí (en cierre)
                 estado_bots[bot]["ia_senal_pendiente"] = False
