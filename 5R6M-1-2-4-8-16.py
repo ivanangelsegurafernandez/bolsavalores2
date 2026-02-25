@@ -343,6 +343,12 @@ ultimo_bot_real = None
 # Guarda el orden de bots usados en la corrida activa para evitar repeticiones.
 bots_usados_en_esta_marti = []
 
+# Auditoría de secuencia martingala (C1..C{MAX_CICLOS}) para traza explícita.
+marti_audit_run_id = 1
+marti_audit_historial = deque(maxlen=80)
+marti_audit_desviaciones = 0
+marti_audit_ultimo_ciclo_ordenado = None
+
 # Nueva: Umbrales mínimos para historial IA
 MIN_IA_SENIALES_CONF = 10  # Mínimo señales cerradas para confiar en prob_hist
 MIN_AUC_CONF = 0.65        # AUC mínimo para audios/colores verdes
@@ -1751,6 +1757,9 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
     owner_after = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
     ok = owner_after == bot
     if ok:
+        _marti_audit_log_orden(ciclo, bot=bot, origen="escribir_orden_real")
+        if int(ciclo) == 1:
+            agregar_evento("🟢 MARTI-AUDIT: apertura explícita en C1 (nuevo ciclo confirmado).")
         _marcar_compuerta_real_consumida()
         DYN_ROOF_STATE["last_real_open_ts"] = float(time.time())
     return ok
@@ -6203,6 +6212,63 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     except Exception:
         pass
 
+def _marti_audit_record(kind: str, ciclo: int | None = None, bot: str | None = None, detalle: str = ""):
+    """Guarda rastro compacto de la secuencia C1..C{MAX_CICLOS} para diagnóstico."""
+    global marti_audit_historial
+    try:
+        c = int(ciclo) if ciclo is not None else None
+    except Exception:
+        c = None
+    run = int(globals().get("marti_audit_run_id", 1) or 1)
+    item = {
+        "ts": time.strftime("%H:%M:%S"),
+        "run": run,
+        "kind": str(kind),
+        "ciclo": c,
+        "bot": str(bot) if bot else None,
+        "detalle": str(detalle or ""),
+    }
+    try:
+        marti_audit_historial.append(item)
+    except Exception:
+        pass
+
+
+def _marti_audit_log_orden(ciclo: int, bot: str | None = None, origen: str = ""):
+    """
+    Verifica orden esperado C1->C6 por corrida y deja eventos explícitos.
+    No bloquea operación; solo audita y alerta desviaciones.
+    """
+    global marti_audit_run_id, marti_audit_desviaciones, marti_audit_ultimo_ciclo_ordenado
+    try:
+        c = max(1, min(int(MAX_CICLOS), int(ciclo)))
+    except Exception:
+        c = 1
+    last = marti_audit_ultimo_ciclo_ordenado
+    exp = 1 if last is None else (1 if int(last) >= int(MAX_CICLOS) else int(last) + 1)
+    if int(c) != int(exp):
+        marti_audit_desviaciones = int(marti_audit_desviaciones) + 1
+        agregar_evento(
+            f"🚨 MARTI-AUDIT run#{int(marti_audit_run_id)}: orden fuera de secuencia (esperado C{int(exp)}, llegó C{int(c)})."
+        )
+        _marti_audit_record("desvio", ciclo=c, bot=bot, detalle=f"esperado=C{exp} origen={origen}")
+    else:
+        _marti_audit_record("orden", ciclo=c, bot=bot, detalle=f"origen={origen}")
+    marti_audit_ultimo_ciclo_ordenado = int(c)
+
+
+def marti_audit_resumen_linea() -> str:
+    """Línea compacta para HUD/eventos con estado de auditoría."""
+    try:
+        run = int(marti_audit_run_id)
+        dv = int(marti_audit_desviaciones)
+        ult = marti_audit_ultimo_ciclo_ordenado
+        ult_txt = f"C{int(ult)}" if isinstance(ult, int) and ult > 0 else "--"
+        return f"Audit run#{run} desvíos={dv} último={ult_txt}"
+    except Exception:
+        return "Audit run#? desvíos=? último=--"
+
+
 def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_operado: int | None = None):
     """
     Actualiza el contador global de ciclos martingala para el HUD y la próxima
@@ -6213,6 +6279,7 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
     - PÉRDIDA: incrementa ciclo hasta MAX_CICLOS (tope de blindaje).
     """
     global marti_ciclos_perdidos, marti_paso, ultimo_bot_real, bots_usados_en_esta_marti
+    global marti_audit_run_id, marti_audit_ultimo_ciclo_ordenado
 
     res = normalizar_resultado(resultado)
     if bot in BOT_NAMES:
@@ -6222,6 +6289,10 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
         marti_ciclos_perdidos = 0
         marti_paso = 0
         bots_usados_en_esta_marti = []
+        _marti_audit_record("cierre_ganancia", ciclo=ciclo_operado, bot=bot, detalle="reinicio_a_C1")
+        marti_audit_run_id = int(marti_audit_run_id) + 1
+        marti_audit_ultimo_ciclo_ordenado = None
+        agregar_evento(f"✅ Martingala reiniciada en C1 por GANANCIA ({marti_audit_resumen_linea()}).")
     elif res == "PÉRDIDA":
         # Registrar el bot operado en la corrida activa para forzar rotación C2..C{MAX_CICLOS}.
         if bot in BOT_NAMES and bot not in bots_usados_en_esta_marti:
@@ -6243,8 +6314,13 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
             marti_ciclos_perdidos = 0
             marti_paso = 0
             bots_usados_en_esta_marti = []
+            _marti_audit_record("cierre_tope", ciclo=ciclo_operado, bot=bot, detalle=f"tope=C{int(MAX_CICLOS)}")
+            marti_audit_run_id = int(marti_audit_run_id) + 1
+            marti_audit_ultimo_ciclo_ordenado = None
             try:
-                agregar_evento(f"🧯 Martingala C{int(MAX_CICLOS)}/C{int(MAX_CICLOS)} completada: reinicio automático a ciclo 1.")
+                agregar_evento(
+                    f"🧯 Martingala C{int(MAX_CICLOS)}/C{int(MAX_CICLOS)} completada: reinicio automático a C1 ({marti_audit_resumen_linea()})."
+                )
             except Exception:
                 pass
         else:
@@ -6263,6 +6339,7 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
     agregar_evento(
         f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo={ciclo_sig}"
     )
+    agregar_evento(f"🧾 MARTI-AUDIT: {marti_audit_resumen_linea()}")
 
 def ciclo_martingala_siguiente() -> int:
     """
@@ -6305,6 +6382,7 @@ def reset_martingala_por_saldo(ciclo_objetivo: int, saldo_actual: float | None) 
     marti_ciclos_perdidos = 0
     marti_paso = 0
     bots_usados_en_esta_marti = []
+    _marti_audit_record("reset_saldo", ciclo=ciclo_objetivo, detalle="reinicio_forzado")
     falta_msg = "saldo no disponible"
     if saldo is not None:
         falta_msg = f"faltan {(monto_necesario - saldo):.2f} USD"
@@ -9138,7 +9216,10 @@ def mostrar_panel():
         sensores_planos = sum(1 for b in BOT_NAMES if bool(estado_bots.get(b, {}).get("ia_sensor_plano", False)))
         sensores_warmup = sum(1 for b in BOT_NAMES if bool(estado_bots.get(b, {}).get("ia_sensor_warmup", False)))
         n_min_real, n_req_real = _n_minimo_real_status()
-        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | OBS≥{umbral_obs*100:.1f}%: {bots_obs} | REAL≥{umbral_real_vigente*100:.1f}%: {bots_real} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} (warmup:{sensores_warmup}) | n_min_real: {n_min_real}/{n_req_real} | Token: {owner_txt}")
+        n_min_disp = min(int(n_min_real), int(n_req_real))
+        n_min_extra = max(0, int(n_min_real) - int(n_req_real))
+        n_min_txt = f"{n_min_disp}/{n_req_real}" + (f" (+{n_min_extra} acum)" if n_min_extra > 0 else "")
+        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | OBS≥{umbral_obs*100:.1f}%: {bots_obs} | REAL≥{umbral_real_vigente*100:.1f}%: {bots_real} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} (warmup:{sensores_warmup}) | n_min_real: {n_min_txt} | Token: {owner_txt}")
 
         try:
             meta_live = resolver_canary_estado(leer_model_meta() or {})
@@ -9153,6 +9234,9 @@ def mostrar_panel():
             mode_h = str(DYN_ROOF_STATE.get("last_gate_mode", "A") or "A")
             confirm_h = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
             confirm_need_h = int(DYN_ROOF_STATE.get("last_confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
+            confirm_disp_h = min(confirm_h, confirm_need_h)
+            confirm_extra_h = max(0, confirm_h - confirm_need_h)
+            confirm_txt_h = f"{confirm_disp_h}/{confirm_need_h}" + (f" (+{confirm_extra_h} acum)" if confirm_extra_h > 0 else "")
             trigger_ok_h = bool(DYN_ROOF_STATE.get("last_trigger_ok", False))
             clone_gate = bool(DYN_ROOF_STATE.get("gate_consumed", False))
             best_prob = float(mejor[1]) if isinstance(mejor, tuple) and len(mejor) >= 2 else 0.0
@@ -9182,7 +9266,7 @@ def mostrar_panel():
                 if best_prob < float(AUTO_REAL_UNRELIABLE_MIN_PROB):
                     why_reasons.append(f"p_best<{float(AUTO_REAL_UNRELIABLE_MIN_PROB)*100:.1f}%")
             if confirm_h < confirm_need_h:
-                why_reasons.append(f"confirm_pending({confirm_h}/{confirm_need_h})")
+                why_reasons.append(f"confirm_pending({confirm_txt_h})")
             if not trigger_ok_h:
                 why_reasons.append("trigger_no")
             why_txt = "none" if not why_reasons else ",".join(why_reasons)
@@ -9192,7 +9276,7 @@ def mostrar_panel():
                 + Fore.YELLOW
                 + f"🧩 WHY-NO: CAP≈{cap_now*100:.1f}% (warmup={'sí' if warmup_live else 'no'}) | "
                   f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} canary={'sí' if canary_live else 'no'} n={n_samples_live} p_best={best_prob*100:.1f}% why={why_txt} | canary_prog={canary_prog_txt} hit={c_hit:.1f}% | "
-                  f"ROOF mode={mode_h} confirm={confirm_h}/{confirm_need_h} trigger_ok={'sí' if trigger_ok_h else 'no'} gate_consumed={'sí' if clone_gate else 'no'}"
+                  f"ROOF mode={mode_h} confirm={confirm_txt_h} trigger_ok={'sí' if trigger_ok_h else 'no'} gate_consumed={'sí' if clone_gate else 'no'}"
             )
 
             # ===== HUD DIAGNÓSTICO RÁPIDO (solo visual, no cambia lógica) =====
@@ -9214,7 +9298,7 @@ def mostrar_panel():
                 ("OBS70", obs_ok),
                 ("UNREL63", unrel_ok),
                 ("ROOF", roof_ok),
-                (f"CONF {confirm_h}/{confirm_need_h}", confirm_ok),
+                (f"CONF {confirm_txt_h}", confirm_ok),
                 ("TRIG", trig_ok),
                 ("REL", rel_ok),
                 ("CAN", can_ok),
@@ -9225,7 +9309,7 @@ def mostrar_panel():
             bloqueos = [
                 ("UNREL63", unrel_ok, max(0.0, float(AUTO_REAL_UNRELIABLE_MIN_PROB) - best_prob), "%"),
                 ("ROOF", roof_ok, max(0.0, float(roof_h) - best_prob), "%"),
-                (f"CONF {confirm_h}/{confirm_need_h}", confirm_ok, float(max(0, confirm_need_h - confirm_h)), "ticks"),
+                (f"CONF {confirm_txt_h}", confirm_ok, float(max(0, confirm_need_h - confirm_h)), "ticks"),
                 ("TRIGGER", trig_ok, 0.0, ""),
                 ("RELIABLE", rel_ok, 0.0, ""),
                 ("CANARY", can_ok, 0.0, ""),
@@ -9256,9 +9340,14 @@ def mostrar_panel():
                 top_txt = "--"
 
             print(padding + Fore.CYAN + f"🧪 Embudo: {funnel_txt}")
+            if owner in BOT_NAMES:
+                principal_txt = f"{principal_txt} (solo nuevas entradas; REAL activo={owner})"
             print(padding + Fore.CYAN + f"🧭 Decisión tick: P_model={p_model*100:.1f}% | P_oper={p_oper*100:.1f}% | Bloqueo principal={principal_txt}")
             print(padding + Fore.CYAN + f"📏 Umbrales activos: OBS={umbral_obs*100:.0f}% | UNREL={AUTO_REAL_UNRELIABLE_MIN_PROB*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | CLASSIC={IA_ACTIVACION_REAL_THR*100:.0f}%")
             print(padding + Fore.CYAN + f"📉 Bloqueo dominante ({len(HUD_BLOQUEOS_RECIENTES)} ticks): {top_txt}")
+            ref_racha = ultimo_bot_real if ultimo_bot_real in BOT_NAMES else "--"
+            elegido_tick = mejor[0] if isinstance(mejor, tuple) and len(mejor) >= 1 else "--"
+            print(padding + Fore.CYAN + f"🧾 Contexto racha: ref={ref_racha} | elegido_tick={elegido_tick} | token_real={owner_txt}")
         except Exception:
             pass
 
@@ -9684,12 +9773,18 @@ def mostrar_panel():
             crowd_h = int(DYN_ROOF_STATE.get("crowd_count", 0) or 0)
             n_min_real, n_req_real = _n_minimo_real_status()
             bloqueado_txt = "bloqueado" if n_min_real < n_req_real else "ok"
+            cst_disp_h = min(cst_h, confirm_need_h)
+            cst_extra_h = max(0, cst_h - confirm_need_h)
+            cst_txt_h = f"{cst_disp_h}/{confirm_need_h}" + (f" (+{cst_extra_h} acum)" if cst_extra_h > 0 else "")
+            n_disp_h = min(int(n_min_real), int(n_req_real))
+            n_extra_h = max(0, int(n_min_real) - int(n_req_real))
+            n_txt_h = f"{n_disp_h}/{n_req_real}" + (f" (+{n_extra_h} acum)" if n_extra_h > 0 else "")
             print(
                 Fore.YELLOW
                 + f" Compuerta REAL (operativa): mode={mode_h} | roof={roof_h*100:.1f}% | floor={floor_eff_h*100:.1f}% | "
-                  f"confirm={cst_h}/{confirm_need_h}" + (f" ({cbot_h})" if cbot_h else "")
+                  f"confirm={cst_txt_h}" + (f" ({cbot_h})" if cbot_h else "")
                   + f" | trigger_ok={'sí' if trigger_ok_h else 'no'} | crowd={crowd_h}"
-                  + f" | n_min_real={n_min_real}/{n_req_real} ({bloqueado_txt})"
+                  + f" | n_min_real={n_txt_h} ({bloqueado_txt})"
             )
         except Exception:
             pass
@@ -9969,7 +10064,12 @@ def dibujar_hud_gatewin(panel_height=8, layout=None):
     if activo_real:
         cyc = estado_bots[activo_real].get("ciclo_actual", 1)
         hud_lines.insert(-1, f"│ Bot REAL: {activo_real} · Ciclo {cyc}/{MAX_CICLOS}".ljust(HUD_INNER_WIDTH) + " │")
-    hud_lines.insert(-1, f"│ Martingala: {marti_ciclos_perdidos}/{MAX_CICLOS} pérdidas seguidas · Próx C{ciclo_martingala_siguiente()}".ljust(HUD_INNER_WIDTH) + " │")
+    prox_ciclo = ciclo_martingala_siguiente()
+    prox_txt = f"C{prox_ciclo}"
+    if int(prox_ciclo) == 1:
+        prox_txt = "C1 (reinicio)"
+    hud_lines.insert(-1, f"│ Martingala: {marti_ciclos_perdidos}/{MAX_CICLOS} pérdidas seguidas · Próx {prox_txt}".ljust(HUD_INNER_WIDTH) + " │")
+    hud_lines.insert(-1, f"│ {marti_audit_resumen_linea():<{HUD_INNER_WIDTH}}│")
     # HUD muestra ciclo actual/siguiente de martingala; sin bloqueo duro de anti-repetición.
     hud_lines.append("└" + "─" * HUD_INNER_WIDTH + "┘")
     layout = (layout or HUD_LAYOUT).lower()
