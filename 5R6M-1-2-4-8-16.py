@@ -252,6 +252,14 @@ GATE_SEGMENTO_MIN_MUESTRA = 35
 GATE_SEGMENTO_MIN_WR = 0.50
 GATE_SEGMENTO_LOOKBACK = 240
 
+# Candados inteligentes: evita bloqueos rígidos en empates/planicies cuando ya
+# hay evidencia real robusta de un bot claramente apto.
+SMART_LOCKS_ENABLE = True
+SMART_CLONE_OVERRIDE_MIN_N = 120
+SMART_CLONE_OVERRIDE_MIN_LB = 0.58
+SMART_CLONE_OVERRIDE_MIN_PROB = 0.78
+SMART_CLONE_OVERRIDE_MIN_GAP = 0.002
+
 # Embudo IA en 2 capas: A=régimen (tradeable), B=prob fina (modelo)
 REGIME_GATE_MIN_SCORE = 0.52          # mínimo score de régimen para considerar señal
 REGIME_GATE_WEIGHT_PROB = 0.70        # peso de la prob del modelo en ranking final
@@ -10744,6 +10752,41 @@ def _n_minimo_real_status() -> tuple[int, int]:
         return 0, int(IA_ACTIVACION_REAL_MIN_N_POR_BOT)
 
 
+def _smart_clone_override_ok(best_bot: str, p_best: float, p_second: float, clone_flat: bool) -> bool:
+    """
+    Permite destrabar el candado clone_flat SOLO cuando hay evidencia real fuerte.
+
+    Objetivo:
+    - Evitar falsos bloqueos por planicie de probabilidades en ticks donde
+      el mejor bot realmente ya demostró edge consistente.
+    - Mantener conservadurismo: exige N, límite inferior (LB), prob alta y
+      micro-GAP positivo frente al segundo.
+    """
+    try:
+        if not bool(SMART_LOCKS_ENABLE):
+            return False
+        if not bool(clone_flat):
+            return False
+        if not best_bot:
+            return False
+
+        ev = _evidencia_bot_umbral_objetivo(best_bot)
+        ev_n = int(ev.get("n", 0) or 0)
+        ev_lb = float(ev.get("lb", 0.0) or 0.0)
+        p1 = float(p_best or 0.0)
+        p2 = float(p_second or 0.0)
+        gap = float(p1 - p2)
+
+        return bool(
+            (ev_n >= int(SMART_CLONE_OVERRIDE_MIN_N))
+            and (ev_lb >= float(SMART_CLONE_OVERRIDE_MIN_LB))
+            and (p1 >= float(SMART_CLONE_OVERRIDE_MIN_PROB))
+            and (gap >= float(SMART_CLONE_OVERRIDE_MIN_GAP))
+        )
+    except Exception:
+        return False
+
+
 def _actualizar_compuerta_techo_dinamico() -> dict:
     """
     Actualiza el techo dinámico y evalúa la compuerta REAL del mejor bot del tick.
@@ -10897,8 +10940,11 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
                 or ((float(p_best) - float(p_second)) < float(PROB_CLONE_GAP_MIN))
             )
         )
+        smart_clone_override = _smart_clone_override_ok(best_bot, p_best, p_second, clone_flat)
         if clone_flat:
             gap_ok = False
+        if smart_clone_override:
+            gap_ok = True
 
         mode_c_active = bool(mode_c_candidate and float(p_best) < float(floor_now))
         gate_mode = "C" if mode_c_active else ("B" if modo_relajado_n15 else "A")
@@ -11035,6 +11081,7 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             "floor_eff": float(floor_eff),
             "confirm_need": int(confirm_need),
             "clone_flat": bool(clone_flat),
+            "smart_clone_override": bool(smart_clone_override),
             "spread_std": float(spread_std),
         })
         return out
