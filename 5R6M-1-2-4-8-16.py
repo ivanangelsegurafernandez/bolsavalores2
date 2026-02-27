@@ -231,6 +231,12 @@ AUTO_REAL_UNRELIABLE_MIN_N = 80
 AUTO_REAL_UNRELIABLE_MIN_PROB = 0.63  # más permisivo en reliable=false (sube activación y riesgo de falsos positivos)
 AUTO_REAL_UNRELIABLE_MIN_AUC = 0.50   # si AUC cae bajo azar, no habilitar AUTO aunque post-n15
 AUTO_REAL_BLOCK_WHEN_WARMUP = True    # durante warmup evita promoción AUTO en modo unreliable
+# Ajuste mínimo anti-congelamiento lateral: permite bajar el umbral UNREL
+# solo cuando hay evidencia operativa consistente por bot.
+AUTO_REAL_UNREL_LATERAL_ADAPT_ENABLE = True
+AUTO_REAL_UNREL_LATERAL_MIN_N = 70
+AUTO_REAL_UNREL_LATERAL_MIN_WR = 0.56
+AUTO_REAL_UNREL_LATERAL_MIN_PROB = 0.58
 # Bypass controlado: si la compuerta REAL ya está sólida en vivo, permitir AUTO
 # aunque el modelo siga en warmup/reliable=false.
 AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE = True
@@ -251,6 +257,14 @@ GATE_SEGMENTO_ENABLED = True
 GATE_SEGMENTO_MIN_MUESTRA = 35
 GATE_SEGMENTO_MIN_WR = 0.50
 GATE_SEGMENTO_LOOKBACK = 240
+
+# Candados inteligentes: evita bloqueos rígidos en empates/planicies cuando ya
+# hay evidencia real robusta de un bot claramente apto.
+SMART_LOCKS_ENABLE = True
+SMART_CLONE_OVERRIDE_MIN_N = 120
+SMART_CLONE_OVERRIDE_MIN_LB = 0.58
+SMART_CLONE_OVERRIDE_MIN_PROB = 0.78
+SMART_CLONE_OVERRIDE_MIN_GAP = 0.002
 
 # Embudo IA en 2 capas: A=régimen (tradeable), B=prob fina (modelo)
 REGIME_GATE_MIN_SCORE = 0.52          # mínimo score de régimen para considerar señal
@@ -9240,11 +9254,12 @@ def mostrar_panel():
             trigger_ok_h = bool(DYN_ROOF_STATE.get("last_trigger_ok", False))
             clone_gate = bool(DYN_ROOF_STATE.get("gate_consumed", False))
             best_prob = float(mejor[1]) if isinstance(mejor, tuple) and len(mejor) >= 2 else 0.0
+            unrel_thr_live = float(_umbral_unrel_operativo(mejor[0] if isinstance(mejor, tuple) else None, best_prob))
             auto_adapt_ok = bool(
                 AUTO_REAL_ALLOW_UNRELIABLE_POST_N15
                 and post_n15
                 and (n_samples_live >= int(AUTO_REAL_UNRELIABLE_MIN_N))
-                and (best_prob >= float(AUTO_REAL_UNRELIABLE_MIN_PROB))
+                and (best_prob >= float(unrel_thr_live))
             )
             auto_state = "OK" if reliable else ("ADAPT" if auto_adapt_ok else "BLOCK")
 
@@ -9263,8 +9278,8 @@ def mostrar_panel():
                     why_reasons.append("n15_pending")
                 if n_samples_live < int(AUTO_REAL_UNRELIABLE_MIN_N):
                     why_reasons.append(f"n<{int(AUTO_REAL_UNRELIABLE_MIN_N)}")
-                if best_prob < float(AUTO_REAL_UNRELIABLE_MIN_PROB):
-                    why_reasons.append(f"p_best<{float(AUTO_REAL_UNRELIABLE_MIN_PROB)*100:.1f}%")
+                if best_prob < float(unrel_thr_live):
+                    why_reasons.append(f"p_best<{float(unrel_thr_live)*100:.1f}%")
             if confirm_h < confirm_need_h:
                 why_reasons.append(f"confirm_pending({confirm_txt_h})")
             if not trigger_ok_h:
@@ -9283,7 +9298,7 @@ def mostrar_panel():
             roof_h = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
             floor_h = float(DYN_ROOF_STATE.get("last_floor_eff", _umbral_real_operativo_actual()) or _umbral_real_operativo_actual())
             obs_ok = bool(best_prob >= float(umbral_obs))
-            unrel_ok = bool(best_prob >= float(AUTO_REAL_UNRELIABLE_MIN_PROB))
+            unrel_ok = bool(best_prob >= float(unrel_thr_live))
             roof_ok = bool(best_prob >= float(roof_h))
             confirm_ok = bool(confirm_h >= confirm_need_h)
             trig_ok = bool(trigger_ok_h)
@@ -9296,7 +9311,7 @@ def mostrar_panel():
 
             funnel_checks = [
                 ("OBS70", obs_ok),
-                ("UNREL63", unrel_ok),
+                (f"UNREL{int(round(unrel_thr_live*100))}", unrel_ok),
                 ("ROOF", roof_ok),
                 (f"CONF {confirm_txt_h}", confirm_ok),
                 ("TRIG", trig_ok),
@@ -9307,7 +9322,7 @@ def mostrar_panel():
             funnel_txt = " | ".join([f"{k}{'✅' if v else '❌'}" for k, v in funnel_checks])
 
             bloqueos = [
-                ("UNREL63", unrel_ok, max(0.0, float(AUTO_REAL_UNRELIABLE_MIN_PROB) - best_prob), "%"),
+                (f"UNREL{int(round(unrel_thr_live*100))}", unrel_ok, max(0.0, float(unrel_thr_live) - best_prob), "%"),
                 ("ROOF", roof_ok, max(0.0, float(roof_h) - best_prob), "%"),
                 (f"CONF {confirm_txt_h}", confirm_ok, float(max(0, confirm_need_h - confirm_h)), "ticks"),
                 ("TRIGGER", trig_ok, 0.0, ""),
@@ -9343,7 +9358,7 @@ def mostrar_panel():
             if owner in BOT_NAMES:
                 principal_txt = f"{principal_txt} (solo nuevas entradas; REAL activo={owner})"
             print(padding + Fore.CYAN + f"🧭 Decisión tick: P_model={p_model*100:.1f}% | P_oper={p_oper*100:.1f}% | Bloqueo principal={principal_txt}")
-            print(padding + Fore.CYAN + f"📏 Umbrales activos: OBS={umbral_obs*100:.0f}% | UNREL={AUTO_REAL_UNRELIABLE_MIN_PROB*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | CLASSIC={IA_ACTIVACION_REAL_THR*100:.0f}%")
+            print(padding + Fore.CYAN + f"📏 Umbrales activos: OBS={umbral_obs*100:.0f}% | UNREL={unrel_thr_live*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | CLASSIC={IA_ACTIVACION_REAL_THR*100:.0f}%")
             print(padding + Fore.CYAN + f"📉 Bloqueo dominante ({len(HUD_BLOQUEOS_RECIENTES)} ticks): {top_txt}")
             ref_racha = ultimo_bot_real if ultimo_bot_real in BOT_NAMES else "--"
             elegido_tick = mejor[0] if isinstance(mejor, tuple) and len(mejor) >= 1 else "--"
@@ -10241,6 +10256,7 @@ def evaluar_semaforo():
 
 # NUEVAS FUNCIONES PARA RESET
 RESET_ON_START = False  # Cambiado a False para mantener historial entre sesiones
+AUTO_REPAIR_ON_START = True  # Repara estructura de CSVs al iniciar sin borrar historial completo
 
 def _csv_header_bot():
     return [
@@ -10291,6 +10307,66 @@ def limpieza_dura():
     resetear_incremental_y_modelos(borrar_modelos=True)
     resetear_estado_hud(estado_bots)
     print("🧨 Limpieza dura ejecutada. Ok.")
+
+def _asegurar_estructura_datos_inicio() -> list[str]:
+    """
+    Verifica y corrige desalineaciones comunes al arranque sin borrar histórico completo.
+
+    Objetivo:
+    - Evitar que una estructura vieja/mixta deje al bot en estado incoherente al iniciar.
+    - Reparar incremental mutante usando el flujo existente.
+    - Reencuadrar CSVs enriquecidos de bots al header canónico cuando detecta desvíos.
+    """
+    msgs = []
+
+    # 1) Incremental: usa el reparador robusto ya existente (no-op si está sano).
+    try:
+        if reparar_dataset_incremental_mutante(ruta="dataset_incremental.csv", cols=_canonical_incremental_cols()):
+            msgs.append("🧹 Inicio seguro: dataset_incremental reparado automáticamente.")
+    except Exception as e:
+        msgs.append(f"⚠️ Inicio seguro: no se pudo validar/reparar dataset_incremental ({e}).")
+
+    # 2) CSVs enriquecidos por bot: si falta/rompe header, se recrea SOLO header canónico.
+    header_ref = _csv_header_bot()
+    required = {"resultado", "trade_status", "epoch", "monto"}
+    for bot in BOT_NAMES:
+        ruta = f"registro_enriquecido_{bot}.csv"
+        if not os.path.exists(ruta):
+            continue
+        try:
+            header = None
+            for enc in ("utf-8", "latin-1", "windows-1252"):
+                try:
+                    with open(ruta, "r", encoding=enc, errors="replace") as f:
+                        first = f.readline().strip()
+                    header = [c.strip() for c in first.split(",")] if first else []
+                    break
+                except Exception:
+                    continue
+
+            header_set = set(header or [])
+            malformed = (not header) or (not required.issubset(header_set))
+
+            # También tratar como incompatible si trae una sola columna "mutante" gigante.
+            if (not malformed) and len(header) <= 2:
+                malformed = True
+
+            if malformed:
+                bak = f"{ruta}.bak_startfix_{int(time.time())}"
+                try:
+                    shutil.copy2(ruta, bak)
+                except Exception:
+                    bak = None
+                with open(ruta, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(header_ref)
+                if bak:
+                    msgs.append(f"🧹 Inicio seguro: {bot} tenía estructura inválida; reiniciado header (backup: {os.path.basename(bak)}).")
+                else:
+                    msgs.append(f"🧹 Inicio seguro: {bot} tenía estructura inválida; reiniciado header.")
+        except Exception as e:
+            msgs.append(f"⚠️ Inicio seguro: no se pudo validar {bot} ({e}).")
+
+    return msgs
 
 # Backfill seguro
 def backfill_incremental(ultimas=500):
@@ -10683,6 +10759,71 @@ def _n_minimo_real_status() -> tuple[int, int]:
         return 0, int(IA_ACTIVACION_REAL_MIN_N_POR_BOT)
 
 
+def _smart_clone_override_ok(best_bot: str, p_best: float, p_second: float, clone_flat: bool) -> bool:
+    """
+    Permite destrabar el candado clone_flat SOLO cuando hay evidencia real fuerte.
+
+    Objetivo:
+    - Evitar falsos bloqueos por planicie de probabilidades en ticks donde
+      el mejor bot realmente ya demostró edge consistente.
+    - Mantener conservadurismo: exige N, límite inferior (LB), prob alta y
+      micro-GAP positivo frente al segundo.
+    """
+    try:
+        if not bool(SMART_LOCKS_ENABLE):
+            return False
+        if not bool(clone_flat):
+            return False
+        if not best_bot:
+            return False
+
+        ev = _evidencia_bot_umbral_objetivo(best_bot)
+        ev_n = int(ev.get("n", 0) or 0)
+        ev_lb = float(ev.get("lb", 0.0) or 0.0)
+        p1 = float(p_best or 0.0)
+        p2 = float(p_second or 0.0)
+        gap = float(p1 - p2)
+
+        return bool(
+            (ev_n >= int(SMART_CLONE_OVERRIDE_MIN_N))
+            and (ev_lb >= float(SMART_CLONE_OVERRIDE_MIN_LB))
+            and (p1 >= float(SMART_CLONE_OVERRIDE_MIN_PROB))
+            and (gap >= float(SMART_CLONE_OVERRIDE_MIN_GAP))
+        )
+    except Exception:
+        return False
+
+
+def _umbral_unrel_operativo(best_bot: str | None, best_prob: float | None = None) -> float:
+    """
+    Umbral UNREL dinámico (mínimo ajuste):
+    - Base: AUTO_REAL_UNRELIABLE_MIN_PROB (63%)
+    - En lateral con evidencia suficiente por bot, puede bajar hasta un piso seguro.
+    """
+    try:
+        base = float(AUTO_REAL_UNRELIABLE_MIN_PROB)
+        if not bool(AUTO_REAL_UNREL_LATERAL_ADAPT_ENABLE):
+            return base
+        if not isinstance(best_bot, str) or (best_bot not in BOT_NAMES):
+            return base
+
+        st = estado_bots.get(best_bot, {}) if isinstance(estado_bots, dict) else {}
+        n_bot = int(st.get("tamano_muestra", 0) or 0)
+        wr_bot = float((st.get("porcentaje_exito", 0.0) or 0.0) / 100.0)
+        p_best = float(best_prob or 0.0)
+
+        lateral_ok = bool(
+            (n_bot >= int(AUTO_REAL_UNREL_LATERAL_MIN_N))
+            and (wr_bot >= float(AUTO_REAL_UNREL_LATERAL_MIN_WR))
+            and (p_best >= float(AUTO_REAL_UNREL_LATERAL_MIN_PROB))
+        )
+        if lateral_ok:
+            return float(max(float(AUTO_REAL_UNREL_LATERAL_MIN_PROB), min(base, p_best)))
+        return base
+    except Exception:
+        return float(AUTO_REAL_UNRELIABLE_MIN_PROB)
+
+
 def _actualizar_compuerta_techo_dinamico() -> dict:
     """
     Actualiza el techo dinámico y evalúa la compuerta REAL del mejor bot del tick.
@@ -10836,8 +10977,11 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
                 or ((float(p_best) - float(p_second)) < float(PROB_CLONE_GAP_MIN))
             )
         )
+        smart_clone_override = _smart_clone_override_ok(best_bot, p_best, p_second, clone_flat)
         if clone_flat:
             gap_ok = False
+        if smart_clone_override:
+            gap_ok = True
 
         mode_c_active = bool(mode_c_candidate and float(p_best) < float(floor_now))
         gate_mode = "C" if mode_c_active else ("B" if modo_relajado_n15 else "A")
@@ -10974,6 +11118,7 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             "floor_eff": float(floor_eff),
             "confirm_need": int(confirm_need),
             "clone_flat": bool(clone_flat),
+            "smart_clone_override": bool(smart_clone_override),
             "spread_std": float(spread_std),
         })
         return out
@@ -11577,6 +11722,13 @@ async def main():
             resetear_incremental_y_modelos(borrar_modelos=True)
             resetear_estado_hud(estado_bots)
             print("🧼 Sesión limpia: CSVs de bots, dataset incremental y estado HUD reiniciados.")
+        elif AUTO_REPAIR_ON_START:
+            for _msg in _asegurar_estructura_datos_inicio():
+                print(_msg)
+                try:
+                    agregar_evento(_msg)
+                except Exception:
+                    pass
         reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True)
         loop = asyncio.get_running_loop()
         set_main_loop(loop)
@@ -12029,6 +12181,12 @@ async def main():
                                 warmup_live = bool(meta_live.get("warmup_mode", n_samples_live < int(TRAIN_WARMUP_MIN_ROWS)))
                                 post_n15 = bool(_todos_bots_con_n_minimo_real())
                                 best_prob = max((float(x[2]) for x in candidatos), default=0.0)
+                                best_bot_local = None
+                                try:
+                                    best_bot_local = max(candidatos, key=lambda x: float(x[2]))[1] if candidatos else None
+                                except Exception:
+                                    best_bot_local = None
+                                unrel_thr_live = float(_umbral_unrel_operativo(best_bot_local, best_prob))
                                 gate_strong_unrel = False
                                 try:
                                     dgate = dyn_gate if isinstance(dyn_gate, dict) else {}
@@ -12044,7 +12202,7 @@ async def main():
                                     AUTO_REAL_ALLOW_UNRELIABLE_POST_N15
                                     and post_n15
                                     and (n_samples_live >= int(AUTO_REAL_UNRELIABLE_MIN_N))
-                                    and (best_prob >= float(AUTO_REAL_UNRELIABLE_MIN_PROB))
+                                    and (best_prob >= float(unrel_thr_live))
                                     and (auc_live >= float(AUTO_REAL_UNRELIABLE_MIN_AUC))
                                     and ((not (bool(AUTO_REAL_BLOCK_WHEN_WARMUP) and warmup_live)) or bool(gate_strong_unrel))
                                 )
@@ -12063,8 +12221,8 @@ async def main():
                                     why_nr = []
                                     if n_samples_live < int(AUTO_REAL_UNRELIABLE_MIN_N):
                                         why_nr.append(f"n<{int(AUTO_REAL_UNRELIABLE_MIN_N)}")
-                                    if best_prob < float(AUTO_REAL_UNRELIABLE_MIN_PROB):
-                                        why_nr.append(f"p_best<{AUTO_REAL_UNRELIABLE_MIN_PROB*100:.0f}%")
+                                    if best_prob < float(unrel_thr_live):
+                                        why_nr.append(f"p_best<{unrel_thr_live*100:.0f}%")
                                     if auc_live < float(AUTO_REAL_UNRELIABLE_MIN_AUC):
                                         why_nr.append(f"auc<{AUTO_REAL_UNRELIABLE_MIN_AUC:.2f}")
                                     if bool(AUTO_REAL_BLOCK_WHEN_WARMUP) and warmup_live:
