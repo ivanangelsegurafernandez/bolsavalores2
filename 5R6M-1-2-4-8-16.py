@@ -10241,6 +10241,7 @@ def evaluar_semaforo():
 
 # NUEVAS FUNCIONES PARA RESET
 RESET_ON_START = False  # Cambiado a False para mantener historial entre sesiones
+AUTO_REPAIR_ON_START = True  # Repara estructura de CSVs al iniciar sin borrar historial completo
 
 def _csv_header_bot():
     return [
@@ -10291,6 +10292,66 @@ def limpieza_dura():
     resetear_incremental_y_modelos(borrar_modelos=True)
     resetear_estado_hud(estado_bots)
     print("🧨 Limpieza dura ejecutada. Ok.")
+
+def _asegurar_estructura_datos_inicio() -> list[str]:
+    """
+    Verifica y corrige desalineaciones comunes al arranque sin borrar histórico completo.
+
+    Objetivo:
+    - Evitar que una estructura vieja/mixta deje al bot en estado incoherente al iniciar.
+    - Reparar incremental mutante usando el flujo existente.
+    - Reencuadrar CSVs enriquecidos de bots al header canónico cuando detecta desvíos.
+    """
+    msgs = []
+
+    # 1) Incremental: usa el reparador robusto ya existente (no-op si está sano).
+    try:
+        if reparar_dataset_incremental_mutante(ruta="dataset_incremental.csv", cols=_canonical_incremental_cols()):
+            msgs.append("🧹 Inicio seguro: dataset_incremental reparado automáticamente.")
+    except Exception as e:
+        msgs.append(f"⚠️ Inicio seguro: no se pudo validar/reparar dataset_incremental ({e}).")
+
+    # 2) CSVs enriquecidos por bot: si falta/rompe header, se recrea SOLO header canónico.
+    header_ref = _csv_header_bot()
+    required = {"resultado", "trade_status", "epoch", "monto"}
+    for bot in BOT_NAMES:
+        ruta = f"registro_enriquecido_{bot}.csv"
+        if not os.path.exists(ruta):
+            continue
+        try:
+            header = None
+            for enc in ("utf-8", "latin-1", "windows-1252"):
+                try:
+                    with open(ruta, "r", encoding=enc, errors="replace") as f:
+                        first = f.readline().strip()
+                    header = [c.strip() for c in first.split(",")] if first else []
+                    break
+                except Exception:
+                    continue
+
+            header_set = set(header or [])
+            malformed = (not header) or (not required.issubset(header_set))
+
+            # También tratar como incompatible si trae una sola columna "mutante" gigante.
+            if (not malformed) and len(header) <= 2:
+                malformed = True
+
+            if malformed:
+                bak = f"{ruta}.bak_startfix_{int(time.time())}"
+                try:
+                    shutil.copy2(ruta, bak)
+                except Exception:
+                    bak = None
+                with open(ruta, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(header_ref)
+                if bak:
+                    msgs.append(f"🧹 Inicio seguro: {bot} tenía estructura inválida; reiniciado header (backup: {os.path.basename(bak)}).")
+                else:
+                    msgs.append(f"🧹 Inicio seguro: {bot} tenía estructura inválida; reiniciado header.")
+        except Exception as e:
+            msgs.append(f"⚠️ Inicio seguro: no se pudo validar {bot} ({e}).")
+
+    return msgs
 
 # Backfill seguro
 def backfill_incremental(ultimas=500):
@@ -11577,6 +11638,13 @@ async def main():
             resetear_incremental_y_modelos(borrar_modelos=True)
             resetear_estado_hud(estado_bots)
             print("🧼 Sesión limpia: CSVs de bots, dataset incremental y estado HUD reiniciados.")
+        elif AUTO_REPAIR_ON_START:
+            for _msg in _asegurar_estructura_datos_inicio():
+                print(_msg)
+                try:
+                    agregar_evento(_msg)
+                except Exception:
+                    pass
         reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True)
         loop = asyncio.get_running_loop()
         set_main_loop(loop)
