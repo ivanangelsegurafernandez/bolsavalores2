@@ -252,6 +252,14 @@ GATE_SEGMENTO_MIN_MUESTRA = 35
 GATE_SEGMENTO_MIN_WR = 0.50
 GATE_SEGMENTO_LOOKBACK = 240
 
+# Candados inteligentes: evita bloqueos rígidos en empates/planicies cuando ya
+# hay evidencia real robusta de un bot claramente apto.
+SMART_LOCKS_ENABLE = True
+SMART_CLONE_OVERRIDE_MIN_N = 120
+SMART_CLONE_OVERRIDE_MIN_LB = 0.58
+SMART_CLONE_OVERRIDE_MIN_PROB = 0.78
+SMART_CLONE_OVERRIDE_MIN_GAP = 0.002
+
 # Embudo IA en 2 capas: A=régimen (tradeable), B=prob fina (modelo)
 REGIME_GATE_MIN_SCORE = 0.52          # mínimo score de régimen para considerar señal
 REGIME_GATE_WEIGHT_PROB = 0.70        # peso de la prob del modelo en ranking final
@@ -10241,6 +10249,7 @@ def evaluar_semaforo():
 
 # NUEVAS FUNCIONES PARA RESET
 RESET_ON_START = False  # Cambiado a False para mantener historial entre sesiones
+AUTO_REPAIR_ON_START = True  # Repara estructura de CSVs al iniciar sin borrar historial completo
 
 def _csv_header_bot():
     return [
@@ -10291,6 +10300,66 @@ def limpieza_dura():
     resetear_incremental_y_modelos(borrar_modelos=True)
     resetear_estado_hud(estado_bots)
     print("🧨 Limpieza dura ejecutada. Ok.")
+
+def _asegurar_estructura_datos_inicio() -> list[str]:
+    """
+    Verifica y corrige desalineaciones comunes al arranque sin borrar histórico completo.
+
+    Objetivo:
+    - Evitar que una estructura vieja/mixta deje al bot en estado incoherente al iniciar.
+    - Reparar incremental mutante usando el flujo existente.
+    - Reencuadrar CSVs enriquecidos de bots al header canónico cuando detecta desvíos.
+    """
+    msgs = []
+
+    # 1) Incremental: usa el reparador robusto ya existente (no-op si está sano).
+    try:
+        if reparar_dataset_incremental_mutante(ruta="dataset_incremental.csv", cols=_canonical_incremental_cols()):
+            msgs.append("🧹 Inicio seguro: dataset_incremental reparado automáticamente.")
+    except Exception as e:
+        msgs.append(f"⚠️ Inicio seguro: no se pudo validar/reparar dataset_incremental ({e}).")
+
+    # 2) CSVs enriquecidos por bot: si falta/rompe header, se recrea SOLO header canónico.
+    header_ref = _csv_header_bot()
+    required = {"resultado", "trade_status", "epoch", "monto"}
+    for bot in BOT_NAMES:
+        ruta = f"registro_enriquecido_{bot}.csv"
+        if not os.path.exists(ruta):
+            continue
+        try:
+            header = None
+            for enc in ("utf-8", "latin-1", "windows-1252"):
+                try:
+                    with open(ruta, "r", encoding=enc, errors="replace") as f:
+                        first = f.readline().strip()
+                    header = [c.strip() for c in first.split(",")] if first else []
+                    break
+                except Exception:
+                    continue
+
+            header_set = set(header or [])
+            malformed = (not header) or (not required.issubset(header_set))
+
+            # También tratar como incompatible si trae una sola columna "mutante" gigante.
+            if (not malformed) and len(header) <= 2:
+                malformed = True
+
+            if malformed:
+                bak = f"{ruta}.bak_startfix_{int(time.time())}"
+                try:
+                    shutil.copy2(ruta, bak)
+                except Exception:
+                    bak = None
+                with open(ruta, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(header_ref)
+                if bak:
+                    msgs.append(f"🧹 Inicio seguro: {bot} tenía estructura inválida; reiniciado header (backup: {os.path.basename(bak)}).")
+                else:
+                    msgs.append(f"🧹 Inicio seguro: {bot} tenía estructura inválida; reiniciado header.")
+        except Exception as e:
+            msgs.append(f"⚠️ Inicio seguro: no se pudo validar {bot} ({e}).")
+
+    return msgs
 
 # Backfill seguro
 def backfill_incremental(ultimas=500):
@@ -10683,6 +10752,41 @@ def _n_minimo_real_status() -> tuple[int, int]:
         return 0, int(IA_ACTIVACION_REAL_MIN_N_POR_BOT)
 
 
+def _smart_clone_override_ok(best_bot: str, p_best: float, p_second: float, clone_flat: bool) -> bool:
+    """
+    Permite destrabar el candado clone_flat SOLO cuando hay evidencia real fuerte.
+
+    Objetivo:
+    - Evitar falsos bloqueos por planicie de probabilidades en ticks donde
+      el mejor bot realmente ya demostró edge consistente.
+    - Mantener conservadurismo: exige N, límite inferior (LB), prob alta y
+      micro-GAP positivo frente al segundo.
+    """
+    try:
+        if not bool(SMART_LOCKS_ENABLE):
+            return False
+        if not bool(clone_flat):
+            return False
+        if not best_bot:
+            return False
+
+        ev = _evidencia_bot_umbral_objetivo(best_bot)
+        ev_n = int(ev.get("n", 0) or 0)
+        ev_lb = float(ev.get("lb", 0.0) or 0.0)
+        p1 = float(p_best or 0.0)
+        p2 = float(p_second or 0.0)
+        gap = float(p1 - p2)
+
+        return bool(
+            (ev_n >= int(SMART_CLONE_OVERRIDE_MIN_N))
+            and (ev_lb >= float(SMART_CLONE_OVERRIDE_MIN_LB))
+            and (p1 >= float(SMART_CLONE_OVERRIDE_MIN_PROB))
+            and (gap >= float(SMART_CLONE_OVERRIDE_MIN_GAP))
+        )
+    except Exception:
+        return False
+
+
 def _actualizar_compuerta_techo_dinamico() -> dict:
     """
     Actualiza el techo dinámico y evalúa la compuerta REAL del mejor bot del tick.
@@ -10836,8 +10940,11 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
                 or ((float(p_best) - float(p_second)) < float(PROB_CLONE_GAP_MIN))
             )
         )
+        smart_clone_override = _smart_clone_override_ok(best_bot, p_best, p_second, clone_flat)
         if clone_flat:
             gap_ok = False
+        if smart_clone_override:
+            gap_ok = True
 
         mode_c_active = bool(mode_c_candidate and float(p_best) < float(floor_now))
         gate_mode = "C" if mode_c_active else ("B" if modo_relajado_n15 else "A")
@@ -10974,6 +11081,7 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             "floor_eff": float(floor_eff),
             "confirm_need": int(confirm_need),
             "clone_flat": bool(clone_flat),
+            "smart_clone_override": bool(smart_clone_override),
             "spread_std": float(spread_std),
         })
         return out
@@ -11577,6 +11685,13 @@ async def main():
             resetear_incremental_y_modelos(borrar_modelos=True)
             resetear_estado_hud(estado_bots)
             print("🧼 Sesión limpia: CSVs de bots, dataset incremental y estado HUD reiniciados.")
+        elif AUTO_REPAIR_ON_START:
+            for _msg in _asegurar_estructura_datos_inicio():
+                print(_msg)
+                try:
+                    agregar_evento(_msg)
+                except Exception:
+                    pass
         reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True)
         loop = asyncio.get_running_loop()
         set_main_loop(loop)
